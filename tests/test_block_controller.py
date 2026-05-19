@@ -198,6 +198,23 @@ def test_track_blocked_without_enough_motion_does_not_trigger_slip() -> None:
     assert output.haptic_feedback.slip_reason is None
 
 
+def test_stage_one_never_emits_slip_reason_both() -> None:
+    pinch_controller = BlockController(make_config(slip_motion_threshold=0.05), make_track(), Vec3(0.0, 0.0, 0.0))
+    pinch_controller.update(make_input(0.0, 0.0, distance=0.01))
+    pinch_output = pinch_controller.update(make_input(1.0, 0.2, distance=0.06))
+
+    track_controller = BlockController(
+        make_config(slip_motion_threshold=0.05, max_hand_delta_per_frame=0.5),
+        make_track(size=2.0),
+        Vec3(0.7, 0.0, 0.0),
+    )
+    track_controller.update(make_input(0.0, 0.7))
+    track_output = track_controller.update(make_input(1.0, 1.1))
+
+    assert pinch_output.haptic_feedback.slip_reason != SlipReason.BOTH
+    assert track_output.haptic_feedback.slip_reason != SlipReason.BOTH
+
+
 def test_inside_to_outside_edge_triggers_detach_once() -> None:
     controller = BlockController(make_config(), make_track(), Vec3(0.0, 0.0, 0.0))
     controller.update(make_input(0.0, 0.0))
@@ -289,3 +306,21 @@ def test_clamped_motion_below_min_block_move_distance_keeps_block_center() -> No
     assert output.feedback_state.stop_reason == StopReason.TRACK_BLOCKED
     assert output.feedback_state.blocked_info is not None
     assert output.feedback_state.blocked_info.primary_blocked_surface == Surface.X_POS
+
+
+def test_stage_one_uses_stop_reason_instead_of_deprecated_stopped_motion_states() -> None:
+    pinch_controller = BlockController(make_config(), make_track(), Vec3(0.0, 0.0, 0.0))
+    pinch_controller.update(make_input(0.0, 0.0))
+    pinch_output = pinch_controller.update(make_input(1.0, 0.2, distance=0.06))
+
+    track_controller = BlockController(make_config(), make_track(size=2.0), Vec3(0.7, 0.0, 0.0))
+    track_controller.update(make_input(0.0, 0.7))
+    track_output = track_controller.update(make_input(1.0, 1.1))
+
+    assert pinch_output.block_state.motion_state == BlockMotionState.GRABBED_PINCH_INSUFFICIENT
+    assert pinch_output.block_state.motion_state != BlockMotionState.STOPPED_BY_PINCH
+    assert pinch_output.feedback_state.stop_reason == StopReason.PINCH_INSUFFICIENT
+
+    assert track_output.block_state.motion_state == BlockMotionState.GRABBED_BLOCKED
+    assert track_output.block_state.motion_state != BlockMotionState.STOPPED_BY_TRACK
+    assert track_output.feedback_state.stop_reason == StopReason.TRACK_BLOCKED
