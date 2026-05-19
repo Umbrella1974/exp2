@@ -91,7 +91,12 @@ class PinchState(Enum):
 
 
 class BlockMotionState(Enum):
-    """Primary interaction state for the block."""
+    """Primary interaction state for the block.
+
+    STOPPED_BY_PINCH and STOPPED_BY_TRACK are kept as reserved/deprecated
+    compatibility values. Stage 1 logic should express stop reasons with
+    StopReason instead of emitting those enum members.
+    """
 
     FREE_VISIBLE = auto()
     CONTACT_HIDDEN = auto()
@@ -148,7 +153,12 @@ class Surface(Enum):
 
 @dataclass(frozen=True)
 class BlockedInfo:
-    """Geometric feedback for an out-of-track candidate or point."""
+    """Geometric feedback for an out-of-track candidate or point.
+
+    blocked_vector is defined as candidate - clamped_point. The primary blocked
+    surface is the sign of the largest blocked_vector component. blocked_distance
+    is the Euclidean norm of blocked_vector, not a normalized value.
+    """
 
     primary_blocked_surface: Surface | None
     primary_blocked_amount: float
@@ -219,7 +229,10 @@ class HapticEventType(Enum):
 
 
 class SlipReason(Enum):
-    """Reason for continuous slip feedback."""
+    """Reason for continuous slip feedback.
+
+    BOTH is reserved for future use and should not be emitted by Stage 1 logic.
+    """
 
     PINCH_INSUFFICIENT = auto()
     TRACK_BLOCKED = auto()
@@ -262,4 +275,3 @@ class FrameOutput:
     detach_counts: DetachCounts = field(default_factory=DetachCounts)
     haptic_feedback: HapticFeedbackState = field(default_factory=HapticFeedbackState)
     events: tuple[HapticEvent, ...] = ()
-

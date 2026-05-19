@@ -13,6 +13,7 @@ from data_models import (
     DetachState,
     FrameInput,
     HapticEventType,
+    PinchState,
     SlipReason,
     StopReason,
     Surface,
@@ -42,6 +43,24 @@ def make_config(**overrides: float) -> EngineConfig:
 
 def make_track(size: float = 4.0) -> TrackRegion:
     return TrackRegion(boxes=(Box3D(center=Vec3(0.0, 0.0, 0.0), size=Vec3(size, size, size)),))
+
+
+def make_face_touch_track() -> TrackRegion:
+    return TrackRegion(
+        boxes=(
+            Box3D(center=Vec3(0.0, 0.0, 0.0), size=Vec3(2.0, 2.0, 2.0)),
+            Box3D(center=Vec3(2.0, 0.0, 0.0), size=Vec3(2.0, 2.0, 2.0)),
+        )
+    )
+
+
+def make_overlap_track() -> TrackRegion:
+    return TrackRegion(
+        boxes=(
+            Box3D(center=Vec3(0.0, 0.0, 0.0), size=Vec3(2.0, 2.0, 2.0)),
+            Box3D(center=Vec3(1.5, 0.0, 0.0), size=Vec3(2.0, 2.0, 2.0)),
+        )
+    )
 
 
 def make_input(
@@ -88,6 +107,36 @@ def test_pinch_valid_moves_block_by_hand_delta() -> None:
     assert output.block_state.center.x == pytest.approx(0.2)
 
 
+def test_block_can_move_across_face_touch_track_union() -> None:
+    controller = BlockController(
+        make_config(max_hand_delta_per_frame=0.5),
+        make_face_touch_track(),
+        Vec3(0.5, 0.0, 0.0),
+    )
+    controller.update(make_input(0.0, 0.5))
+    controller.update(make_input(1.0, 1.0))
+    controller.update(make_input(2.0, 1.5))
+    controller.update(make_input(3.0, 2.0))
+    output = controller.update(make_input(4.0, 2.5))
+    assert output.block_state.motion_state == BlockMotionState.GRABBED_MOVING
+    assert output.block_state.center.x == pytest.approx(2.5)
+
+
+def test_block_can_move_across_overlap_track_union() -> None:
+    controller = BlockController(
+        make_config(max_hand_delta_per_frame=0.5),
+        make_overlap_track(),
+        Vec3(0.0, 0.0, 0.0),
+    )
+    controller.update(make_input(0.0, 0.0))
+    controller.update(make_input(1.0, 0.5))
+    controller.update(make_input(2.0, 1.0))
+    controller.update(make_input(3.0, 1.5))
+    output = controller.update(make_input(4.0, 2.0))
+    assert output.block_state.motion_state == BlockMotionState.GRABBED_MOVING
+    assert output.block_state.center.x == pytest.approx(2.0)
+
+
 def test_candidate_outside_track_moves_to_last_legal_boundary_point() -> None:
     controller = BlockController(make_config(), make_track(size=2.0), Vec3(0.7, 0.0, 0.0))
     controller.update(make_input(0.0, 0.7))
@@ -97,8 +146,19 @@ def test_candidate_outside_track_moves_to_last_legal_boundary_point() -> None:
     assert output.feedback_state.track_state == TrackState.BLOCKED_X_POS
     assert output.feedback_state.blocked_info is not None
     assert output.feedback_state.blocked_info.primary_blocked_surface == Surface.X_POS
+    assert output.haptic_feedback.slip_active is True
+    assert output.haptic_feedback.slip_reason == SlipReason.TRACK_BLOCKED
     assert output.haptic_feedback.blocked_force_active is True
     assert output.haptic_feedback.primary_blocked_surface == Surface.X_POS
+
+
+def test_pinch_insufficient_without_enough_motion_does_not_trigger_slip() -> None:
+    controller = BlockController(make_config(slip_motion_threshold=0.05), make_track(), Vec3(0.0, 0.0, 0.0))
+    controller.update(make_input(0.0, 0.0, distance=0.01))
+    output = controller.update(make_input(1.0, 0.03, distance=0.06))
+    assert output.block_state.motion_state == BlockMotionState.GRABBED_PINCH_INSUFFICIENT
+    assert output.haptic_feedback.slip_active is False
+    assert output.haptic_feedback.slip_reason is None
 
 
 def test_blocked_then_hand_moves_back_can_resume_moving() -> None:
@@ -122,6 +182,20 @@ def test_large_hand_delta_stops_motion() -> None:
     assert output.block_state.center == Vec3(0.0, 0.0, 0.0)
     assert output.feedback_state.stop_reason == StopReason.LARGE_DELTA
     assert output.feedback_state.track_state == TrackState.HAND_DELTA_TOO_LARGE
+
+
+def test_track_blocked_without_enough_motion_does_not_trigger_slip() -> None:
+    controller = BlockController(
+        make_config(slip_motion_threshold=0.05, max_hand_delta_per_frame=0.5),
+        make_track(size=2.0),
+        Vec3(0.98, 0.0, 0.0),
+    )
+    controller.update(make_input(0.0, 0.98))
+    output = controller.update(make_input(1.0, 1.01))
+    assert output.block_state.motion_state == BlockMotionState.GRABBED_BLOCKED
+    assert output.feedback_state.stop_reason == StopReason.TRACK_BLOCKED
+    assert output.haptic_feedback.slip_active is False
+    assert output.haptic_feedback.slip_reason is None
 
 
 def test_inside_to_outside_edge_triggers_detach_once() -> None:
@@ -174,3 +248,44 @@ def test_tracking_recovery_frame_resets_reference_without_contact_event_or_motio
     assert resumed.events == ()
     assert resumed.block_state.motion_state == BlockMotionState.GRABBED_MOVING
     assert resumed.block_state.center.x == pytest.approx(0.2)
+
+
+def test_tracking_invalid_keeps_state_and_recovery_suppresses_exit_until_next_frame() -> None:
+    controller = BlockController(make_config(), make_track(), Vec3(0.0, 0.0, 0.0))
+    controller.update(make_input(0.0, 0.0))
+    previous_reference = controller._state.previous_pinch_center
+
+    invalid = controller.update(make_input(1.0, 0.8, tracker_valid=False))
+    assert invalid.block_state.center == Vec3(0.0, 0.0, 0.0)
+    assert invalid.contact_state == ContactState.INSIDE_BLOCK
+    assert invalid.pinch_state == PinchState.PINCH_UNKNOWN
+    assert invalid.feedback_state.stop_reason == StopReason.TRACKING_INVALID
+    assert invalid.feedback_state.detach_state == DetachState.NONE
+    assert invalid.events == ()
+    assert controller._state.previous_pinch_center == previous_reference
+
+    recovery = controller.update(make_input(2.0, 0.8, tracker_valid=True))
+    assert recovery.feedback_state.recovery_frame is True
+    assert recovery.contact_state == ContactState.OUTSIDE_BLOCK
+    assert recovery.events == ()
+    assert recovery.detach_counts.total_detach_count == 0
+    assert recovery.block_state.center == Vec3(0.0, 0.0, 0.0)
+
+    reenter = controller.update(make_input(3.0, 0.0, tracker_valid=True))
+    assert reenter.events[0].event_type == HapticEventType.CONTACT_ENTER
+    assert reenter.feedback_state.detach_state == DetachState.NONE
+
+
+def test_clamped_motion_below_min_block_move_distance_keeps_block_center() -> None:
+    controller = BlockController(
+        make_config(min_block_move_distance=0.05, max_hand_delta_per_frame=0.5),
+        make_track(size=2.0),
+        Vec3(0.98, 0.0, 0.0),
+    )
+    controller.update(make_input(0.0, 0.98))
+    output = controller.update(make_input(1.0, 1.02))
+    assert output.block_state.motion_state == BlockMotionState.GRABBED_BLOCKED
+    assert output.block_state.center == Vec3(0.98, 0.0, 0.0)
+    assert output.feedback_state.stop_reason == StopReason.TRACK_BLOCKED
+    assert output.feedback_state.blocked_info is not None
+    assert output.feedback_state.blocked_info.primary_blocked_surface == Surface.X_POS

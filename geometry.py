@@ -59,20 +59,29 @@ def clamp_segment_to_track(
     iterations: int = 24,
     surface_threshold: float = 0.0,
 ) -> ClampResult:
-    """Clamp a segment end to the last point on the segment that stays in track."""
+    """Clamp a segment end to the last point on the segment that stays in track.
+
+    This returns the furthest point reachable along start -> end while remaining
+    continuously inside the track union. It does not allow teleporting across
+    gaps even if the final endpoint lies inside a later box in the union.
+    """
 
     if not point_in_track(start, track_region, epsilon=epsilon):
         raise ValueError("Segment start must already be inside the track.")
 
-    if point_in_track(end, track_region, epsilon=epsilon):
+    coverage_end = _continuous_coverage_end(start, end, track_region, epsilon)
+    if coverage_end >= 1.0:
         return ClampResult(clamped_point=end, end_inside_track=True, blocked_info=None)
 
-    low = 0.0
-    high = 1.0
+    low = max(0.0, coverage_end)
+    high = min(1.0, coverage_end + 1.0 / max(iterations, 1))
+    if high <= low:
+        high = min(1.0, low + 1e-6)
+
     for _ in range(iterations):
         mid = (low + high) * 0.5
         sample = lerp_vec3(start, end, mid)
-        if point_in_track(sample, track_region, epsilon=epsilon):
+        if _segment_prefix_inside(start, end, track_region, mid, epsilon):
             low = mid
         else:
             high = mid
@@ -90,6 +99,83 @@ def lerp_vec3(start: Vec3, end: Vec3, t: float) -> Vec3:
     """Linearly interpolate between two vectors."""
 
     return start + (end - start).scale(t)
+
+
+def _continuous_coverage_end(
+    start: Vec3,
+    end: Vec3,
+    track_region: TrackRegion,
+    epsilon: float,
+) -> float:
+    intervals = []
+    for box in track_region.boxes:
+        interval = _box_segment_interval(start, end, box, epsilon)
+        if interval is not None:
+            intervals.append(interval)
+
+    if not intervals:
+        return 0.0
+
+    intervals.sort(key=lambda item: (item[0], item[1]))
+    merged_start, merged_end = intervals[0]
+    if merged_start > epsilon:
+        return 0.0
+
+    for interval_start, interval_end in intervals[1:]:
+        if interval_start <= merged_end + epsilon:
+            merged_end = max(merged_end, interval_end)
+            continue
+        break
+
+    return min(1.0, max(0.0, merged_end))
+
+
+def _box_segment_interval(
+    start: Vec3,
+    end: Vec3,
+    box: Box3D,
+    epsilon: float,
+) -> tuple[float, float] | None:
+    minimum = box.min_corner
+    maximum = box.max_corner
+    low = 0.0
+    high = 1.0
+
+    for start_value, end_value, minimum_value, maximum_value in (
+        (start.x, end.x, minimum.x - epsilon, maximum.x + epsilon),
+        (start.y, end.y, minimum.y - epsilon, maximum.y + epsilon),
+        (start.z, end.z, minimum.z - epsilon, maximum.z + epsilon),
+    ):
+        delta = end_value - start_value
+        if abs(delta) <= 1e-12:
+            if not (minimum_value <= start_value <= maximum_value):
+                return None
+            continue
+
+        axis_t0 = (minimum_value - start_value) / delta
+        axis_t1 = (maximum_value - start_value) / delta
+        axis_low = min(axis_t0, axis_t1)
+        axis_high = max(axis_t0, axis_t1)
+        low = max(low, axis_low)
+        high = min(high, axis_high)
+        if low > high:
+            return None
+
+    clipped_low = max(0.0, low)
+    clipped_high = min(1.0, high)
+    if clipped_low > clipped_high:
+        return None
+    return (clipped_low, clipped_high)
+
+
+def _segment_prefix_inside(
+    start: Vec3,
+    end: Vec3,
+    track_region: TrackRegion,
+    t: float,
+    epsilon: float,
+) -> bool:
+    return _continuous_coverage_end(start, lerp_vec3(start, end, t), track_region, epsilon) >= 1.0 - 1e-12
 
 
 def _closest_point_in_track(point: Vec3, track_region: TrackRegion) -> Vec3:
