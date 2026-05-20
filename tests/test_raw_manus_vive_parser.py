@@ -87,3 +87,44 @@ def test_node_count_can_be_low_without_parser_failure() -> None:
 def test_timestamp_scale_is_applied() -> None:
     frame = parse_raw_manus_vive_frame(valid_raw(), DeviceAdapterConfig(timestamp_scale=0.001))
     assert frame.time == 0.0125
+
+
+def test_node_with_invalid_position_is_skipped_without_crashing() -> None:
+    raw = valid_raw()
+    raw["skeletons"][0]["nodes"] = [
+        {"id": 4, "position": [0.0, 0.0]},
+        {"id": 9, "position": [0.02, 0.0, 0.0]},
+    ]
+    frame = parse_raw_manus_vive_frame(raw)
+    assert frame.hand is not None
+    assert 4 not in frame.hand.nodes
+    assert 9 in frame.hand.nodes
+
+
+def test_node_with_missing_position_is_skipped_without_crashing() -> None:
+    raw = valid_raw()
+    raw["skeletons"][0]["nodes"] = [
+        {"id": 4},
+        {"id": 9, "position": [0.02, 0.0, 0.0]},
+    ]
+    frame = parse_raw_manus_vive_frame(raw)
+    assert frame.hand is not None
+    assert 4 not in frame.hand.nodes
+    assert 9 in frame.hand.nodes
+
+
+def test_tracker_with_invalid_position_returns_no_tracker() -> None:
+    raw = valid_raw()
+    raw["trackers"][0]["position"] = [1.0, 2.0]
+    frame = parse_raw_manus_vive_frame(raw)
+    assert frame.tracker is None
+
+
+def test_extra_fields_do_not_break_parser() -> None:
+    raw = valid_raw()
+    raw["unexpected"] = {"deep": ["value"]}
+    raw["skeletons"][0]["unexpected_node_schema_version"] = 123
+    raw["trackers"][0]["debug"] = True
+    frame = parse_raw_manus_vive_frame(raw)
+    assert frame.hand is not None and frame.hand.valid
+    assert frame.tracker is not None and frame.tracker.valid
