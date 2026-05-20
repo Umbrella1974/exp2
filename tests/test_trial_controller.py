@@ -156,3 +156,39 @@ def test_world_coordinate_input_is_converted_to_task_space() -> None:
         )
     )
     assert result.frame_output.pinch_center_task == Vec3(0.0, 0.0, 0.0)
+
+
+def test_invalid_coordinate_space_raises() -> None:
+    controller = make_trial_controller()
+    controller.start_trial(time=0.0, trial_id=1)
+    try:
+        controller.update(
+            ExperimentInputSample(
+                time=0.0,
+                pinch_center_task=Vec3(0.0, 0.0, 0.0),
+                pinch_distance=0.01,
+                tracker_valid=True,
+                coordinate_space="world_task_typo",
+            )
+        )
+    except ValueError as exc:
+        assert "coordinate_space" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for invalid coordinate_space.")
+
+
+def test_reset_without_time_does_not_record_fake_reset_event() -> None:
+    controller = make_trial_controller()
+    controller.start_trial(time=10.0, trial_id=1)
+    controller.reset()
+    assert controller.trial_state == TrialState.WAITING
+    assert "trial_reset" not in event_types(controller)
+
+
+def test_reset_with_time_records_reset_event() -> None:
+    controller = make_trial_controller()
+    controller.start_trial(time=10.0, trial_id=1)
+    controller.reset(time=12.0)
+    reset_events = [event for event in controller.event_history if event.event_type == "trial_reset"]
+    assert reset_events
+    assert reset_events[0].time == 12.0

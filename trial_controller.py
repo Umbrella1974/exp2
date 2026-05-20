@@ -23,7 +23,11 @@ from task_coordinate_system import TaskCoordinateSystem
 
 
 class TrialState(Enum):
-    """Lifecycle state for a trial."""
+    """Lifecycle state for a trial.
+
+    TRACKING_INVALID is reserved for future use. Stage 2/3 keeps tracking loss
+    inside RUNNING and records tracking_invalid/tracking_recovered edge events.
+    """
 
     WAITING = auto()
     PROMPT = auto()
@@ -186,11 +190,11 @@ class TrialController:
         self.trial_state = TrialState.ENDED_BY_SUBJECT
         self._record_events((self._make_event(time, "subject_end", state=self.trial_state),))
 
-    def reset(self) -> None:
+    def reset(self, time: float | None = None) -> None:
         """Reset the trial lifecycle without mutating any old BlockController."""
 
-        if self.trial_id is not None:
-            self._record_events((self._make_event(0.0, "trial_reset"),))
+        if self.trial_id is not None and time is not None:
+            self._record_events((self._make_event(time, "trial_reset"),))
         self.trial_state = TrialState.WAITING
         self.trial_id = None
         self.prompt_on_time = None
@@ -297,6 +301,9 @@ class TrialController:
             if self.task_coordinate_system is None:
                 raise ValueError("task_coordinate_system is required for world coordinates.")
             return _to_vec3(self.task_coordinate_system.world_to_task(sample.pinch_center_world))
+
+        if sample.coordinate_space != "task":
+            raise ValueError('coordinate_space must be "task" or "world".')
 
         if sample.pinch_center_task is None:
             return None
