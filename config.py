@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from data_models import Vec3
 
@@ -24,6 +24,11 @@ class EngineConfig:
     max_detach_count: int = 3
     trial_timeout_seconds: float = 60.0
     slip_motion_threshold: float = 1e-4
+    coordinate_space: str = "task"
+    up_axis_world: Vec3 = field(default_factory=lambda: Vec3(0.0, 1.0, 0.0))
+    min_x_axis_length: float = 0.1
+    record_frames: bool = True
+    record_events: bool = True
 
     @property
     def block_size(self) -> Vec3:
