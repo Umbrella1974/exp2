@@ -11,9 +11,9 @@ from data_models import Vec3
 class EngineConfig:
     """Tunable thresholds and dimensions for the engine."""
 
-    block_size_x: float = 1.0
-    block_size_y: float = 1.0
-    block_size_z: float = 1.0
+    block_size_x: float = 0.2#1.0
+    block_size_y: float = 0.2#1.0
+    block_size_z: float = 1.0#1.0
     track_epsilon: float = 1e-6
     pinch_grab_threshold: float = 0.025
     pinch_release_threshold: float = 0.035

@@ -28,11 +28,13 @@ def run_preview(
     max_frames: int | None = None,
     print_every: int = 1,
     calibration_path: str | None = None,
+    trial_id: int | str = "preview",
+    timestamp_scale: float = 0.001,
 ) -> None:
     """Run raw frames through parser, adapter, TrialController, and BlockController."""
 
     engine_config = EngineConfig()
-    adapter_config = DeviceAdapterConfig()
+    adapter_config = DeviceAdapterConfig(timestamp_scale=timestamp_scale)
     task_system = (
         load_task_calibration(calibration_path)
         if calibration_path is not None
@@ -46,14 +48,20 @@ def run_preview(
         return BlockController(engine_config, track, Vec3(0.0, 0.0, 0.0))
 
     trial_controller = TrialController(factory, task_system, engine_config)
-    trial_controller.start_trial(time=0.0, trial_id="preview")
     adapter = ManusViveExperimentAdapter(task_system, config=adapter_config)
+    trial_started = False
 
+    # File-backed sources have EOF, so normal iteration is appropriate here.
+    # Future socket/live sources should use a while loop around next_frame(),
+    # because None means "no new frame right now" rather than stream end.
     for frame_index, raw in enumerate(raw_frames):
         if max_frames is not None and frame_index >= max_frames:
             break
 
         device_frame = parse_raw_manus_vive_frame(raw, adapter_config)
+        if not trial_started:
+            trial_controller.start_trial(time=device_frame.time, trial_id=trial_id)
+            trial_started = True
         sample = adapter.to_experiment_input_sample(device_frame)
         result = trial_controller.update(sample)
         output = result.frame_output
@@ -124,6 +132,13 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=None, help="Maximum frames to process.")
     parser.add_argument("--calibration", default=None, help="Optional task calibration JSON.")
     parser.add_argument("--print-every", type=int, default=1, help="Print every N frames.")
+    parser.add_argument("--trial-id", default="preview", help="Trial id used by the preview run.")
+    parser.add_argument(
+        "--timestamp-scale",
+        type=float,
+        default=0.001,
+        help="Scale raw timestamp into seconds; default treats epoch milliseconds as seconds.",
+    )
     args = parser.parse_args()
     if args.print_every <= 0:
         raise ValueError("--print-every must be positive.")
@@ -135,6 +150,8 @@ def main() -> None:
             max_frames=args.max_frames,
             print_every=args.print_every,
             calibration_path=args.calibration,
+            trial_id=args.trial_id,
+            timestamp_scale=args.timestamp_scale,
         )
     finally:
         if hasattr(source, "close"):

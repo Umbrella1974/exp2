@@ -39,8 +39,21 @@ def test_run_live_preview_uses_raw_source_pipeline(capsys) -> None:
             raw_frame(0.2, 0.35, subject_end=True),
         ]
     )
-    run_preview(source, max_frames=3, print_every=2)
+    run_preview(source, max_frames=3, print_every=2, trial_id="custom-preview")
     output = capsys.readouterr().out
     assert "frame_index" in output
     assert "trial_state" in output
     assert "pinch_center_task" in output
+
+
+def test_run_live_preview_starts_trial_from_first_epoch_millisecond_frame(capsys) -> None:
+    source = IterableRawFrameSource(
+        [
+            raw_frame(1779292866225.0, 0.0),
+            raw_frame(1779292866325.0, 0.2),
+        ]
+    )
+    run_preview(source, max_frames=2, print_every=1, trial_id="epoch-ms-preview")
+    output = capsys.readouterr().out
+    assert "FAILED_TIMEOUT" not in output
+    assert "'time': 1779292866.225" in output
