@@ -128,3 +128,51 @@ def test_extra_fields_do_not_break_parser() -> None:
     frame = parse_raw_manus_vive_frame(raw)
     assert frame.hand is not None and frame.hand.valid
     assert frame.tracker is not None and frame.tracker.valid
+
+
+def test_timing_fields_are_preserved_and_sync_delta_is_computed() -> None:
+    raw = valid_raw()
+    raw.update(
+        {
+            "combined_monotonic_ms": 1234.5,
+            "skeleton_publish_time": 100,
+            "tracker_publish_time": 101.5,
+            "skeleton_receive_monotonic_ms": 2000.0,
+            "tracker_receive_monotonic_ms": 2012.25,
+            "skeleton_callback_index": 11,
+            "tracker_callback_index": 12,
+            "skeleton_frame": 21,
+            "tracker_frame": 22,
+        }
+    )
+    raw["trackers"][0]["last_update_time"] = 98.75
+
+    frame = parse_raw_manus_vive_frame(raw)
+
+    assert frame.combined_monotonic_ms == 1234.5
+    assert frame.skeleton_publish_time == 100
+    assert frame.tracker_publish_time == 101.5
+    assert frame.skeleton_receive_monotonic_ms == 2000.0
+    assert frame.tracker_receive_monotonic_ms == 2012.25
+    assert frame.sync_delta_ms == 12.25
+    assert frame.skeleton_callback_index == 11
+    assert frame.tracker_callback_index == 12
+    assert frame.skeleton_frame_id == 21
+    assert frame.tracker_frame_id == 22
+    assert frame.tracker is not None
+    assert frame.tracker.last_update_time == 98.75
+
+
+def test_missing_timing_fields_default_to_none() -> None:
+    frame = parse_raw_manus_vive_frame(valid_raw())
+
+    assert frame.combined_monotonic_ms is None
+    assert frame.skeleton_receive_monotonic_ms is None
+    assert frame.tracker_receive_monotonic_ms is None
+    assert frame.sync_delta_ms is None
+    assert frame.skeleton_callback_index is None
+    assert frame.tracker_callback_index is None
+    assert frame.skeleton_frame_id is None
+    assert frame.tracker_frame_id is None
+    assert frame.tracker is not None
+    assert frame.tracker.last_update_time is None

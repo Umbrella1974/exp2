@@ -27,6 +27,8 @@ def parse_raw_manus_vive_frame(
     config = config or DeviceAdapterConfig()
     source_timestamp = raw.get("timestamp")
     frame_id = _optional_int(raw.get("frame"))
+    skeleton_receive_monotonic_ms = _optional_float(raw.get("skeleton_receive_monotonic_ms"))
+    tracker_receive_monotonic_ms = _optional_float(raw.get("tracker_receive_monotonic_ms"))
     return DeviceFrame(
         time=_frame_time(source_timestamp, config.timestamp_scale),
         source_timestamp=source_timestamp,
@@ -34,6 +36,19 @@ def parse_raw_manus_vive_frame(
         tracker=_parse_tracker(raw, config),
         hand=_parse_hand(raw, config),
         raw=raw,
+        combined_monotonic_ms=_optional_float(raw.get("combined_monotonic_ms")),
+        skeleton_publish_time=_optional_number(raw.get("skeleton_publish_time")),
+        tracker_publish_time=_optional_number(raw.get("tracker_publish_time")),
+        skeleton_receive_monotonic_ms=skeleton_receive_monotonic_ms,
+        tracker_receive_monotonic_ms=tracker_receive_monotonic_ms,
+        skeleton_callback_index=_optional_int(raw.get("skeleton_callback_index")),
+        tracker_callback_index=_optional_int(raw.get("tracker_callback_index")),
+        skeleton_frame_id=_optional_int(raw.get("skeleton_frame")),
+        tracker_frame_id=_optional_int(raw.get("tracker_frame")),
+        sync_delta_ms=_sync_delta_ms(
+            skeleton_receive_monotonic_ms,
+            tracker_receive_monotonic_ms,
+        ),
     )
 
 
@@ -111,6 +126,7 @@ def _parse_tracker(raw: dict[str, Any], config: DeviceAdapterConfig) -> ViveTrac
         pose_world=pose,
         valid=bool(tracker.get("valid", True)),
         quality=tracker.get("quality"),
+        last_update_time=_optional_number(tracker.get("last_update_time")),
     )
 
 
@@ -121,6 +137,37 @@ def _optional_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_number(value: object) -> float | int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int | float):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sync_delta_ms(
+    skeleton_receive_monotonic_ms: float | None,
+    tracker_receive_monotonic_ms: float | None,
+) -> float | None:
+    if skeleton_receive_monotonic_ms is None or tracker_receive_monotonic_ms is None:
+        return None
+    return abs(skeleton_receive_monotonic_ms - tracker_receive_monotonic_ms)
 
 
 def _optional_str(value: object) -> str | None:

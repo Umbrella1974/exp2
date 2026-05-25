@@ -108,6 +108,7 @@ class ViveTrackerFrame:
     pose_world: Pose3D
     valid: bool
     quality: int | bool | None = None
+    last_update_time: float | int | None = None
 
 
 @dataclass(frozen=True)
@@ -120,3 +121,13 @@ class DeviceFrame:
     tracker: ViveTrackerFrame | None
     hand: ManusHandFrame | None
     raw: dict[str, Any] | None = None
+    combined_monotonic_ms: float | None = None
+    skeleton_publish_time: float | int | None = None
+    tracker_publish_time: float | int | None = None
+    skeleton_receive_monotonic_ms: float | None = None
+    tracker_receive_monotonic_ms: float | None = None
+    skeleton_callback_index: int | None = None
+    tracker_callback_index: int | None = None
+    skeleton_frame_id: int | None = None
+    tracker_frame_id: int | None = None
+    sync_delta_ms: float | None = None

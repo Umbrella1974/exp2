@@ -8,6 +8,10 @@ frames through the existing parser, adapter, TrialController, and BlockControlle
 The automatically estimated task x-axis comes from the first calibration window
 of valid points. These outputs are diagnostic and must not be treated as formal
 experiment analysis. Formal experiments still need online calibration.
+
+When --write-session is enabled, the generated session uses post-hoc automatic
+calibration and is not formal experiment data. Formal experiments still require
+subject-defined calibration and formal scene configuration.
 """
 
 from __future__ import annotations
@@ -29,8 +33,24 @@ from device_frame_models import DeviceAdapterConfig
 from manus_vive_adapter import ManusViveExperimentAdapter
 from raw_frame_source import JsonlRawFrameSource
 from raw_manus_vive_parser import parse_raw_manus_vive_frame
+from session_recorder import SessionRecorder
 from task_coordinate_system import TaskCoordinateSystem
 from trial_controller import ExperimentInputSample, TrialController
+
+
+OFFLINE_AUTOCALIBRATED_SESSION_WARNING = (
+    "This session was generated from post-hoc auto calibration and must not be treated "
+    "as a formal experimental trial."
+)
+
+HAPTIC_EVENT_TYPES = {
+    "contact_enter",
+    "contact_exit",
+    "slip_start",
+    "slip_end",
+    "blocked_force_start",
+    "blocked_force_end",
+}
 
 
 @dataclass(frozen=True)
@@ -56,6 +76,11 @@ class OfflineReplayConfig:
     timestamp_scale: float = 0.001
     offline_trial_timeout_seconds: float = 1e9
     offline_max_detach_count: int = 1_000_000_000
+    write_session: bool = False
+    session_dir: Path | None = None
+    session_id: str | None = None
+    subject_id: str | None = None
+    notes: str | None = None
 
 
 @dataclass(frozen=True)
@@ -322,6 +347,20 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
     first_valid_time = valid_records[0].sample.time if valid_records else records[0].sample.time
     trial.start_trial(time=first_valid_time, trial_id="offline_autocalibrated")
 
+    session_recorder = None
+    if config.write_session:
+        session_dir = config.session_dir or (config.out_dir / "session")
+        session_recorder = SessionRecorder(session_dir)
+        session_recorder.start_session(
+            session_meta=_offline_session_meta(config, session_dir),
+            calibration=_offline_session_calibration(calibration.payload),
+            trial_config=_offline_session_trial_config(
+                scene.payload,
+                engine_config,
+                calibration.warnings + scene.warnings,
+            ),
+        )
+
     frames: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     warnings = list(calibration.warnings) + list(scene.warnings)
@@ -334,8 +373,13 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
     slip_active_count = 0
     blocked_count = 0
     large_delta_count = 0
+    haptic_active_count = 0
 
     for record in records:
+        if session_recorder is not None:
+            session_recorder.record_raw_frame(record.raw_index, record.raw)
+            session_recorder.record_device_frame(record.raw_index, record.device_frame)
+
         if bool(record.raw.get("subject_end", False)):
             raw_subject_end_count += 1
         if record.sample.pinch_distance is not None:
@@ -373,6 +417,8 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
         output = result.frame_output
         if output.haptic_feedback.slip_active:
             slip_active_count += 1
+        if output.haptic_feedback.slip_active or output.haptic_feedback.blocked_force_active:
+            haptic_active_count += 1
         if output.feedback_state.stop_reason.name == "TRACK_BLOCKED":
             blocked_count += 1
         if output.feedback_state.stop_reason.name == "LARGE_DELTA":
@@ -392,6 +438,27 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
 
         frames.append(_frame_row(record, replay_sample, result))
 
+        if session_recorder is not None:
+            session_recorder.record_processed_frame(
+                record.raw_index,
+                record.raw,
+                record.device_frame,
+                replay_sample,
+                output,
+                haptic_state=output.haptic_feedback,
+                extra={
+                    "input_source": record.input_point_source,
+                    "trial_time": result.time_since_prompt,
+                },
+            )
+            session_recorder.record_events(record.raw_index, replay_sample.time, result.events)
+            session_recorder.record_haptic(
+                record.raw_index,
+                replay_sample.time,
+                output.haptic_feedback,
+                details={"mode": "offline_replay", "sent_to_hardware": False},
+            )
+
     summary = {
         "total_raw_frames": len(records),
         "replayed_raw_frames": len(frames),
@@ -406,6 +473,8 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
         "blocked_frame_count": int(blocked_count),
         "large_delta_frame_count": int(large_delta_count),
         "tracker_invalid_frame_count": int(tracker_invalid_count),
+        "haptic_active_frame_count": int(haptic_active_count),
+        "haptic_event_count": _haptic_event_count(events),
         "pinch_distance_min": min(pinch_distances) if pinch_distances else None,
         "pinch_distance_mean": mean(pinch_distances) if pinch_distances else None,
         "pinch_distance_max": max(pinch_distances) if pinch_distances else None,
@@ -425,7 +494,57 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
         "corridor_y_center": scene.payload["corridor_y_center"],
         "warnings": warnings,
     }
+    if session_recorder is not None:
+        session_recorder.finalize(summary)
     return OfflineReplayResult(frames, events, calibration.payload, scene.payload, summary)
+
+
+def _offline_session_meta(config: OfflineReplayConfig, session_dir: Path) -> dict[str, Any]:
+    session_meta = {
+        "session_id": config.session_id or session_dir.name,
+        "mode": "offline_autocalibrated",
+        "trial_id": "offline_autocalibrated",
+        "calibration_type": "post_hoc_auto",
+        "is_formal_calibration": False,
+        "scene_type": "post_hoc_auto",
+        "is_formal_scene": False,
+        "warnings": [OFFLINE_AUTOCALIBRATED_SESSION_WARNING],
+    }
+    if config.subject_id is not None:
+        session_meta["subject_id"] = config.subject_id
+    if config.notes is not None:
+        session_meta["notes"] = config.notes
+    return session_meta
+
+
+def _offline_session_calibration(calibration_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "calibration_type": "post_hoc_auto",
+        "is_formal_calibration": False,
+        "calibration_auto": calibration_payload,
+    }
+
+
+def _offline_session_trial_config(
+    scene_payload: dict[str, Any],
+    engine_config: EngineConfig,
+    warnings: list[str],
+) -> dict[str, Any]:
+    return {
+        "scene_type": "post_hoc_auto",
+        "is_formal_scene": False,
+        "scene_auto": scene_payload,
+        "block_size": scene_payload.get("block_size"),
+        "block_initial_center_task": scene_payload.get("block_center_task"),
+        "track_bounds_task": scene_payload.get("track_bounds"),
+        "scene_mode": scene_payload.get("scene_mode"),
+        "pinch_threshold": {
+            "grab": engine_config.pinch_grab_threshold,
+            "release": engine_config.pinch_release_threshold,
+        },
+        "trial_timeout_seconds": engine_config.trial_timeout_seconds,
+        "warnings": warnings,
+    }
 
 
 def write_outputs(result: OfflineReplayResult, out_dir: Path) -> None:
@@ -468,6 +587,11 @@ def main() -> None:
         z_tolerance=args.z_tolerance,
         out_dir=Path(args.out_dir),
         offline_max_detach_count=args.offline_max_detach_count,
+        write_session=args.write_session,
+        session_dir=Path(args.session_dir) if args.session_dir is not None else None,
+        session_id=args.session_id,
+        subject_id=args.subject_id,
+        notes=args.notes,
     )
     result = run_offline_replay(config)
     write_outputs(result, config.out_dir)
@@ -655,6 +779,10 @@ def _event_count(events: list[dict[str, Any]], event_type: str) -> int:
     return sum(1 for event in events if event["event_type"] == event_type)
 
 
+def _haptic_event_count(events: list[dict[str, Any]]) -> int:
+    return sum(1 for event in events if event["event_type"] in HAPTIC_EVENT_TYPES)
+
+
 def _vec_to_list(vector: Vec3) -> list[float]:
     return [vector.x, vector.y, vector.z]
 
@@ -699,6 +827,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--z-tolerance", type=float, default=0.20)
     parser.add_argument("--out-dir", default="data/offline_replay")
     parser.add_argument("--offline-max-detach-count", type=int, default=1_000_000_000)
+    parser.add_argument(
+        "--write-session",
+        action="store_true",
+        help=(
+            "Write a standard session directory using post-hoc auto calibration. "
+            "This output is not formal experiment data."
+        ),
+    )
+    parser.add_argument("--session-dir", default=None)
+    parser.add_argument("--session-id", default=None)
+    parser.add_argument("--subject-id", default=None)
+    parser.add_argument("--notes", default=None)
     return parser.parse_args()
 
 
