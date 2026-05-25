@@ -1,46 +1,45 @@
-# Constrained Block Experiment Engine
+# Exp2 Constrained Block Experiment Engine
 
-这个项目是一个分阶段实现的实验交互引擎。当前代码已经包含：
+这个仓库实现的是一个受约束物块交互实验引擎。当前代码主要用于离线 smoke/regression 测试和后续真实实验接入前的管线验证。
 
-- Stage 1：受轨道约束的虚拟木块核心交互逻辑。
-- Stage 2：trial 生命周期、坐标系、mock/replay、CSV recorder。
-- Stage 3：MANUS/Vive raw JSON 的稳定 adapter contract。
-- Stage 3.1：JSONL raw frame source 和 `run_live_preview.py` smoke preview。
-
-当前没有接 MANUS SDK、Vive SDK、socket、UI 或触觉硬件。真实设备数据需要先变成 raw JSON dict，再进入：
+当前核心数据流是：
 
 ```text
-RawFrameSource
+raw JSON / JSONL
+  -> JsonlRawFrameSource
   -> parse_raw_manus_vive_frame()
   -> ManusViveExperimentAdapter
   -> ExperimentInputSample
   -> TrialController
   -> BlockController
+  -> frames / events / summary
 ```
+
+当前还没有接入正式 GUI、真实 socket、MANUS SDK、Vive SDK 或触觉硬件。`ManusSocketRawFrameSource` 现在只是 receiver 适配壳。
 
 ## 环境准备
 
-建议在项目根目录运行命令：
+在项目根目录运行命令：
 
 ```powershell
 cd D:\research_history\first_one\research_code\exp2
 ```
 
-需要 Python 3.10+。当前测试依赖主要是：
+推荐 Python 3.10+。基础依赖：
 
 ```powershell
-pip install pytest numpy
+pip install numpy pytest
 ```
 
-如果后面要真的读取 YAML 配置，还需要：
+如果希望 `offline_replay_autocalibrated.py` 额外生成 PNG 图，可以安装：
 
 ```powershell
-pip install pyyaml
+pip install matplotlib
 ```
 
-注意：当前代码还没有自动读取 YAML 的 loader，`config_example.yaml` 是配置模板和记录文件，不会被 `run_live_preview.py` 自动加载。
+没有 `matplotlib` 时，核心 replay 和 CSV/JSON 输出仍然可以工作，图像生成会被跳过并写入 warning。
 
-## 运行测试
+## 跑测试
 
 完整测试：
 
@@ -48,92 +47,354 @@ pip install pyyaml
 pytest -q
 ```
 
-只测试 Stage 3 raw/parser/adapter：
+只跑 batch 离线报告工具：
 
 ```powershell
-pytest tests/test_raw_frame_source.py tests/test_raw_manus_vive_parser.py tests/test_manus_vive_adapter.py -q
+pytest -q tests/test_batch_offline_replay_report.py
 ```
 
-只测试 preview pipeline：
+只跑 raw/parser/adapter 相关测试：
 
 ```powershell
-pytest tests/test_run_live_preview_pipeline.py tests/test_stage3_fake_live_pipeline.py -q
+pytest -q tests/test_raw_frame_source.py tests/test_raw_manus_vive_parser.py tests/test_manus_vive_adapter.py
 ```
 
-如果完整测试失败，先看失败文件名。`test_block_controller.py` 失败通常是 Stage 1 状态机问题；`test_raw_manus_vive_parser.py` 失败通常是 raw JSON schema 或 parser 问题；`test_run_live_preview_pipeline.py` 失败通常是 preview wiring 问题。
+当前全量测试应为：
 
-## 用 JSONL 跑 Smoke Preview
+```text
+98 passed
+```
 
-`run_live_preview.py` 目前只读 JSONL 文件。每一行必须是一个 raw JSON dict。
+## 三个常用入口
 
-基本命令：
+### 1. `run_live_preview.py`
+
+用于快速检查一个 JSONL 文件能不能被 parser/adapter/TrialController 跑通。它更像实时预览 smoke test，不适合作为批量离线评估工具。
 
 ```powershell
-python run_live_preview.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_01.jsonl --max-frames 1000 --print-every 10 --trial-id smoke_001
+python run_live_preview.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_15.jsonl --max-frames 1000 --print-every 10 --trial-id smoke_001
 ```
 
 常用参数：
 
 ```text
---raw-jsonl       JSONL 数据文件路径
---max-frames     最多处理多少帧
---print-every    每隔多少帧打印一次状态
---trial-id       preview trial id，默认 preview
---timestamp-scale 原始 timestamp 转秒的比例，默认 0.001
---calibration    可选 calibration JSON 路径
+--raw-jsonl         输入 JSONL，每行一个 raw dict
+--max-frames       最多处理多少帧
+--print-every      每隔多少帧打印一次
+--trial-id         trial id，默认 preview
+--timestamp-scale  timestamp 转秒比例，默认 0.001
+--calibration      可选 calibration JSON
 ```
 
-如果 raw timestamp 是 epoch 毫秒，使用默认 `--timestamp-scale 0.001`。如果 timestamp 已经是秒，用：
+如果 raw timestamp 已经是秒，使用：
 
 ```powershell
 python run_live_preview.py --raw-jsonl data.jsonl --timestamp-scale 1.0
 ```
 
-打印输出里最重要的字段：
+文件输入可以用 `for frame in source`，因为 JSONL 有 EOF。以后真实 socket/live source 不要用 `for`，因为 socket 的 `None` 表示“当前没有新帧”，不是数据结束。实时流应该持续调用：
 
-```text
-tracker_valid         tracker 数据是否可用
-hand_valid            MANUS hand frame 是否可用
-pinch_valid           thumb/index 节点是否足够计算 pinch
-pinch_distance        thumb/index tip 距离
-pinch_center_world    adapter 输出的 world 坐标
-pinch_center_task     TrialController 转换后的 task 坐标
-contact_state         pinch center 是否进入当前 block box
-pinch_state           pinch distance 是否足够夹持
-block_motion_state    block 当前运动状态
-stop_reason           停止原因，例如 TRACKING_INVALID / PINCH_INSUFFICIENT / TRACK_BLOCKED
+```python
+while running:
+    raw = source.next_frame()
+    if raw is None:
+        continue
+    ...
 ```
 
-## 如何判断输出有没有问题
+### 2. `offline_replay_autocalibrated.py`
 
-如果 `tracker_valid=False` 很多，优先检查：
+用于对一段未正式标定的 raw JSONL 做 post-hoc 离线 replay。它会自动构造临时 task coordinate system，自动生成临时 block/track scene，然后跑现有 TrialController / BlockController。
 
-- raw 里的 `trackers` 是否存在。
-- 默认 `tracker_index=0` 是否选错 tracker。
-- tracker 是否有 `position: [x, y, z]`。
-- tracker 的 `valid` 是否为 `false`。
+它适合 smoke test 和调试，不是正式实验分析工具。
 
-如果 `hand_valid=True` 但 `pinch_valid=False`，优先检查：
+示例，宽通道正样本：
 
-- node id 是否正确。
-- 默认 thumb tip 是 `4`，index tip 是 `9`。
-- 对应 node 是否有 3D `position`。
+```powershell
+python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_14.jsonl --out-dir data\offline_replay\experiment_14_block060 --max-frames 5000 --calibration-frames 100 --scene-mode wide-track --block-size 0.6
+```
 
-如果 `pinch_state=PINCH_INSUFFICIENT` 很多，优先检查：
+示例，窄通道 blocked 压力测试：
 
-- `pinch_distance` 分布是否明显大于默认阈值。
-- 默认 `pinch_grab_threshold=0.025`，`pinch_release_threshold=0.035`，单位按米理解。
+```powershell
+python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_15.jsonl --out-dir data\offline_replay\experiment_15_narrow --max-frames 5000 --calibration-frames 100 --scene-mode narrow-corridor --block-size 0.6 --narrow-track-width 0.08
+```
 
-如果一直 `contact_state=OUTSIDE_BLOCK`，优先检查：
+示例，PCA 校准方式：
 
-- 当前是否使用了 demo task 坐标系。
-- `pinch_center_task` 是否在 block box 附近。
-- 默认 block 初始中心是 `(0,0,0)`，默认 block size 是 `1 x 1 x 1`。
-- 真实实验通常需要 calibration 和真实 block/track 配置。
+```powershell
+python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_12.jsonl --out-dir data\offline_replay\experiment_12_pca --max-frames 5000 --calibration-mode pca --calibration-frames 100 --scene-mode wide-track --block-size 0.6
+```
 
-## Calibration 文件
+常用参数：
 
-`--calibration` 接收的是 JSON，不是 YAML。保存格式由 `calibration_io.py` 定义：
+```text
+--raw-jsonl              输入 raw JSONL
+--out-dir                输出目录
+--max-frames             最多 replay 多少帧
+--calibration-mode       initial-window 或 pca
+--calibration-frames     用前多少个有效点估计临时坐标系
+--scene-mode             wide-track / fitted-corridor / narrow-corridor
+--block-size             临时物块尺寸，三个轴同值
+--track-margin           wide-track 外扩边界
+--track-width            fitted-corridor 通道宽度
+--narrow-track-width     narrow-corridor 通道宽度
+--z-tolerance            corridor 的 z 容差
+```
+
+重要说明：
+
+- `offline_replay_autocalibrated.py` 会为了离线完整 replay 基本关闭 trial timeout 和 too-many-detach 限制。
+- 它会强制 replay 时 `subject_end=False`，避免一段 raw 里提前结束后无法继续观察后续帧。
+- 它的 task coordinate system 和 scene 都是临时自动估计，不代表正式实验标定。
+- 当前临时物块初始中心来自第一帧有效输入点，命令行只暴露 `--block-size`，没有暴露手动 block center。
+
+### 3. `batch_offline_replay_report.py`
+
+用于一条命令批量跑多组 JSONL，并生成 `batch_summary.csv` / `batch_summary.json`。它是回归基线工具，用来防止后续改代码时把已经跑通的 parser / adapter / TrialController / BlockController pipeline 改坏。
+
+它不是正式实验分析工具。
+
+基本命令：
+
+```powershell
+python batch_offline_replay_report.py --cases data/offline_replay_batch/cases_example.json --out-dir data/offline_replay_batch --overwrite
+```
+
+如果希望 expectation 失败时返回非零退出码：
+
+```powershell
+python batch_offline_replay_report.py --cases data/offline_replay_batch/cases_example.json --out-dir data/offline_replay_batch --overwrite --stop-on-fail
+```
+
+参数说明：
+
+```text
+--cases              必填，batch cases JSON
+--out-dir            默认 data/offline_replay_batch
+--overwrite          只清理当前 case_id 对应的输出子目录
+--stop-on-fail       有 FAIL/ERROR 时提前停止并返回非零退出码
+--python-executable  默认使用当前 sys.executable
+```
+
+`cases_example.json` 里可以写：
+
+```json
+{
+  "cases": [
+    {
+      "id": "experiment_14_block060",
+      "raw_jsonl": "D:/download_edge/dataansys/raw_frames_15_parts/experiment_14.jsonl",
+      "description": "positive moving sample",
+      "args": {
+        "calibration_mode": "initial-window",
+        "calibration_frames": 100,
+        "scene_mode": "wide-track",
+        "block_size": 0.6
+      },
+      "expectations": [
+        {"metric": "moving_frame_count", "op": ">=", "value": 1},
+        {"metric": "large_delta_frame_count", "op": "==", "value": 0}
+      ]
+    }
+  ]
+}
+```
+
+支持的 expectation op：
+
+```text
+==
+!=
+>
+>=
+<
+<=
+between
+```
+
+`between` 示例：
+
+```json
+{"metric": "pinch_distance_mean", "op": "between", "value": [0.01, 0.20]}
+```
+
+case id 只能包含字母、数字、下划线、短横线和点号。`--overwrite` 不会删除整个 `out_dir`，只会删除对应 `out_dir/case_id`。
+
+## 输出文件怎么看
+
+单个 offline replay case 输出目录通常包含：
+
+```text
+frames.csv
+events.csv
+calibration_auto.json
+scene_auto.json
+summary.json
+task_trajectory_xyz.png
+pinch_distance_over_time.png
+block_center_xyz_over_time.png
+contact_state_over_time.png
+stop_reason_counts.png
+```
+
+如果没有安装 `matplotlib`，PNG 可能不存在，不影响 CSV/JSON。
+
+### `summary.json`
+
+最常看的字段：
+
+```text
+total_raw_frames                  原始帧数
+replayed_raw_frames               实际 replay 帧数
+valid_input_frames                有可用输入点的帧数
+valid_pinch_frames                有可用 pinch center/input point 的帧数
+tracker_invalid_frame_count       tracker invalid 帧数
+invalid_input_frame_count         输入无效帧数
+generated_contact_enter_count     contact_enter 事件数
+generated_contact_exit_count      contact_exit 事件数
+slip_active_frame_count           slip active 帧数
+blocked_frame_count               blocked 帧数
+large_delta_frame_count           large delta 帧数
+pinch_distance_min/mean/max       pinch 距离统计
+task_trajectory_range             输入点在 task 坐标系下的范围
+warnings                          离线工具产生的警告
+```
+
+注意：`task_trajectory_range` 是输入点轨迹范围，不是物块轨迹。它是 world input point 转到 task coordinate system 后的范围。同一个 raw 样本如果 calibration 参数不同，task trajectory 也会不同。
+
+### `frames.csv`
+
+判断状态机是否真的移动物块，优先看：
+
+```text
+pinch_state
+contact_state
+block_motion_state
+stop_reason
+block_center_task_x
+block_center_task_y
+block_center_task_z
+events
+```
+
+几个常见组合：
+
+```text
+PINCH_VALID + INSIDE_BLOCK + GRABBED_MOVING
+```
+
+说明抓取有效、接触物块、物块正在移动。
+
+```text
+PINCH_INSUFFICIENT + INSIDE_BLOCK + GRABBED_PINCH_INSUFFICIENT
+```
+
+说明手在物块里，但 pinch 距离不满足抓取阈值，通常会触发 slip 相关反馈。
+
+```text
+PINCH_VALID + OUTSIDE_BLOCK
+```
+
+说明 pinch 有效，但没接触到物块，不应该移动物块。
+
+```text
+GRABBED_BLOCKED 或 stop_reason=TRACK_BLOCKED
+```
+
+说明通道约束阻挡了物块移动。
+
+真正的物块轨迹在：
+
+```text
+block_center_task_x
+block_center_task_y
+block_center_task_z
+```
+
+不是 `task_trajectory_range`。
+
+### `events.csv`
+
+常见事件：
+
+```text
+tracking_invalid
+tracking_recovered
+contact_enter
+contact_exit
+pinch_valid
+pinch_insufficient
+block_moved
+slip_start
+slip_end
+block_blocked_start
+block_blocked_end
+blocked_force_start
+blocked_force_end
+active_release
+unexpected_detach
+```
+
+`block_moved` 是 moving 状态从 false 到 true 的边缘事件，不是每一帧移动都写一条。每帧运动情况要看 `frames.csv`。
+
+## 当前几类离线样本的意义
+
+根据目前跑过的 `experiment_10` 到 `experiment_15`：
+
+```text
+experiment_12 / 14 / 15   正样本，可以看到 GRABBED_MOVING
+experiment_12 / 14 / 15 narrow/fitted   通道压力测试，可以看到 GRABBED_BLOCKED
+experiment_10 / 11        pinch 距离太大，适合作 no-pinch 负样本
+experiment_13             有 PINCH_VALID 但在物块外，适合作 outside-block 负样本
+```
+
+这些结果适合做 regression baseline，不适合直接写成正式实验结论。
+
+## YAML 目前怎么用
+
+`config_example.yaml` 当前只是配置模板和记录文件，代码不会自动读取它。
+
+也就是说，如果你在 YAML 里修改了参数，它不会自动影响：
+
+```text
+run_live_preview.py
+offline_replay_autocalibrated.py
+batch_offline_replay_report.py
+```
+
+现在需要手动把 YAML 里的值对应到命令行参数，或者改 Python 里的 config。
+
+例如 YAML 里记录：
+
+```yaml
+offline_replay:
+  raw_jsonl: "D:/download_edge/dataansys/raw_frames_15_parts/experiment_14.jsonl"
+  out_dir: "data/offline_replay/experiment_14_block060"
+  max_frames: 5000
+  calibration_mode: "initial-window"
+  calibration_frames: 100
+  scene_mode: "wide-track"
+  block_size: 0.6
+```
+
+对应命令是：
+
+```powershell
+python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_14.jsonl --out-dir data\offline_replay\experiment_14_block060 --max-frames 5000 --calibration-mode initial-window --calibration-frames 100 --scene-mode wide-track --block-size 0.6
+```
+
+如果要批量跑，推荐把这些参数写进：
+
+```text
+data/offline_replay_batch/cases_example.json
+```
+
+而不是 YAML。
+
+## Calibration JSON
+
+`run_live_preview.py --calibration` 接收的是 JSON，不是 YAML。格式由 `calibration_io.py` 定义，示例：
 
 ```json
 {
@@ -147,135 +408,67 @@ stop_reason           停止原因，例如 TRACKING_INVALID / PINCH_INSUFFICIEN
 }
 ```
 
-如果不传 `--calibration`，preview 使用 demo 坐标系：
+如果不传 `--calibration`，preview 使用 demo 坐标系。这只适合 smoke test，不适合判断真实实验空间是否对齐。
+
+`offline_replay_autocalibrated.py` 不读 calibration JSON。它会根据 raw 数据前一段有效输入点自动估计临时坐标系。
+
+## 常见问题
+
+### 一直 timeout
+
+优先检查 `timestamp_scale`。如果 raw timestamp 是毫秒，默认 `0.001` 是对的；如果 raw timestamp 已经是秒，应使用 `--timestamp-scale 1.0`。离线 autocalibrated replay 已经基本关闭 timeout，`run_live_preview.py` 更容易暴露 timestamp 问题。
+
+### `tracker_valid=False` 很多
+
+检查：
 
 ```text
-origin_world = [0, 0, 0]
-x_axis_world 约等于 [1, 0, 0]
-z_axis_world = [0, 0, 1]
+raw 里是否有 trackers
+tracker_index 是否选错
+tracker 是否有 position: [x, y, z]
+tracker.valid 是否为 false
 ```
 
-这只适合 smoke test，不适合判断真实实验空间是否对齐。
+### `hand_valid=True` 但 pinch 无效
 
-## YAML 怎么改
+检查：
 
-当前仓库没有自动读取 YAML 的逻辑。`config_example.yaml` 是推荐模板，用来记录一次实验或一次 preview 的配置。现在你需要把 YAML 里的值手动对应到命令行参数或 Python config 里。
-
-最常改的是 `preview`：
-
-```yaml
-preview:
-  raw_jsonl: "D:/download_edge/dataansys/raw_frames_15_parts/experiment_01.jsonl"
-  trial_id: "smoke_001"
-  max_frames: 1000
-  print_every: 10
-  timestamp_scale: 0.001
-  calibration: null
+```text
+thumb_node 是否正确，默认 4
+index_node 是否正确，默认 9
+对应 node 是否有 3D position
+skeleton_index 是否选错
 ```
 
-对应运行命令：
+### `PINCH_INSUFFICIENT` 很多
 
-```powershell
-python run_live_preview.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_01.jsonl --max-frames 1000 --print-every 10 --trial-id smoke_001 --timestamp-scale 0.001
+当前核心阈值在 `config.py`：
+
+```text
+pinch_grab_threshold = 0.025
+pinch_release_threshold = 0.035
 ```
 
-如果 timestamp 已经是秒：
+单位按米理解。如果真实 pinch distance 常见值远大于 0.035，需要重新评估 node、坐标尺度或阈值。
 
-```yaml
-preview:
-  timestamp_scale: 1.0
-```
+### 有 `PINCH_VALID` 但物块不动
 
-如果有 calibration JSON：
+看 `contact_state`。如果是 `OUTSIDE_BLOCK`，说明手指闭合了但没有碰到物块，这是合理负样本。
 
-```yaml
-preview:
-  calibration: "D:/path/to/calibration.json"
-```
+### `task_trajectory_xyz.png` 是什么
 
-对应命令加：
-
-```powershell
---calibration D:\path\to\calibration.json
-```
-
-设备 adapter 相关字段在 `adapter`：
-
-```yaml
-adapter:
-  skeleton_index: 0
-  tracker_index: 0
-  thumb_tip_node_id: 4
-  index_tip_node_id: 9
-  local_offset: [0.0, 0.0, 0.0]
-  local_scale: 1.0
-  use_tracker_rotation: false
-```
-
-修改建议：
-
-- 如果 hand 数据有效但 pinch 一直无效，优先改 `thumb_tip_node_id` 和 `index_tip_node_id`。
-- 如果 tracker 有多个，且第 0 个不是目标 tracker，改 `tracker_index`。
-- 如果 skeleton 有多个，且第 0 个不是目标手，改 `skeleton_index`。
-- 如果 `pinch_center_world` 整体偏移固定，改 `local_offset`。
-- 如果 MANUS local 坐标尺度明显不对，改 `local_scale`。
-- `use_tracker_rotation` 当前保留为 future TODO，第一版还没有做完整 rotation fusion。
-
-核心交互阈值在 `engine`：
-
-```yaml
-engine:
-  pinch_grab_threshold: 0.025
-  pinch_release_threshold: 0.035
-  max_hand_delta_per_frame: 0.25
-  trial_timeout_seconds: 60.0
-  max_detach_count: 3
-```
-
-修改建议：
-
-- 如果真实 pinch distance 常见值大于 `0.035`，需要重新评估 pinch 阈值。
-- 如果经常出现 `STOPPED_BY_LARGE_DELTA`，可能是坐标尺度过大、采样跳变或 `max_hand_delta_per_frame` 太小。
-- 如果 preview 第一帧 timeout，通常是 `timestamp_scale` 不对。
-
-## 多 Trial JSONL 注意事项
-
-当前 `run_live_preview.py` 把一个 JSONL 当成一个 preview trial。它适合 smoke test，不适合一次性评估十几组实验。
-
-如果一个 JSONL 包含多组 trial，需要先按边界切分。边界可以来自：
-
-- raw 里的 `trial_id`
-- raw 里的 `subject_end=true`
-- 文件名或外部记录
-
-否则第一组 `subject_end` 后，后续帧会继续进入同一个已经结束的 trial。
-
-## 文件型 Source 和真实 Socket Source
-
-JSONL 文件有结尾，所以 preview 里可以使用：
-
-```python
-for frame in source:
-    ...
-```
-
-真实 socket/live source 以后不要这样写。socket 的 `None` 表示“当前没有新帧”，不表示数据结束。实时流应该使用：
-
-```python
-while running:
-    raw = source.next_frame()
-    if raw is None:
-        continue
-    ...
-```
+现在它画的是输入点在 task 坐标系下的 x/y 轨迹。它不是物块轨迹。物块轨迹看 `block_center_xyz_over_time.png` 或 `frames.csv` 里的 `block_center_task_*`。
 
 ## 当前还没做的事
 
-- 没有正式实验 UI。
-- 没有触觉硬件控制。
-- 没有真实 socket 接入。
-- 没有自动读取 YAML 配置。
-- 没有完整 MANUS/Vive rotation fusion。
-- 没有多 trial JSONL 离线诊断脚本。
+```text
+没有正式 GUI
+没有真实 socket live loop
+没有触觉硬件控制
+没有自动读取 YAML 配置
+没有完整 MANUS/Vive rotation fusion
+没有正式在线 calibration 流程
+没有正式 scene 配置流程
+```
 
-下一步最值得做的是增加一个 `analyze_raw_jsonl.py`，统计 tracker/hand/pinch 有效率、pinch distance 分布、pinch center 范围和每个 trial 的事件摘要。
+下一步建议是：用 `batch_offline_replay_report.py` 固化当前几组离线样本的 baseline，然后再进入正式 calibration、真实 scene 配置和 live/socket/haptic 联调。
