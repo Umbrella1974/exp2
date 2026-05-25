@@ -51,6 +51,17 @@ def test_jsonl_raw_frame_source_non_object_reports_line_number(tmp_path) -> None
         source.close()
 
 
+def test_jsonl_raw_frame_source_accepts_utf8_bom(tmp_path) -> None:
+    path = tmp_path / "bom.jsonl"
+    path.write_text('\ufeff{"frame": 1}\n', encoding="utf-8")
+
+    source = JsonlRawFrameSource(path)
+    try:
+        assert source.next_frame() == {"frame": 1}
+    finally:
+        source.close()
+
+
 def test_iterable_raw_frame_source_yields_copies_in_order() -> None:
     original = [{"frame": 1}, {"frame": 2}]
     source = IterableRawFrameSource(original)

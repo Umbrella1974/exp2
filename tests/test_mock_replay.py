@@ -16,7 +16,13 @@ def make_controller(
     track_size: float = 4.0,
     initial_block_center: Vec3 = Vec3(0.0, 0.0, 0.0),
 ) -> TrialController:
-    config = config or EngineConfig(max_hand_delta_per_frame=0.5, slip_motion_threshold=0.05)
+    config = config or EngineConfig(
+        block_size_x=1.0,
+        block_size_y=1.0,
+        block_size_z=1.0,
+        max_hand_delta_per_frame=0.5,
+        slip_motion_threshold=0.05,
+    )
     track = TrackRegion(boxes=(Box3D(center=Vec3(0.0, 0.0, 0.0), size=Vec3(track_size, track_size, track_size)),))
 
     def factory() -> BlockController:

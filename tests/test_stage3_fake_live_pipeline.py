@@ -41,7 +41,13 @@ def raw_frame(timestamp: float, pinch_x: float, *, subject_end: bool = False) ->
 
 
 def test_fake_raw_json_runs_full_pipeline() -> None:
-    config = EngineConfig(max_hand_delta_per_frame=0.5, slip_motion_threshold=0.05)
+    config = EngineConfig(
+        block_size_x=1.0,
+        block_size_y=1.0,
+        block_size_z=1.0,
+        max_hand_delta_per_frame=0.5,
+        slip_motion_threshold=0.05,
+    )
     track = TrackRegion(boxes=(Box3D(center=Vec3(0.0, 0.0, 0.0), size=Vec3(4.0, 4.0, 4.0)),))
 
     def factory() -> BlockController:
@@ -83,7 +89,13 @@ def test_fake_raw_jsonl_source_runs_full_pipeline(tmp_path) -> None:
     )
     path.write_text("\n".join(json.dumps(frame) for frame in frames), encoding="utf-8")
 
-    config = EngineConfig(max_hand_delta_per_frame=0.5, slip_motion_threshold=0.05)
+    config = EngineConfig(
+        block_size_x=1.0,
+        block_size_y=1.0,
+        block_size_z=1.0,
+        max_hand_delta_per_frame=0.5,
+        slip_motion_threshold=0.05,
+    )
     track = TrackRegion(boxes=(Box3D(center=Vec3(0.0, 0.0, 0.0), size=Vec3(4.0, 4.0, 4.0)),))
 
     def factory() -> BlockController:

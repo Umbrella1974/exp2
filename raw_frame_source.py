@@ -31,7 +31,7 @@ class JsonlRawFrameSource(RawFrameSource):
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        self._handle = self.path.open("r", encoding="utf-8")
+        self._handle = self.path.open("r", encoding="utf-8-sig")
         self._line_number = 0
 
     def next_frame(self) -> dict[str, Any] | None:
