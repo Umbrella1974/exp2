@@ -57,13 +57,14 @@ pytest -q
 当前应为：
 
 ```text
-146 passed
+152 passed
 ```
 
 常用局部测试：
 
 ```powershell
 pytest -q tests/test_offline_replay_autocalibrated.py tests/test_offline_replay_session_output.py
+pytest -q tests/test_offline_replay_map_config.py
 pytest -q tests/test_batch_offline_replay_report.py
 pytest -q tests/test_analyze_session.py
 pytest -q tests/test_map_config.py tests/test_map_generator.py
@@ -145,6 +146,9 @@ python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\r
 --track-width                fitted-corridor 宽度
 --narrow-track-width         narrow-corridor 宽度
 --z-tolerance                轨道 z 方向容差
+--map-config                 可选，使用 MapConfig JSON 作为 block/track scene
+--map-id-override            可选，只覆盖本次 replay 输出中的 map_id
+--strict-map-validation      可选，MapConfig warning 也会阻止 replay
 --write-session              额外写标准 session 目录
 ```
 
@@ -153,7 +157,47 @@ python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\r
 - replay 时会强制 `subject_end=False`，避免 raw 中途结束导致后续帧无法观察。
 - 离线 replay 基本关闭 trial timeout 和 too-many-detach 限制，方便完整回放一段数据。
 - 临时坐标系和临时 scene 都是 post-hoc 结果，不应作为正式实验结论。
-- 当前离线脚本的物块初始中心来自第一帧有效输入点；CLI 暂不暴露手动 block center。
+- 不传 `--map-config` 时，物块初始中心来自第一帧有效输入点，block/track 由 `--scene-mode` 自动生成。
+- 传 `--map-config` 时，物块初始中心、物块尺寸和轨道都来自 MapConfig；`--scene-mode`、`--block-size` 等 auto scene 参数不再决定 block/track 几何。
+
+使用 MapConfig 跑旧 raw JSONL：
+
+```powershell
+python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_14.jsonl --out-dir data\offline_replay\exp14_map_xoy_turn --max-frames 5000 --calibration-frames 100 --map-config maps\examples\xoy_turn.json --write-session
+```
+
+然后用 analyzer 查看多段地图可视化：
+
+```powershell
+python analyze_session.py --session-dir data\offline_replay\exp14_map_xoy_turn\session --overwrite
+```
+
+注意：这个流程使用配置地图，但 calibration 仍然是 post-hoc auto，不是正式实验。它适合检查真实数据在指定 MapConfig 地图中的 pipeline 表现和可视化，不应作为正式实验结果。
+
+MapConfig replay 行为：
+
+- `validation.errors` 会阻止 replay。
+- 默认 `validation.warnings` 不阻止 replay，会写入 `summary.json`、`scene_auto.json`、`session/trial_config.json` 和 `session/trial_summary.json`。
+- 如果传 `--strict-map-validation`，warnings 也会阻止 replay。
+- `--map-id-override` 只影响本次输出，不修改原始 map JSON；输出 metadata 会保留 `original_map_id` 和 `map_id_overridden`。
+- 使用 `--map-config` 时，`session_meta.json` 和 `calibration.json` 仍标记 `calibration_type=post_hoc_auto`、`is_formal_calibration=false`，`trial_config.json` 和 `scene_auto.json` 标记 `scene_type=map_config`、`is_formal_scene=false`。
+
+MapConfig replay 会在 `summary.json`、`scene_auto.json`、`session/trial_config.json` 和 `session/trial_summary.json` 中记录：
+
+```text
+map_config_used
+map_id
+original_map_id
+map_id_overridden
+map_config_path
+map_config_version
+map_source_type
+track_box_count
+target_region_present
+strict_map_validation
+map_validation_errors
+map_validation_warnings
+```
 
 ## `analyze_session.py`
 
@@ -289,6 +333,8 @@ between
 
 `case_id` 只能包含字母、数字、下划线、短横线和点，避免误删路径。
 
+注意：当前 batch runner 的 case args 还没有透传 `map_config`、`map_id_override`、`strict_map_validation`。如果要批量跑 MapConfig replay，需要先扩展 `batch_offline_replay_report.py` 的 supported case args；单次 MapConfig replay 请直接使用 `offline_replay_autocalibrated.py --map-config`。
+
 ## `run_live_preview.py`
 
 这个脚本是轻量 preview/smoke 工具，用于快速检查一个 JSONL 文件能否跑通 parser/adapter/trial/block pipeline。它不是批量离线评估工具。
@@ -389,6 +435,23 @@ pinch_distance_min / mean / max
 task_trajectory_range
 block_displacement_task
 warnings
+```
+
+MapConfig replay 额外看：
+
+```text
+map_config_used
+map_id
+original_map_id
+map_id_overridden
+map_config_path
+map_config_version
+map_source_type
+track_box_count
+target_region_present
+strict_map_validation
+map_validation_errors
+map_validation_warnings
 ```
 
 判断物块是否真的移动，优先看 `frames.csv` 或 `processed_frames.csv`：
@@ -525,7 +588,7 @@ min(0.20, last_segment_length * 0.25)
 
 如果传入的 `target_length` 超过最后一段长度，会 clamp 并在 metadata warning 中记录。
 
-注意：当前 `offline_replay_autocalibrated.py` CLI 仍然使用自动 scene，不接受 `--map-json`。MapConfig 已经可用于正式 trial/session 配置和 analyzer 绘图，但还没有接入离线 autocalibrated replay CLI。
+注意：`offline_replay_autocalibrated.py --map-config` 可以把旧 raw JSONL 跑在 MapConfig 地图中，但 calibration 仍然是 post-hoc auto，所以这个流程仍是调试/可视化用途，不是正式实验结果。
 
 ## YAML 现在怎么用
 
@@ -572,7 +635,7 @@ python run_live_preview.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_
 }
 ```
 
-但这只影响使用 MapConfig 的正式配置路径，不会自动影响 `offline_replay_autocalibrated.py` 的自动 scene。
+如果使用 `offline_replay_autocalibrated.py --map-config path/to/map.json`，则 replay 的 block 初始位置、物块尺寸和轨道来自该 MapConfig；否则仍使用自动 scene。
 
 ## Calibration JSON
 
@@ -641,8 +704,7 @@ pinch_release_threshold = 0.035
 没有自动读取 YAML 配置
 没有完整 MANUS/Vive rotation fusion
 没有正式在线 calibration 流程
-offline_replay_autocalibrated.py 还没有 --map-json
-MapConfig 已可验证/编译/写 trial_config，但还没有接进离线 replay CLI
+MapConfig replay 仍使用 post-hoc auto calibration，不能标记成正式实验
 ```
 
-比较自然的下一步是：把 MapConfig 接入正式 trial/session 配置路径，之后再决定是否给 `offline_replay_autocalibrated.py` 增加 `--map-json`，让离线数据也能直接复用正式地图。
+比较自然的下一步是：把 MapConfig 接入正式在线 trial/session 配置路径，并实现正式受试者标定流程。

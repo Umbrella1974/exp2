@@ -31,6 +31,12 @@ from config import EngineConfig
 from data_models import Box3D, TrackRegion, Vec3
 from device_frame_models import DeviceAdapterConfig
 from manus_vive_adapter import ManusViveExperimentAdapter
+from map_config import (
+    compile_map_to_track_region,
+    load_map_config,
+    map_config_to_trial_config,
+    validate_map_config,
+)
 from raw_frame_source import JsonlRawFrameSource
 from raw_manus_vive_parser import parse_raw_manus_vive_frame
 from session_recorder import SessionRecorder
@@ -41,6 +47,11 @@ from trial_controller import ExperimentInputSample, TrialController
 OFFLINE_AUTOCALIBRATED_SESSION_WARNING = (
     "This session was generated from post-hoc auto calibration and must not be treated "
     "as a formal experimental trial."
+)
+
+MAP_CONFIG_POST_HOC_WARNING = (
+    "This session uses a configured map but post-hoc auto calibration; it must not be "
+    "treated as a formal experimental trial."
 )
 
 HAPTIC_EVENT_TYPES = {
@@ -76,6 +87,9 @@ class OfflineReplayConfig:
     timestamp_scale: float = 0.001
     offline_trial_timeout_seconds: float = 1e9
     offline_max_detach_count: int = 1_000_000_000
+    map_config: Path | None = None
+    map_id_override: str | None = None
+    strict_map_validation: bool = False
     write_session: bool = False
     session_dir: Path | None = None
     session_id: str | None = None
@@ -320,6 +334,61 @@ def build_auto_scene(
     return SceneResult(track, block_center, block_size, payload, warnings)
 
 
+def build_map_config_scene(config: OfflineReplayConfig) -> SceneResult:
+    """Build a scene from a MapConfig JSON file without changing controller logic."""
+
+    if config.map_config is None:
+        raise ValueError("map_config path is required to build a MapConfig scene.")
+
+    map_path = Path(config.map_config)
+    map_config = load_map_config(map_path)
+    validation = validate_map_config(map_config)
+    if validation.errors:
+        raise ValueError("map validation failed: " + "; ".join(validation.errors))
+    if validation.warnings and config.strict_map_validation:
+        raise ValueError(
+            "strict map validation failed due to warnings: "
+            + "; ".join(validation.warnings)
+        )
+
+    track_region, block_center, block_size = compile_map_to_track_region(map_config)
+    payload = map_config_to_trial_config(map_config)
+    original_map_id = payload.get("map_id", "")
+    map_id_overridden = config.map_id_override is not None
+    if map_id_overridden:
+        payload["map_id"] = config.map_id_override
+
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata.update(
+        {
+            "original_map_id": original_map_id,
+            "map_id_overridden": map_id_overridden,
+        }
+    )
+    payload["metadata"] = metadata
+    payload.update(
+        {
+            "scene_type": "map_config",
+            "scene_mode": "map_config",
+            "is_formal_scene": False,
+            "map_config_used": True,
+            "original_map_id": original_map_id,
+            "map_id_overridden": map_id_overridden,
+            "map_config_path": str(map_path),
+            "strict_map_validation": bool(config.strict_map_validation),
+            "map_validation_errors": list(validation.errors),
+            "map_validation_warnings": list(validation.warnings),
+            "track_box_count": len(map_config.track_boxes),
+            "target_region_present": map_config.target_region is not None,
+        }
+    )
+
+    warnings = [MAP_CONFIG_POST_HOC_WARNING] + list(validation.warnings)
+    return SceneResult(track_region, block_center, block_size, payload, warnings)
+
+
 def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
     """Run the full offline autocalibrated replay and return serializable outputs."""
 
@@ -329,12 +398,16 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
     task_points = np.vstack(
         [calibration.task_coordinate_system.world_to_task(point) for point in points_world]
     )
-    scene = build_auto_scene(task_points, config)
+    scene = (
+        build_map_config_scene(config)
+        if config.map_config is not None
+        else build_auto_scene(task_points, config)
+    )
 
     engine_config = EngineConfig(
-        block_size_x=config.block_size,
-        block_size_y=config.block_size,
-        block_size_z=config.block_size,
+        block_size_x=scene.block_size.x,
+        block_size_y=scene.block_size.y,
+        block_size_z=scene.block_size.z,
         trial_timeout_seconds=config.offline_trial_timeout_seconds,
         max_detach_count=config.offline_max_detach_count,
         max_hand_delta_per_frame=10.0,
@@ -353,7 +426,10 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
         session_recorder = SessionRecorder(session_dir)
         session_recorder.start_session(
             session_meta=_offline_session_meta(config, session_dir),
-            calibration=_offline_session_calibration(calibration.payload),
+            calibration=_offline_session_calibration(
+                calibration.payload,
+                warnings=[MAP_CONFIG_POST_HOC_WARNING] if config.map_config is not None else None,
+            ),
             trial_config=_offline_session_trial_config(
                 scene.payload,
                 engine_config,
@@ -479,7 +555,7 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
         "pinch_distance_mean": mean(pinch_distances) if pinch_distances else None,
         "pinch_distance_max": max(pinch_distances) if pinch_distances else None,
         "task_trajectory_range": _trajectory_range_payload(task_points),
-        "scene_mode": config.scene_mode,
+        "scene_mode": scene.payload.get("scene_mode", config.scene_mode),
         "calibration_mode": config.calibration_mode,
         "calibration_frames": config.calibration_frames,
         "raw_subject_end_frame_count": int(raw_subject_end_count),
@@ -491,24 +567,29 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
         "task_y_min": float(np.min(task_points[:, 1])),
         "task_y_max": float(np.max(task_points[:, 1])),
         "task_y_median": float(np.median(task_points[:, 1])),
-        "corridor_y_center": scene.payload["corridor_y_center"],
+        "corridor_y_center": scene.payload.get("corridor_y_center"),
         "warnings": warnings,
     }
+    if scene.payload.get("map_config_used"):
+        summary.update(_map_summary_fields(scene.payload))
     if session_recorder is not None:
         session_recorder.finalize(summary)
     return OfflineReplayResult(frames, events, calibration.payload, scene.payload, summary)
 
 
 def _offline_session_meta(config: OfflineReplayConfig, session_dir: Path) -> dict[str, Any]:
+    warnings = [OFFLINE_AUTOCALIBRATED_SESSION_WARNING]
+    if config.map_config is not None:
+        warnings.append(MAP_CONFIG_POST_HOC_WARNING)
     session_meta = {
         "session_id": config.session_id or session_dir.name,
         "mode": "offline_autocalibrated",
         "trial_id": "offline_autocalibrated",
         "calibration_type": "post_hoc_auto",
         "is_formal_calibration": False,
-        "scene_type": "post_hoc_auto",
+        "scene_type": "map_config" if config.map_config is not None else "post_hoc_auto",
         "is_formal_scene": False,
-        "warnings": [OFFLINE_AUTOCALIBRATED_SESSION_WARNING],
+        "warnings": warnings,
     }
     if config.subject_id is not None:
         session_meta["subject_id"] = config.subject_id
@@ -517,12 +598,19 @@ def _offline_session_meta(config: OfflineReplayConfig, session_dir: Path) -> dic
     return session_meta
 
 
-def _offline_session_calibration(calibration_payload: dict[str, Any]) -> dict[str, Any]:
-    return {
+def _offline_session_calibration(
+    calibration_payload: dict[str, Any],
+    *,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    payload = {
         "calibration_type": "post_hoc_auto",
         "is_formal_calibration": False,
         "calibration_auto": calibration_payload,
     }
+    if warnings:
+        payload["warnings"] = list(warnings)
+    return payload
 
 
 def _offline_session_trial_config(
@@ -530,6 +618,16 @@ def _offline_session_trial_config(
     engine_config: EngineConfig,
     warnings: list[str],
 ) -> dict[str, Any]:
+    if scene_payload.get("scene_type") == "map_config":
+        payload = dict(scene_payload)
+        payload["pinch_threshold"] = {
+            "grab": engine_config.pinch_grab_threshold,
+            "release": engine_config.pinch_release_threshold,
+        }
+        payload["trial_timeout_seconds"] = engine_config.trial_timeout_seconds
+        payload["warnings"] = warnings
+        return payload
+
     return {
         "scene_type": "post_hoc_auto",
         "is_formal_scene": False,
@@ -544,6 +642,23 @@ def _offline_session_trial_config(
         },
         "trial_timeout_seconds": engine_config.trial_timeout_seconds,
         "warnings": warnings,
+    }
+
+
+def _map_summary_fields(scene_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "map_config_used": True,
+        "map_id": scene_payload.get("map_id", ""),
+        "original_map_id": scene_payload.get("original_map_id", ""),
+        "map_id_overridden": bool(scene_payload.get("map_id_overridden")),
+        "map_config_path": scene_payload.get("map_config_path", ""),
+        "map_config_version": scene_payload.get("map_config_version", ""),
+        "map_source_type": scene_payload.get("map_source_type", ""),
+        "track_box_count": scene_payload.get("track_box_count", 0),
+        "target_region_present": bool(scene_payload.get("target_region_present")),
+        "strict_map_validation": bool(scene_payload.get("strict_map_validation")),
+        "map_validation_errors": list(scene_payload.get("map_validation_errors", [])),
+        "map_validation_warnings": list(scene_payload.get("map_validation_warnings", [])),
     }
 
 
@@ -587,6 +702,9 @@ def main() -> None:
         z_tolerance=args.z_tolerance,
         out_dir=Path(args.out_dir),
         offline_max_detach_count=args.offline_max_detach_count,
+        map_config=Path(args.map_config) if args.map_config is not None else None,
+        map_id_override=args.map_id_override,
+        strict_map_validation=args.strict_map_validation,
         write_session=args.write_session,
         session_dir=Path(args.session_dir) if args.session_dir is not None else None,
         session_id=args.session_id,
@@ -827,6 +945,27 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--z-tolerance", type=float, default=0.20)
     parser.add_argument("--out-dir", default="data/offline_replay")
     parser.add_argument("--offline-max-detach-count", type=int, default=1_000_000_000)
+    parser.add_argument(
+        "--map-config",
+        default=None,
+        help=(
+            "Optional MapConfig JSON scene. When set, replay still uses post-hoc "
+            "auto calibration, but block/track geometry comes from this map."
+        ),
+    )
+    parser.add_argument(
+        "--map-id-override",
+        default=None,
+        help="Override map_id in this replay output only; the source map JSON is not modified.",
+    )
+    parser.add_argument(
+        "--strict-map-validation",
+        action="store_true",
+        help=(
+            "When used with --map-config, fail on validation warnings as well as errors. "
+            "By default, map validation warnings are recorded but do not stop replay."
+        ),
+    )
     parser.add_argument(
         "--write-session",
         action="store_true",
