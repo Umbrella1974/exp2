@@ -628,6 +628,8 @@ def _annotate_events(plt: Any, events: list[dict[str, Any]], event_label_limit: 
 
 
 def _plot_track_geometry(plt: Any, trial_config: dict[str, Any], warnings: list[str]) -> None:
+    # Prefer MapConfig-style track_boxes so trajectory maps show the real
+    # multi-segment layout; older post-hoc sessions fall back to coarse bounds.
     if _plot_track_boxes(plt, trial_config, warnings):
         return
     warnings.append("trial_config.track_boxes missing or unusable; trajectory map used track bounds fallback.")

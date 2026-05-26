@@ -238,6 +238,11 @@ def _target_region_for_last_segment(
 
     box_min = list(last_box.min)
     box_max = list(last_box.max)
+    longitudinal_span = _longitudinal_span(last_box, direction)
+    if target_length >= longitudinal_span:
+        # Keep the target independent from the full track box even in a
+        # single-segment map where the requested length clamps to the segment.
+        target_length = max(longitudinal_span * (1.0 - 1e-9), longitudinal_span - 1e-9)
     if direction == "x+":
         box_min[0] = box_max[0] - target_length
     elif direction == "x-":
@@ -261,3 +266,9 @@ def _target_region_for_last_segment(
             "warnings": warnings,
         },
     )
+
+
+def _longitudinal_span(box: MapBoxSpec, direction: str) -> float:
+    if direction in ("x+", "x-"):
+        return float(box.max[0] - box.min[0])
+    return float(box.max[1] - box.min[1])

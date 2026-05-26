@@ -92,6 +92,29 @@ def test_generated_target_region_is_independent_and_overlaps_last_segment() -> N
     assert _has_positive_volume_overlap(target, last_segment)
 
 
+def test_generated_target_region_is_at_last_segment_end() -> None:
+    config = generate_orthogonal_corridor_map(
+        map_id="target_at_end",
+        seed=1,
+        num_segments=1,
+        start=[0.0, 0.0, 0.0],
+        initial_direction="x+",
+        segment_length_range=(0.4, 0.4),
+        track_width=0.2,
+        z_tolerance=0.1,
+        allowed_turns=["straight"],
+        target_length=0.1,
+    )
+    target = config.target_region
+    last_segment = config.track_boxes[-1]
+
+    assert target is not None
+    assert target.max[0] == pytest.approx(last_segment.max[0])
+    assert target.min[0] == pytest.approx(last_segment.max[0] - 0.1)
+    assert target.min[1:] == pytest.approx(last_segment.min[1:])
+    assert target.max[1:] == pytest.approx(last_segment.max[1:])
+
+
 def test_target_length_default_uses_min_of_20cm_or_quarter_segment() -> None:
     config = generate_orthogonal_corridor_map(
         map_id="default_target",
@@ -126,6 +149,8 @@ def test_target_length_is_clamped_when_longer_than_last_segment() -> None:
     assert config.target_region is not None
     assert config.target_region.metadata["target_length"] == pytest.approx(0.4)
     assert config.target_region.metadata["warnings"]
+    assert config.target_region.min != config.track_boxes[-1].min
+    assert config.target_region.max == config.track_boxes[-1].max
 
 
 def test_left_and_right_are_90_degree_relative_turns() -> None:
@@ -159,6 +184,8 @@ def test_left_and_right_are_90_degree_relative_turns() -> None:
 def test_generator_rejects_unsupported_plane_and_turn() -> None:
     with pytest.raises(NotImplementedError):
         _generate(seed=1, plane="xoz")
+    with pytest.raises(NotImplementedError):
+        _generate(seed=1, plane="yoz")
     with pytest.raises(ValueError, match="unsupported turns"):
         _generate(seed=1, allowed_turns=["straight", "back"])
 

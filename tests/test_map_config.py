@@ -155,6 +155,23 @@ def test_edge_only_adjacent_boxes_report_error() -> None:
     assert any("edge/point" in error for error in result.errors)
 
 
+def test_point_only_adjacent_boxes_report_error() -> None:
+    config = load_map_config("maps/examples/xoy_turn.json")
+    first = replace(config.track_boxes[0], min=[0.0, 0.0, 0.0], max=[1.0, 1.0, 1.0])
+    second = replace(config.track_boxes[1], min=[1.0, 1.0, 1.0], max=[2.0, 2.0, 2.0])
+    bad_config = replace(
+        config,
+        block_initial_center_task=[0.5, 0.5, 0.5],
+        track_boxes=[first, second],
+        target_region=None,
+    )
+
+    result = validate_map_config(bad_config)
+
+    assert not result.is_valid
+    assert any("edge/point" in error for error in result.errors)
+
+
 def test_ordered_face_contact_with_area_passes() -> None:
     config = load_map_config("maps/examples/xoy_turn.json")
     first = replace(config.track_boxes[0], min=[0.0, 0.0, 0.0], max=[1.0, 1.0, 1.0])
