@@ -105,6 +105,105 @@ def test_ordered_track_boxes_with_gap_report_error() -> None:
     assert any("gap" in error for error in result.errors)
 
 
+def test_duplicate_order_reports_error() -> None:
+    config = load_map_config("maps/examples/xoy_turn.json")
+    duplicate = replace(config.track_boxes[1], order=0)
+    bad_config = replace(config, track_boxes=[config.track_boxes[0], duplicate])
+
+    result = validate_map_config(bad_config)
+
+    assert not result.is_valid
+    assert any("duplicated" in error for error in result.errors)
+
+
+def test_missing_order_when_some_boxes_ordered_reports_error() -> None:
+    config = load_map_config("maps/examples/xoy_turn.json")
+    unordered = replace(config.track_boxes[1], order=None)
+    bad_config = replace(config, track_boxes=[config.track_boxes[0], unordered])
+
+    result = validate_map_config(bad_config)
+
+    assert not result.is_valid
+    assert any("all track_boxes must define order" in error for error in result.errors)
+
+
+def test_non_contiguous_order_reports_error() -> None:
+    config = load_map_config("maps/examples/xoy_turn.json")
+    non_contiguous = replace(config.track_boxes[1], order=2)
+    bad_config = replace(config, track_boxes=[config.track_boxes[0], non_contiguous])
+
+    result = validate_map_config(bad_config)
+
+    assert not result.is_valid
+    assert any("contiguous" in error for error in result.errors)
+
+
+def test_edge_only_adjacent_boxes_report_error() -> None:
+    config = load_map_config("maps/examples/xoy_turn.json")
+    first = replace(config.track_boxes[0], min=[0.0, 0.0, 0.0], max=[1.0, 1.0, 1.0])
+    second = replace(config.track_boxes[1], min=[1.0, 1.0, 0.0], max=[2.0, 2.0, 1.0])
+    bad_config = replace(
+        config,
+        block_initial_center_task=[0.5, 0.5, 0.5],
+        track_boxes=[first, second],
+        target_region=None,
+    )
+
+    result = validate_map_config(bad_config)
+
+    assert not result.is_valid
+    assert any("edge/point" in error for error in result.errors)
+
+
+def test_ordered_face_contact_with_area_passes() -> None:
+    config = load_map_config("maps/examples/xoy_turn.json")
+    first = replace(config.track_boxes[0], min=[0.0, 0.0, 0.0], max=[1.0, 1.0, 1.0])
+    second = replace(config.track_boxes[1], min=[1.0, 0.0, 0.0], max=[2.0, 1.0, 1.0])
+    good_config = replace(
+        config,
+        block_initial_center_task=[0.5, 0.5, 0.5],
+        track_boxes=[first, second],
+        target_region=None,
+    )
+
+    result = validate_map_config(good_config)
+
+    assert result.is_valid
+
+
+def test_ordered_volume_overlap_passes() -> None:
+    config = load_map_config("maps/examples/xoy_turn.json")
+    first = replace(config.track_boxes[0], min=[0.0, 0.0, 0.0], max=[1.1, 1.0, 1.0])
+    second = replace(config.track_boxes[1], min=[1.0, 0.0, 0.0], max=[2.0, 1.0, 1.0])
+    good_config = replace(
+        config,
+        block_initial_center_task=[0.5, 0.5, 0.5],
+        track_boxes=[first, second],
+        target_region=None,
+    )
+
+    result = validate_map_config(good_config)
+
+    assert result.is_valid
+
+
+def test_target_region_edge_only_contact_reports_error() -> None:
+    config = load_map_config("maps/examples/xoy_straight.json")
+    target = MapBoxSpec(
+        id="edge_target",
+        min=[1.2, 0.15, -0.1],
+        max=[1.4, 0.35, 0.1],
+        label="Edge target",
+        metadata={},
+    )
+    bad_config = replace(config, target_region=target)
+
+    result = validate_map_config(bad_config)
+
+    assert not result.is_valid
+    assert any("edge/point" in error for error in result.errors)
+
+
 def test_map_config_to_trial_config_is_json_serializable_and_complete() -> None:
     config = load_map_config("maps/examples/xoy_two_turns.json")
 
@@ -114,6 +213,7 @@ def test_map_config_to_trial_config_is_json_serializable_and_complete() -> None:
     assert "xoy_two_turns" in encoded
     assert trial_config["map_config_version"] == 1
     assert trial_config["map_source_type"] == "manual"
+    assert trial_config["description"] == config.description
     assert trial_config["is_generated"] is False
     assert len(trial_config["track_boxes"]) == 3
     assert trial_config["target_region"]["id"] == "target"

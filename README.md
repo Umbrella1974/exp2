@@ -1,11 +1,18 @@
 # Exp2 Constrained Block Experiment Engine
 
-这个仓库实现的是一个受约束物块交互实验引擎。当前重点是离线 smoke/regression、session 记录、事后可视化分析，以及正式实验地图配置的基础层。
+这个仓库实现的是一个“受约束物块交互实验”的核心引擎与离线调试工具链。当前重点不是 GUI 或真实硬件闭环，而是：
 
-核心实时数据流是：
+- 读取 MANUS/Vive raw JSONL 数据
+- 通过 parser / adapter 转成实验输入帧
+- 运行 TrialController 和 BlockController
+- 输出逐帧 CSV、事件、触觉状态和 summary
+- 对离线 session 做可视化分析
+- 提供 MapConfig / MapGenerator 作为正式实验地图配置基础层
+
+核心实时数据流大致是：
 
 ```text
-raw JSON / JSONL
+raw JSONL
   -> JsonlRawFrameSource
   -> parse_raw_manus_vive_frame()
   -> ManusViveExperimentAdapter
@@ -25,7 +32,7 @@ raw JSON / JSONL
 cd D:\research_history\first_one\research_code\exp2
 ```
 
-基础依赖：
+安装基础依赖：
 
 ```powershell
 pip install numpy pytest
@@ -50,51 +57,50 @@ pytest -q
 当前应为：
 
 ```text
-130 passed
+146 passed
 ```
 
 常用局部测试：
 
 ```powershell
+pytest -q tests/test_offline_replay_autocalibrated.py tests/test_offline_replay_session_output.py
 pytest -q tests/test_batch_offline_replay_report.py
-pytest -q tests/test_session_recorder.py tests/test_offline_replay_session_output.py
 pytest -q tests/test_analyze_session.py
 pytest -q tests/test_map_config.py tests/test_map_generator.py
+pytest -q tests/test_trial_controller.py tests/test_block_controller.py
 ```
 
-## 常用入口
+## 最常用流程
 
-### `run_live_preview.py`
+如果你现在拿到一包离线 JSONL 数据，建议按这个顺序跑：
 
-用于快速检查一个 JSONL 文件能不能被 parser/adapter/TrialController 跑通。它是 preview/smoke 工具，不适合批量离线评估。
+1. 先用 `offline_replay_autocalibrated.py` 跑一组单样本，看 pipeline 能不能完整跑通。
+2. 加 `--write-session` 生成标准 session 目录。
+3. 用 `analyze_session.py` 生成 summary 和图。
+4. 多组数据稳定后，把它们写进 batch cases JSON，用 `batch_offline_replay_report.py` 做回归基线。
+
+示例：
 
 ```powershell
-python run_live_preview.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_15.jsonl --max-frames 1000 --print-every 10 --trial-id smoke_001
+python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_14.jsonl --out-dir data\offline_replay\experiment_14_block060 --max-frames 5000 --calibration-frames 100 --scene-mode wide-track --block-size 0.6 --write-session
 ```
 
-常用参数：
+然后分析 session：
 
-```text
---raw-jsonl         输入 JSONL，每行一个 raw dict
---max-frames       最多处理多少帧
---print-every      每隔多少帧打印一次
---trial-id         trial id，默认 preview
---timestamp-scale  timestamp 转秒比例，默认 0.001
---calibration      可选 calibration JSON
+```powershell
+python analyze_session.py --session-dir data\offline_replay\experiment_14_block060\session --overwrite
 ```
 
-文件输入可以用 `for frame in source`，因为 JSONL 有 EOF。以后真实 socket/live source 不要用 `for`，因为 socket 的 `None` 表示“当前没有新帧”，不是数据结束。实时流应该持续调用 `next_frame()`。
+## `offline_replay_autocalibrated.py`
 
-### `offline_replay_autocalibrated.py`
+这个脚本用于未正式标定 raw JSONL 的 post-hoc 离线 replay。它会自动估计临时 task 坐标系，自动生成临时 block/track scene，然后跑现有 parser、adapter、TrialController、BlockController。
 
-用于对未正式标定 raw JSONL 做 post-hoc 离线 replay。它会自动构造临时 task coordinate system，自动生成临时 block/track scene，然后跑现有 pipeline。
-
-它适合 smoke test 和调试，不是正式实验分析工具。
+它适合 smoke test、参数调试和回归测试，不代表正式实验分析。正式实验仍然需要在线标定和正式 scene/map 配置。
 
 宽通道示例：
 
 ```powershell
-python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_14.jsonl --out-dir data\offline_replay\experiment_14_block060 --max-frames 5000 --calibration-frames 100 --scene-mode wide-track --block-size 0.6
+python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_14.jsonl --out-dir data\offline_replay\experiment_14_wide --max-frames 5000 --calibration-frames 100 --scene-mode wide-track --block-size 0.6
 ```
 
 窄通道 blocked 压力测试：
@@ -103,7 +109,7 @@ python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\r
 python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_15.jsonl --out-dir data\offline_replay\experiment_15_narrow --max-frames 5000 --calibration-frames 100 --scene-mode narrow-corridor --block-size 0.6 --narrow-track-width 0.08
 ```
 
-写标准 session 目录：
+写标准 session：
 
 ```powershell
 python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_14.jsonl --out-dir data\offline_replay\experiment_14_block060 --max-frames 5000 --calibration-frames 100 --scene-mode wide-track --block-size 0.6 --write-session
@@ -115,38 +121,45 @@ python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\r
 out_dir/session
 ```
 
-如果该目录已存在且非空，会报错，不会静默覆盖。也可以显式指定：
+也可以显式指定：
 
 ```powershell
---session-dir data\offline_sessions\experiment_14_block060 --session-id exp14_block060 --subject-id S001 --notes "offline smoke test"
+python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_14.jsonl --out-dir data\offline_replay\experiment_14_block060 --write-session --session-dir data\offline_sessions\experiment_14_block060 --session-id exp14_block060 --subject-id S001 --notes "offline smoke test"
 ```
 
-重要说明：
+常用参数：
 
-- `offline_replay_autocalibrated.py` 会为了离线完整 replay 基本关闭 trial timeout 和 too-many-detach 限制。
-- replay 时会强制 `subject_end=False`，避免一段 raw 中途结束后无法观察后续帧。
-- 自动 calibration 和自动 scene 都是 post-hoc 临时结果，不代表正式实验标定。
-- 当前临时物块初始中心来自第一帧有效输入点，命令行只暴露 `--block-size`，没有暴露手动 block center。
-
-### `batch_offline_replay_report.py`
-
-用于一条命令批量跑多组 raw JSONL，并生成 `batch_summary.csv` / `batch_summary.json`。它是 regression baseline 工具，防止后续改代码时破坏已经跑通的 parser / adapter / TrialController / BlockController pipeline。
-
-```powershell
-python batch_offline_replay_report.py --cases data/offline_replay_batch/cases_example.json --out-dir data/offline_replay_batch --overwrite
+```text
+--raw-jsonl                  输入 JSONL，每行一个 raw dict
+--out-dir                    输出目录
+--max-frames                 最多处理多少帧
+--thumb-node                 thumb tip node id，默认 4
+--index-node                 index tip node id，默认 9
+--tracker-index              Vive tracker index，默认 0
+--skeleton-index             MANUS skeleton index，默认 0
+--calibration-mode           initial-window 或 pca
+--calibration-frames         用前多少个有效点估计临时坐标系，默认 100
+--scene-mode                 wide-track / fitted-corridor / narrow-corridor
+--block-size                 物块边长，单位按米理解
+--track-margin               wide/fitted 场景边界余量
+--track-width                fitted-corridor 宽度
+--narrow-track-width         narrow-corridor 宽度
+--z-tolerance                轨道 z 方向容差
+--write-session              额外写标准 session 目录
 ```
 
-如果 expectation 失败时需要非零退出码：
+重要行为：
 
-```powershell
-python batch_offline_replay_report.py --cases data/offline_replay_batch/cases_example.json --out-dir data/offline_replay_batch --overwrite --stop-on-fail
-```
+- replay 时会强制 `subject_end=False`，避免 raw 中途结束导致后续帧无法观察。
+- 离线 replay 基本关闭 trial timeout 和 too-many-detach 限制，方便完整回放一段数据。
+- 临时坐标系和临时 scene 都是 post-hoc 结果，不应作为正式实验结论。
+- 当前离线脚本的物块初始中心来自第一帧有效输入点；CLI 暂不暴露手动 block center。
 
-`--overwrite` 只清理当前 `case_id` 对应子目录，不删除整个 `out_dir`。
+## `analyze_session.py`
 
-### `analyze_session.py`
+这个脚本只读取已记录的 session 目录，生成 `analysis_summary.json` 和可选 PNG 图。它不会重新运行 TrialController / BlockController，也不会写回 `events.csv`。
 
-用于读取 Stage 4A session 目录，生成 `analysis_summary.json` 和可视化图像。它只做事后分析，不重新运行 TrialController / BlockController，不写回 `events.csv`。
+运行：
 
 ```powershell
 python analyze_session.py --session-dir data\offline_replay\experiment_14_block060\session --overwrite
@@ -162,11 +175,19 @@ python analyze_session.py --session-dir data\offline_replay\experiment_14_block0
 
 ```text
 --session-dir          必填，session 目录
---out-dir              可选，只改变图像输出目录
---no-plots             只生成 analysis_summary.json
+--out-dir              可选，只改变 PNG 输出目录
+--no-plots             不生成 PNG，只写 analysis_summary.json
 --event-label-limit    图中最多标注多少事件文字，默认 40
 --overwrite            覆盖 analysis_summary.json 和本脚本生成的 PNG
 --time-column          sample_time / trial_time / raw_timestamp
+```
+
+时间列选择规则：
+
+```text
+优先使用 --time-column 指定列
+如果该列缺失或全为空，则 fallback:
+sample_time -> trial_time -> raw_timestamp -> frame_index
 ```
 
 输出：
@@ -180,11 +201,118 @@ session/plots/state_timeline.png
 session/plots/haptic_timeline.png
 ```
 
-`--out-dir` 只改变图片目录，`analysis_summary.json` 固定写在 `session_dir` 下。
+`trajectory_track_map.png` 会优先使用 `trial_config.json` 里的 `track_boxes` 画多段轨道，并额外画：
+
+```text
+target_region
+block_initial_center_task
+pinch path
+block path
+blocked / slip / haptic event points
+```
+
+如果 session 没有 `track_boxes`，会回退到旧的 bounds 字段，例如：
+
+```text
+track_bounds_task
+track_bounds
+track_region
+bounds
+scene_auto.track_bounds
+```
+
+识别不了边界时只画轨迹并写 warning，不会让分析失败。
+
+## `batch_offline_replay_report.py`
+
+这个脚本用于批量跑多组 raw JSONL，并生成稳定的 regression 报告。它内部通过 subprocess 调用 `offline_replay_autocalibrated.py`，尽量不改变 replay 脚本本身。
+
+运行示例：
+
+```powershell
+python batch_offline_replay_report.py --cases data\offline_replay_batch\cases_example.json --out-dir data\offline_replay_batch --overwrite
+```
+
+如果希望一旦 FAIL/ERROR 就返回非零退出码：
+
+```powershell
+python batch_offline_replay_report.py --cases data\offline_replay_batch\cases_example.json --out-dir data\offline_replay_batch --overwrite --stop-on-fail
+```
+
+输出：
+
+```text
+data/offline_replay_batch/batch_summary.csv
+data/offline_replay_batch/batch_summary.json
+data/offline_replay_batch/<case_id>/summary.json
+data/offline_replay_batch/<case_id>/frames.csv
+data/offline_replay_batch/<case_id>/events.csv
+```
+
+`--overwrite` 只会清理当前 `case_id` 对应的输出子目录，不会删除整个 `out_dir`。
+
+cases JSON 示例结构：
+
+```json
+{
+  "cases": [
+    {
+      "id": "positive_moving_experiment_14",
+      "raw_jsonl": "D:/download_edge/dataansys/raw_frames_15_parts/experiment_14.jsonl",
+      "description": "Positive moving sample",
+      "args": {
+        "calibration_mode": "initial-window",
+        "calibration_frames": 100,
+        "scene_mode": "wide-track",
+        "block_size": 0.6
+      },
+      "expectations": [
+        {"metric": "moving_frame_count", "op": ">=", "value": 1},
+        {"metric": "large_delta_frame_count", "op": "==", "value": 0}
+      ]
+    }
+  ]
+}
+```
+
+支持的 expectation 操作：
+
+```text
+==
+!=
+>
+>=
+<
+<=
+between
+```
+
+`case_id` 只能包含字母、数字、下划线、短横线和点，避免误删路径。
+
+## `run_live_preview.py`
+
+这个脚本是轻量 preview/smoke 工具，用于快速检查一个 JSONL 文件能否跑通 parser/adapter/trial/block pipeline。它不是批量离线评估工具。
+
+```powershell
+python run_live_preview.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_15.jsonl --max-frames 1000 --print-every 10 --trial-id smoke_001
+```
+
+常用参数：
+
+```text
+--raw-jsonl         输入 JSONL
+--max-frames       最多处理多少帧
+--print-every      每隔多少帧打印一次
+--trial-id         trial id，默认 preview
+--timestamp-scale  timestamp 转秒比例，默认 0.001
+--calibration      可选 calibration JSON
+```
+
+文件输入可以用 `for frame in source`，因为 JSONL 有 EOF。以后真实 socket/live source 不要用 `for`，因为 socket 的 `None` 表示“当前没有新帧”，不是数据结束；实时流应该持续调用 `next_frame()`。
 
 ## Session 输出
 
-`--write-session` 会生成：
+`offline_replay_autocalibrated.py --write-session` 会生成：
 
 ```text
 session_meta.json
@@ -199,9 +327,9 @@ trial_summary.json
 plots/
 ```
 
-`raw_frames.jsonl` 严格保存原始 raw dict，不额外写 `frame_index`，不改字段。
+`raw_frames.jsonl` 保存原始 raw dict，不额外写 `frame_index`，不改字段。
 
-`device_frames.jsonl` 保存 parser 后的 DeviceFrame 摘要，包括新版 timing 字段：
+`device_frames.jsonl` 保存 parser 后的 DeviceFrame 摘要，包括 timing 字段：
 
 ```text
 combined_monotonic_ms
@@ -213,7 +341,7 @@ tracker_callback_index
 tracker_last_update_time
 ```
 
-`processed_frames.csv` 是最常用的逐帧状态表，包含：
+`processed_frames.csv` 是最常用的逐帧状态表，常看字段：
 
 ```text
 sample_time
@@ -238,15 +366,74 @@ blocked_force_active
 large_delta
 ```
 
-注意：offline replay 中如果前几帧在 trial start time 之前，`trial_time` 可能为负数。这表示 pre-roll 数据，不是状态机错误。
+离线 replay 中如果前几帧在 trial start time 之前，`trial_time` 可能为负数。这通常表示 pre-roll 数据，不是状态机错误。
+
+## 怎么看结果
+
+优先看 `summary.json` 或 `analysis_summary.json`：
+
+```text
+valid_input_frames
+valid_pinch_frames
+tracker_invalid_frame_count
+invalid_input_frame_count
+generated_contact_enter_count
+generated_contact_exit_count
+moving_frame_count
+slip_active_frame_count
+blocked_frame_count
+large_delta_frame_count
+haptic_active_frame_count
+haptic_event_count
+pinch_distance_min / mean / max
+task_trajectory_range
+block_displacement_task
+warnings
+```
+
+判断物块是否真的移动，优先看 `frames.csv` 或 `processed_frames.csv`：
+
+```text
+pinch_state
+contact_state
+block_motion_state
+stop_reason
+block_center_task_x/y/z
+```
+
+常见组合：
+
+```text
+PINCH_VALID + INSIDE_BLOCK + GRABBED_MOVING
+```
+
+表示抓取有效、接触物块、物块正在移动。
+
+```text
+PINCH_INSUFFICIENT + INSIDE_BLOCK + GRABBED_PINCH_INSUFFICIENT
+```
+
+表示手在物块里，但 pinch 距离不满足抓取阈值。
+
+```text
+PINCH_VALID + OUTSIDE_BLOCK
+```
+
+表示 pinch 有效，但没有接触物块，不应移动物块。
+
+```text
+GRABBED_BLOCKED 或 stop_reason=TRACK_BLOCKED
+```
+
+表示通道约束阻挡了移动。
+
+`task_trajectory_range` 是输入点在 task 坐标系下的范围，不是物块轨迹。物块轨迹看 `block_center_task_x/y/z` 或 `block_displacement_task`。
 
 ## MapConfig 和 MapGenerator
 
-MapConfig 是正式实验地图配置的基础层，用手工 JSON 或规则生成的多段轨道，编译成 `BlockController` 已经支持的 `TrackRegion`。本阶段只做 map core，不接入 offline replay 或 analyzer。
+MapConfig 是正式实验地图配置的基础层。它把手写 JSON 或规则生成的多段 axis-aligned box 轨道编译成 BlockController 已经支持的 `TrackRegion`。
 
-### 手动加载 map
-
-示例地图在：
+示例地图：
 
 ```text
 maps/examples/xoy_straight.json
@@ -280,21 +467,36 @@ from map_config import map_config_to_trial_config
 trial_config = map_config_to_trial_config(config)
 ```
 
-输出会包含：
+`trial_config` 会包含：
 
 ```text
-map_config_version = 1
-map_source_type = "manual" 或 "generated"
-完整 track_boxes
-target_region
+map_config_version
+map_id
+map_source_type
+description
+coordinate_space
+unit
 block_initial_center_task
 block_size
-metadata.generated / generator_name / generator_seed / generator_params
+track_boxes
+target_region
+metadata
+is_generated
 ```
 
-### 规则生成 xoy 正交轨道
+地图校验规则：
 
-第一版 generator 只支持 xoy 平面上的 axis-aligned AABB corridor。每段只能 straight、left 或 right，转弯都是 90°，不支持斜向、不支持 180° 掉头。
+- `coordinate_space` 必须是 `task`。
+- `unit` 必须是 `m`。
+- `block_initial_center_task` 必须在至少一个 track box 内。
+- 如果任意 `track_box.order` 存在，则所有 track box 都必须有 order。
+- order 不能重复，必须是连续的 `0..n-1`。
+- 相邻 ordered boxes 必须有正体积重叠，或至少是有正面积的面接触。
+- gap、仅边接触、仅点接触都会报错。
+- `target_region` 必须和至少一个 track box 有正体积相交。
+- `target_region` 仅面接触会 warning，仅边/点接触会 error。
+
+规则生成 x-y 平面正交轨道：
 
 ```python
 from map_generator import generate_orthogonal_corridor_map
@@ -309,130 +511,25 @@ config = generate_orthogonal_corridor_map(
     track_width=0.2,
     z_tolerance=0.1,
     allowed_turns=["left", "right", "straight"],
+    target_length=None,
 )
 ```
 
-每个生成 segment 都包含：
+当前 generator 只支持 `plane="xoy"`，只支持 `left` / `right` / `straight`，转弯都是 90 度。不支持斜向、任意角度、180 度掉头或 3D maze。
+
+生成器会生成独立的 `target_region`，默认长度是：
 
 ```text
-id
-order
-label
-min / max
-metadata.segment_direction
-metadata.segment_length
-metadata.turn_from_previous
+min(0.20, last_segment_length * 0.25)
 ```
 
-`start` 同时是 `block_initial_center_task`，并且第一段 track box 必须包含它。
+如果传入的 `target_length` 超过最后一段长度，会 clamp 并在 metadata warning 中记录。
 
-## 输出文件怎么看
+注意：当前 `offline_replay_autocalibrated.py` CLI 仍然使用自动 scene，不接受 `--map-json`。MapConfig 已经可用于正式 trial/session 配置和 analyzer 绘图，但还没有接入离线 autocalibrated replay CLI。
 
-### `summary.json` / `trial_summary.json`
+## YAML 现在怎么用
 
-常看字段：
-
-```text
-total_raw_frames
-replayed_raw_frames
-valid_input_frames
-valid_pinch_frames
-tracker_invalid_frame_count
-invalid_input_frame_count
-generated_contact_enter_count
-generated_contact_exit_count
-slip_active_frame_count
-blocked_frame_count
-large_delta_frame_count
-haptic_active_frame_count
-haptic_event_count
-pinch_distance_min/mean/max
-task_trajectory_range
-warnings
-```
-
-`task_trajectory_range` 是输入点在 task 坐标系下的范围，不是物块轨迹。真正的物块轨迹看 `block_center_task_x/y/z`。
-
-### `frames.csv` / `processed_frames.csv`
-
-判断物块是否真的移动，优先看：
-
-```text
-pinch_state
-contact_state
-block_motion_state
-stop_reason
-block_center_task_x/y/z
-```
-
-常见组合：
-
-```text
-PINCH_VALID + INSIDE_BLOCK + GRABBED_MOVING
-```
-
-说明抓取有效、接触物块、物块移动。
-
-```text
-PINCH_INSUFFICIENT + INSIDE_BLOCK + GRABBED_PINCH_INSUFFICIENT
-```
-
-说明手在物块里，但 pinch 距离不满足抓取阈值。
-
-```text
-PINCH_VALID + OUTSIDE_BLOCK
-```
-
-说明 pinch 有效，但没有接触物块，不应移动物块。
-
-```text
-GRABBED_BLOCKED 或 stop_reason=TRACK_BLOCKED
-```
-
-说明通道约束阻挡了移动。
-
-### `events.csv`
-
-`events.csv` 只记录 pipeline 已有离散事件。`analyze_session.py` 会在内部派生 slip/blocked/haptic 边缘用于 summary 和图，但不会写回 `events.csv`。
-
-常见事件：
-
-```text
-tracking_invalid
-tracking_recovered
-contact_enter
-contact_exit
-pinch_valid
-pinch_insufficient
-block_moved
-slip_start
-slip_end
-block_blocked_start
-block_blocked_end
-blocked_force_start
-blocked_force_end
-active_release
-unexpected_detach
-```
-
-`block_moved` 是 moving 从 false 到 true 的边缘事件，不是每一帧移动都写一条。
-
-## 当前离线样本经验
-
-目前跑过的 `experiment_10` 到 `experiment_15` 大致可以这样用：
-
-```text
-experiment_12 / 14 / 15                正样本，可以看到 GRABBED_MOVING
-experiment_12 / 14 / 15 narrow/fitted  通道压力测试，可以看到 GRABBED_BLOCKED
-experiment_10 / 11                     pinch 距离太大，适合作 no-pinch 负样本
-experiment_13                          有 PINCH_VALID 但在物块外，适合作 outside-block 负样本
-```
-
-这些适合做 regression baseline，不适合直接写成正式实验结论。
-
-## YAML 目前怎么用
-
-`config_example.yaml` 当前只是模板和记录文件，代码不会自动读取它。修改 YAML 不会自动影响：
+`config_example.yaml` 目前只是模板和记录文件，代码不会自动读取它。修改 YAML 不会自动影响：
 
 ```text
 run_live_preview.py
@@ -443,9 +540,43 @@ analyze_session.py
 
 现在需要手动把 YAML 里的值对应到命令行参数，或者写进 batch cases JSON / map JSON。
 
+例如 YAML 里的：
+
+```yaml
+preview:
+  raw_jsonl: "D:/download_edge/dataansys/raw_frames_15_parts/experiment_01.jsonl"
+  trial_id: "smoke_001"
+  max_frames: 1000
+  print_every: 10
+  timestamp_scale: 0.001
+```
+
+对应命令行：
+
+```powershell
+python run_live_preview.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_01.jsonl --trial-id smoke_001 --max-frames 1000 --print-every 10 --timestamp-scale 0.001
+```
+
+如果想改离线 replay 的物块大小，当前改命令行：
+
+```powershell
+--block-size 0.6
+```
+
+如果想改正式地图里的物块初始位置和大小，应改 map JSON：
+
+```json
+{
+  "block_initial_center_task": [0.0, 0.0, 0.0],
+  "block_size": [0.2, 0.2, 0.2]
+}
+```
+
+但这只影响使用 MapConfig 的正式配置路径，不会自动影响 `offline_replay_autocalibrated.py` 的自动 scene。
+
 ## Calibration JSON
 
-`run_live_preview.py --calibration` 接收的是 JSON，不是 YAML。格式由 `calibration_io.py` 定义：
+`run_live_preview.py --calibration` 接收 JSON，不是 YAML。格式由 `calibration_io.py` 定义：
 
 ```json
 {
@@ -459,17 +590,26 @@ analyze_session.py
 }
 ```
 
-`offline_replay_autocalibrated.py` 不读 calibration JSON。它会根据 raw 数据前一段有效输入点自动估计临时坐标系。
+`offline_replay_autocalibrated.py` 不读 calibration JSON。它会根据 raw 数据前一段有效输入点自动估计临时 task 坐标系：
+
+- `initial-window`：以前若干有效点中的最远点估计 x 方向。
+- `pca`：用前若干有效点的 PCA 第一主方向估计 x 方向。
 
 ## 常见问题
 
 ### 一直 timeout
 
-优先检查 `timestamp_scale`。如果 raw timestamp 是毫秒，默认 `0.001` 是对的；如果 raw timestamp 已经是秒，应使用 `--timestamp-scale 1.0`。
+优先检查 timestamp 单位。`run_live_preview.py` 默认 `--timestamp-scale 0.001`，也就是把 raw timestamp 当毫秒。如果 raw timestamp 已经是秒，应使用：
+
+```powershell
+--timestamp-scale 1.0
+```
+
+`offline_replay_autocalibrated.py` 当前基本关闭 trial timeout，通常不应因为正常 replay 中途 timeout。
 
 ### `tracker_valid=False` 很多
 
-检查 raw 里是否有 `trackers`、`tracker_index` 是否选错、tracker 是否有 `position`、`valid` 是否为 false。
+检查 raw 中是否有 `trackers`，`tracker_index` 是否选错，tracker 是否有 `position`，以及 valid 字段是否为 false。
 
 ### `hand_valid=True` 但 pinch 无效
 
@@ -477,7 +617,7 @@ analyze_session.py
 
 ### `PINCH_INSUFFICIENT` 很多
 
-当前核心阈值在 `config.py`：
+当前默认阈值在 `config.py`：
 
 ```text
 pinch_grab_threshold = 0.025
@@ -486,11 +626,13 @@ pinch_release_threshold = 0.035
 
 单位按米理解。如果真实 pinch distance 常见值远大于 0.035，需要重新评估 node、坐标尺度或阈值。
 
-### `task_trajectory_xyz.png` 是什么
+### 图里轨迹为什么同一数据不同参数会不一样
 
-它画的是输入点在 task 坐标系下的 x/y 轨迹，不是物块轨迹。物块轨迹看 `block_center_xyz_over_time.png` 或 `block_center_task_*`。
+`offline_replay_autocalibrated.py` 的 `task_trajectory_xyz.png` 画的是输入点在临时 task 坐标系下的轨迹。不同 `calibration_mode`、`calibration_frames`、scene 参数可能让 task 坐标系或物块行为不同，所以结果可能不一样。
 
-## 仍未完成
+如果你看的是 session analyzer 的 `trajectory_track_map.png`，它同时画 pinch path、block path、轨道、target 和事件点。物块路径当然会随 block size / track width / scene mode 改变。
+
+## 当前限制
 
 ```text
 没有正式 GUI
@@ -499,7 +641,8 @@ pinch_release_threshold = 0.035
 没有自动读取 YAML 配置
 没有完整 MANUS/Vive rotation fusion
 没有正式在线 calibration 流程
-MapConfig 还没有接入 replay/session/analyzer
+offline_replay_autocalibrated.py 还没有 --map-json
+MapConfig 已可验证/编译/写 trial_config，但还没有接进离线 replay CLI
 ```
 
-建议下一步：把 MapConfig 接入正式 trial/session 配置，然后让 analyzer 的 `trajectory_track_map` 使用完整多段 `track_boxes` 绘制真实轨道，而不是只画外包围边界。
+比较自然的下一步是：把 MapConfig 接入正式 trial/session 配置路径，之后再决定是否给 `offline_replay_autocalibrated.py` 增加 `--map-json`，让离线数据也能直接复用正式地图。

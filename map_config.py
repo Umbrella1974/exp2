@@ -140,22 +140,12 @@ def validate_map_config(config: MapConfig) -> MapValidationResult:
         target_relation = _target_relation(config.target_region, config.track_boxes)
         if target_relation == "none":
             errors.append("target_region must intersect at least one track box with positive volume.")
-        elif target_relation == "touch":
+        elif target_relation == "face_touch":
             warnings.append("target_region only touches track boxes without positive volume overlap.")
+        elif target_relation == "edge_or_point_touch":
+            errors.append("target_region only touches track boxes by edge/point.")
 
-    ordered_boxes = [box for box in config.track_boxes if box.order is not None]
-    if ordered_boxes:
-        ordered_boxes = sorted(ordered_boxes, key=lambda box: int(box.order or 0))
-        for previous, current in zip(ordered_boxes, ordered_boxes[1:]):
-            relation = _box_relation(previous, current)
-            if relation == "gap":
-                errors.append(
-                    f"ordered track boxes {previous.id} and {current.id} have a gap."
-                )
-            elif relation in ("edge_or_point_touch", "touch_without_area"):
-                errors.append(
-                    f"ordered track boxes {previous.id} and {current.id} only touch by edge/point or zero-area face."
-                )
+    _validate_ordered_boxes(config.track_boxes, errors)
 
     return MapValidationResult(errors=errors, warnings=warnings)
 
@@ -179,6 +169,7 @@ def map_config_to_trial_config(config: MapConfig) -> dict[str, Any]:
         "map_id": config.map_id,
         "map_source": config.map_id,
         "map_source_type": "generated" if generated else "manual",
+        "description": config.description,
         "coordinate_space": config.coordinate_space,
         "unit": config.unit,
         "block_initial_center_task": list(config.block_initial_center_task),
@@ -274,14 +265,47 @@ def _point_in_spec(point: Vec3, box: MapBoxSpec) -> bool:
 
 
 def _target_relation(target: MapBoxSpec, boxes: list[MapBoxSpec]) -> str:
-    saw_touch = False
+    saw_face_touch = False
+    saw_edge_or_point_touch = False
     for box in boxes:
         relation = _box_relation(target, box)
         if relation == "volume_overlap":
             return "volume"
-        if relation != "gap":
-            saw_touch = True
-    return "touch" if saw_touch else "none"
+        if relation == "face_touch":
+            saw_face_touch = True
+        elif relation in ("edge_or_point_touch", "touch_without_area"):
+            saw_edge_or_point_touch = True
+    if saw_face_touch:
+        return "face_touch"
+    if saw_edge_or_point_touch:
+        return "edge_or_point_touch"
+    return "none"
+
+
+def _validate_ordered_boxes(boxes: list[MapBoxSpec], errors: list[str]) -> None:
+    if not any(box.order is not None for box in boxes):
+        return
+    if any(box.order is None for box in boxes):
+        errors.append("all track_boxes must define order when any track box is ordered.")
+        return
+    orders = [int(box.order) for box in boxes if box.order is not None]
+    if len(set(orders)) != len(orders):
+        errors.append("track box order values must not be duplicated.")
+        return
+    expected_orders = list(range(len(boxes)))
+    if sorted(orders) != expected_orders:
+        errors.append("track box order values must be contiguous from 0 to n-1.")
+        return
+
+    ordered_boxes = sorted(boxes, key=lambda box: int(box.order or 0))
+    for previous, current in zip(ordered_boxes, ordered_boxes[1:]):
+        relation = _box_relation(previous, current)
+        if relation == "gap":
+            errors.append(f"ordered track boxes {previous.id} and {current.id} have a gap.")
+        elif relation in ("edge_or_point_touch", "touch_without_area"):
+            errors.append(
+                f"ordered track boxes {previous.id} and {current.id} only touch by edge/point or zero-area face."
+            )
 
 
 def _box_relation(a: MapBoxSpec, b: MapBoxSpec) -> str:

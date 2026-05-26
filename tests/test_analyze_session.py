@@ -147,12 +147,65 @@ def test_plot_generation_if_matplotlib_is_available(tmp_path: Path) -> None:
     assert any(Path(path).name == "trajectory_track_map.png" for path in summary["generated_plots"])
 
 
+def test_analysis_summary_reports_map_track_boxes(tmp_path: Path) -> None:
+    session_dir = _fake_session(tmp_path, with_track_boxes=True)
+
+    summary = analyze_session.analyze_session(
+        session_dir=session_dir,
+        no_plots=True,
+        overwrite=True,
+    )
+
+    assert summary["map_id"] == "fake_map"
+    assert summary["map_config_version"] == 1
+    assert summary["map_source_type"] == "manual"
+    assert summary["track_box_count"] == 2
+    assert summary["target_region_present"] is True
+    assert summary["trajectory_map_used_track_boxes"] is True
+
+
+def test_trajectory_map_uses_track_boxes_when_available(tmp_path: Path) -> None:
+    pytest.importorskip("matplotlib")
+    session_dir = _fake_session(tmp_path, with_track_boxes=True)
+
+    summary = analyze_session.analyze_session(session_dir=session_dir, overwrite=True)
+
+    assert any(Path(path).name == "trajectory_track_map.png" for path in summary["generated_plots"])
+    assert summary["trajectory_map_used_track_boxes"] is True
+    assert not any("track_boxes missing or unusable" in warning for warning in summary["warnings"])
+
+
+def test_trajectory_map_falls_back_without_track_boxes(tmp_path: Path) -> None:
+    pytest.importorskip("matplotlib")
+    session_dir = _fake_session(tmp_path)
+
+    summary = analyze_session.analyze_session(session_dir=session_dir, overwrite=True)
+
+    assert any(Path(path).name == "trajectory_track_map.png" for path in summary["generated_plots"])
+    assert summary["trajectory_map_used_track_boxes"] is False
+    assert any("track_boxes missing or unusable" in warning for warning in summary["warnings"])
+
+
+def test_bad_track_box_warns_without_failing(tmp_path: Path) -> None:
+    pytest.importorskip("matplotlib")
+    session_dir = _fake_session(tmp_path, with_track_boxes=True, bad_track_box=True)
+
+    summary = analyze_session.analyze_session(session_dir=session_dir, overwrite=True)
+
+    assert summary["status"] == "OK"
+    assert summary["track_box_count"] == 3
+    assert summary["trajectory_map_used_track_boxes"] is True
+    assert any("track_boxes[2] could not be parsed" in warning for warning in summary["warnings"])
+
+
 def _fake_session(
     tmp_path: Path,
     *,
     empty_trial_time: bool = False,
     empty_all_time: bool = False,
     many_events: bool = False,
+    with_track_boxes: bool = False,
+    bad_track_box: bool = False,
 ) -> Path:
     session_dir = tmp_path / "session"
     session_dir.mkdir()
@@ -175,20 +228,7 @@ def _fake_session(
             "is_formal_calibration": False,
         },
     )
-    _write_json(
-        session_dir / "trial_config.json",
-        {
-            "scene_type": "post_hoc_auto",
-            "is_formal_scene": False,
-            "pinch_threshold": {"grab": 0.025, "release": 0.035},
-            "scene_auto": {
-                "track_bounds": {
-                    "min": [-1.0, -1.0, -1.0],
-                    "max": [1.0, 1.0, 1.0],
-                }
-            },
-        },
-    )
+    _write_json(session_dir / "trial_config.json", _trial_config(with_track_boxes, bad_track_box))
     _write_json(session_dir / "trial_summary.json", {"warnings": []})
     rows = _processed_rows(empty_trial_time=empty_trial_time, empty_all_time=empty_all_time)
     _write_csv(session_dir / "processed_frames.csv", rows)
@@ -261,6 +301,59 @@ def _haptic_rows() -> list[dict[str, str]]:
         {"frame_index": "3", "time": "10.3", "haptic_state": "OFF", "command_type": "", "slip_active": "False", "blocked_force_active": "True"},
         {"frame_index": "4", "time": "10.4", "haptic_state": "", "command_type": "pulse", "slip_active": "False", "blocked_force_active": "False"},
     ]
+
+
+def _trial_config(with_track_boxes: bool, bad_track_box: bool) -> dict:
+    config = {
+        "scene_type": "post_hoc_auto",
+        "is_formal_scene": False,
+        "pinch_threshold": {"grab": 0.025, "release": 0.035},
+        "scene_auto": {
+            "track_bounds": {
+                "min": [-1.0, -1.0, -1.0],
+                "max": [1.0, 1.0, 1.0],
+            }
+        },
+    }
+    if not with_track_boxes:
+        return config
+
+    config.update(
+        {
+            "map_config_version": 1,
+            "map_id": "fake_map",
+            "map_source_type": "manual",
+            "block_initial_center_task": [0.0, 0.0, 0.0],
+            "track_boxes": [
+                {
+                    "id": "segment_00",
+                    "order": 0,
+                    "label": "Segment 1",
+                    "min": [0.0, -0.2, -0.1],
+                    "max": [0.5, 0.2, 0.1],
+                    "metadata": {"direction": "x+"},
+                },
+                {
+                    "id": "segment_01",
+                    "order": 1,
+                    "label": "Segment 2",
+                    "min": [0.4, -0.2, -0.1],
+                    "max": [0.8, 0.2, 0.1],
+                    "metadata": {"direction": "x+"},
+                },
+            ],
+            "target_region": {
+                "id": "target",
+                "label": "Target region",
+                "min": [0.7, -0.2, -0.1],
+                "max": [0.8, 0.2, 0.1],
+                "metadata": {"type": "target_region"},
+            },
+        }
+    )
+    if bad_track_box:
+        config["track_boxes"].append({"id": "bad_box", "min": [0.0], "max": [1.0]})
+    return config
 
 
 def _write_json(path: Path, payload: dict) -> None:

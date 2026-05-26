@@ -1,8 +1,9 @@
 """Simple rule-based map generation helpers.
 
 The first generator only creates xoy-plane orthogonal corridor maps from
-axis-aligned AABB segments. It is a basic tooling layer, not a formal random
-experiment design system.
+axis-aligned AABB segments. All turns are 90 degrees; diagonal segments,
+arbitrary angles, 180-degree turns, and 3D mazes are intentionally out of scope.
+It is a basic tooling layer, not a formal random experiment design system.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ def generate_orthogonal_corridor_map(
     allowed_turns: Sequence[str],
     plane: str = "xoy",
     junction_overlap: float = 0.03,
+    target_length: float | None = None,
 ) -> MapConfig:
     """Generate a simple continuous xoy orthogonal corridor map."""
 
@@ -71,6 +73,8 @@ def generate_orthogonal_corridor_map(
         raise ValueError(f"unsupported turns: {', '.join(sorted(unsupported_turns))}")
     if not allowed_turns:
         raise ValueError("allowed_turns must not be empty.")
+    if target_length is not None and target_length <= 0:
+        raise ValueError("target_length must be > 0 when provided.")
 
     rng = random.Random(seed)
     current_point = [float(start[0]), float(start[1])]
@@ -78,6 +82,7 @@ def generate_orthogonal_corridor_map(
     direction = initial_direction
     boxes: list[MapBoxSpec] = []
     chosen_turns: list[str] = []
+    segment_records: list[dict[str, object]] = []
 
     for index in range(num_segments):
         turn = "straight" if index == 0 else rng.choice(list(allowed_turns))
@@ -115,7 +120,22 @@ def generate_orthogonal_corridor_map(
                 },
             )
         )
+        segment_records.append(
+            {
+                "id": f"segment_{index:02d}",
+                "start": list(current_point),
+                "end": list(end_point),
+                "direction": direction,
+                "length": length,
+            }
+        )
         current_point = end_point
+
+    target_region = _target_region_for_last_segment(
+        last_segment=segment_records[-1],
+        last_box=boxes[-1],
+        requested_target_length=target_length,
+    )
 
     return MapConfig(
         map_id=map_id,
@@ -125,7 +145,7 @@ def generate_orthogonal_corridor_map(
         block_initial_center_task=[float(start[0]), float(start[1]), float(start[2])],
         block_size=[track_width, track_width, z_tolerance * 2.0],
         track_boxes=boxes,
-        target_region=boxes[-1],
+        target_region=target_region,
         metadata={
             "generated": True,
             "generator_name": "generate_orthogonal_corridor_map",
@@ -140,6 +160,8 @@ def generate_orthogonal_corridor_map(
                 "allowed_turns": list(allowed_turns),
                 "plane": plane,
                 "junction_overlap": junction_overlap,
+                "target_length": target_region.metadata["target_length"],
+                "requested_target_length": target_length,
                 "turns": chosen_turns,
             },
         },
@@ -194,3 +216,48 @@ def _segment_bounds(
         x1 = start[0] + half_width
 
     return [x0, y0, z - z_tolerance], [x1, y1, z + z_tolerance]
+
+
+def _target_region_for_last_segment(
+    *,
+    last_segment: dict[str, object],
+    last_box: MapBoxSpec,
+    requested_target_length: float | None,
+) -> MapBoxSpec:
+    segment_length = float(last_segment["length"])
+    direction = str(last_segment["direction"])
+    target_length = (
+        min(0.20, segment_length * 0.25)
+        if requested_target_length is None
+        else float(requested_target_length)
+    )
+    warnings: list[str] = []
+    if target_length > segment_length:
+        warnings.append("target_length exceeded last segment length and was clamped.")
+        target_length = segment_length
+
+    box_min = list(last_box.min)
+    box_max = list(last_box.max)
+    if direction == "x+":
+        box_min[0] = box_max[0] - target_length
+    elif direction == "x-":
+        box_max[0] = box_min[0] + target_length
+    elif direction == "y+":
+        box_min[1] = box_max[1] - target_length
+    elif direction == "y-":
+        box_max[1] = box_min[1] + target_length
+
+    return MapBoxSpec(
+        id="target",
+        order=None,
+        label="Target region",
+        min=box_min,
+        max=box_max,
+        metadata={
+            "type": "target_region",
+            "based_on_segment_id": last_segment["id"],
+            "target_length": target_length,
+            "requested_target_length": requested_target_length,
+            "warnings": warnings,
+        },
+    )

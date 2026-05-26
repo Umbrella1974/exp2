@@ -114,6 +114,9 @@ def analyze_session(
         "status": "OK",
         "session_dir": str(session_dir),
         "mode": session_meta.get("mode", ""),
+        "map_id": trial_config.get("map_id", ""),
+        "map_config_version": trial_config.get("map_config_version", ""),
+        "map_source_type": trial_config.get("map_source_type", ""),
         "calibration_type": calibration.get(
             "calibration_type",
             session_meta.get("calibration_type", ""),
@@ -161,6 +164,9 @@ def analyze_session(
             "block_center_task_y",
             "block_center_task_z",
         ),
+        "track_box_count": _track_box_count(trial_config),
+        "target_region_present": isinstance(trial_config.get("target_region"), dict),
+        "trajectory_map_used_track_boxes": _has_track_boxes(trial_config),
         "derived_event_counts": derived_event_counts,
         "generated_plots": [],
         "skipped_event_label_count": skipped_event_label_count,
@@ -319,7 +325,8 @@ def _plot_trajectory_track_map(
     block_y = _float_column(rows, "block_center_task_y")
     plt.plot(pinch_x, pinch_y, label="pinch path", alpha=0.8)
     plt.plot(block_x, block_y, label="block path", alpha=0.8)
-    _plot_track_bounds(plt, trial_config, warnings)
+    _plot_track_geometry(plt, trial_config, warnings)
+    _plot_configured_block_start(plt, trial_config, warnings)
     _plot_endpoint_markers(plt, block_x, block_y)
     _plot_event_points(plt, rows, times, events, warnings)
     plt.xlabel("task x")
@@ -567,6 +574,21 @@ def _blocked_flags(rows: list[dict[str, str]]) -> tuple[list[bool], str | None]:
     return flags, "blocked_force_active unavailable; blocked_frame_count used state-string fallback."
 
 
+def _has_track_boxes(trial_config: dict[str, Any]) -> bool:
+    track_boxes = trial_config.get("track_boxes")
+    return isinstance(track_boxes, list) and any(
+        isinstance(box, dict) and _normalize_bounds(box) is not None
+        for box in track_boxes
+    )
+
+
+def _track_box_count(trial_config: dict[str, Any]) -> int:
+    track_boxes = trial_config.get("track_boxes")
+    if not isinstance(track_boxes, list):
+        return 0
+    return len(track_boxes)
+
+
 def _plot_series(
     plt: Any,
     times: list[float | None],
@@ -605,6 +627,73 @@ def _annotate_events(plt: Any, events: list[dict[str, Any]], event_label_limit: 
         labeled += 1
 
 
+def _plot_track_geometry(plt: Any, trial_config: dict[str, Any], warnings: list[str]) -> None:
+    if _plot_track_boxes(plt, trial_config, warnings):
+        return
+    warnings.append("trial_config.track_boxes missing or unusable; trajectory map used track bounds fallback.")
+    _plot_track_bounds(plt, trial_config, warnings)
+
+
+def _plot_track_boxes(plt: Any, trial_config: dict[str, Any], warnings: list[str]) -> bool:
+    track_boxes = trial_config.get("track_boxes")
+    if not isinstance(track_boxes, list) or not track_boxes:
+        return False
+    valid_boxes: list[dict[str, Any]] = []
+    for index, box in enumerate(track_boxes):
+        bounds = _normalize_bounds(box)
+        if bounds is None:
+            warnings.append(f"track_boxes[{index}] could not be parsed and was skipped.")
+            continue
+        valid_boxes.append({"payload": box, "bounds": bounds})
+    if not valid_boxes:
+        return False
+
+    valid_boxes.sort(key=lambda item: _box_sort_key(item["payload"]))
+    for index, item in enumerate(valid_boxes):
+        box = item["payload"]
+        bounds = item["bounds"]
+        min_point = bounds["min"]
+        max_point = bounds["max"]
+        xs = [min_point[0], max_point[0], max_point[0], min_point[0], min_point[0]]
+        ys = [min_point[1], min_point[1], max_point[1], max_point[1], min_point[1]]
+        label = "track boxes" if index == 0 else None
+        plt.fill(xs, ys, alpha=0.12, color="tab:gray", label=label)
+        plt.plot(xs, ys, color="tab:gray", linewidth=0.9)
+        if index < 20:
+            cx = (min_point[0] + max_point[0]) * 0.5
+            cy = (min_point[1] + max_point[1]) * 0.5
+            text = str(box.get("order", box.get("id", index)))
+            plt.text(cx, cy, text, ha="center", va="center", fontsize=7, color="black")
+    _plot_target_region(plt, trial_config, warnings)
+    return True
+
+
+def _plot_target_region(plt: Any, trial_config: dict[str, Any], warnings: list[str]) -> None:
+    target = trial_config.get("target_region")
+    if not isinstance(target, dict):
+        return
+    bounds = _normalize_bounds(target)
+    if bounds is None:
+        warnings.append("target_region could not be parsed and was skipped.")
+        return
+    min_point = bounds["min"]
+    max_point = bounds["max"]
+    xs = [min_point[0], max_point[0], max_point[0], min_point[0], min_point[0]]
+    ys = [min_point[1], min_point[1], max_point[1], max_point[1], min_point[1]]
+    plt.plot(xs, ys, linestyle="--", linewidth=1.8, color="tab:green", label="target region")
+
+
+def _plot_configured_block_start(
+    plt: Any,
+    trial_config: dict[str, Any],
+    warnings: list[str],
+) -> None:
+    point = _point3(trial_config.get("block_initial_center_task"))
+    if point is None:
+        return
+    plt.scatter([point[0]], [point[1]], marker="*", s=90, label="configured block start")
+
+
 def _plot_track_bounds(plt: Any, trial_config: dict[str, Any], warnings: list[str]) -> None:
     bounds = _find_track_bounds(trial_config)
     if bounds is None:
@@ -617,6 +706,13 @@ def _plot_track_bounds(plt: Any, trial_config: dict[str, Any], warnings: list[st
     xs = [x0, x1, x1, x0, x0]
     ys = [y0, y0, y1, y1, y0]
     plt.plot(xs, ys, linestyle="--", color="black", label="track bounds")
+
+
+def _box_sort_key(box: dict[str, Any]) -> tuple[int, str]:
+    order = _int_or_none(box.get("order"))
+    if order is None:
+        return (10_000_000, str(box.get("id", "")))
+    return (order, str(box.get("id", "")))
 
 
 def _find_track_bounds(payload: Any) -> dict[str, list[float]] | None:
