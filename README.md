@@ -57,7 +57,7 @@ pytest -q
 当前应为：
 
 ```text
-152 passed
+154 passed
 ```
 
 常用局部测试：
@@ -224,6 +224,8 @@ python analyze_session.py --session-dir data\offline_replay\experiment_14_block0
 --event-label-limit    图中最多标注多少事件文字，默认 40
 --overwrite            覆盖 analysis_summary.json 和本脚本生成的 PNG
 --time-column          sample_time / trial_time / raw_timestamp
+--relative-time        使用相对时间轴，默认开启
+--absolute-time        使用原始时间列作为图像横轴
 ```
 
 时间列选择规则：
@@ -243,6 +245,27 @@ session/plots/pinch_distance_with_events.png
 session/plots/trajectory_track_map.png
 session/plots/state_timeline.png
 session/plots/haptic_timeline.png
+```
+
+默认情况下，图像横轴使用相对时间：
+
+```text
+selected_time - first_finite_selected_time
+```
+
+`analysis_summary.json` 会记录：
+
+```text
+time_column_used
+time_axis_mode
+time_zero
+time_axis_label
+```
+
+如果需要保留旧的绝对时间横轴，使用：
+
+```powershell
+python analyze_session.py --session-dir data\offline_replay\experiment_14_block060\session --absolute-time --overwrite
 ```
 
 `trajectory_track_map.png` 会优先使用 `trial_config.json` 里的 `track_boxes` 画多段轨道，并额外画：
@@ -431,11 +454,17 @@ blocked_frame_count
 large_delta_frame_count
 haptic_active_frame_count
 haptic_event_count
+logical_slip_feedback_frame_count
+logical_blocked_feedback_frame_count
+hardware_haptic_active_frame_count
+hardware_haptic_event_count
 pinch_distance_min / mean / max
 task_trajectory_range
 block_displacement_task
 warnings
 ```
+
+`haptic_active_frame_count` / `hardware_haptic_active_frame_count` 表示命令或硬件层 active，不等于逻辑 slip。离线 replay 中常见情况是 `logical_slip_feedback_frame_count` 大于 0，但没有真实硬件发送记录。
 
 MapConfig replay 额外看：
 

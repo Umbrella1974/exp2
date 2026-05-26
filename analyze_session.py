@@ -55,6 +55,20 @@ class TimeSeries:
 
     column: str
     values: list[float | None]
+    axis_values: list[float | None]
+    axis_mode: str
+    zero: float | None
+    axis_label: str
+
+
+@dataclass(frozen=True)
+class TrackBoxStats:
+    """Parse status for MapConfig-style track boxes."""
+
+    total: int
+    valid: int
+    skipped: int
+    skipped_indices: list[int]
 
 
 def analyze_session(
@@ -65,6 +79,7 @@ def analyze_session(
     event_label_limit: int = 40,
     overwrite: bool = False,
     time_column: str = "sample_time",
+    relative_time: bool = True,
 ) -> dict[str, Any]:
     """Analyze a session directory and write analysis_summary.json."""
 
@@ -95,7 +110,7 @@ def analyze_session(
     if session_meta.get("mode") == "offline_autocalibrated" and POST_HOC_WARNING not in warnings:
         warnings.append(POST_HOC_WARNING)
 
-    times = _select_time_series(processed_rows, time_column, warnings)
+    times = _select_time_series(processed_rows, time_column, warnings, relative_time=relative_time)
     recorded_events = _recorded_events(event_rows)
     derived_events = _derive_events(processed_rows, times, recorded_events)
     all_events = _sort_events(recorded_events + derived_events)
@@ -109,6 +124,12 @@ def analyze_session(
     blocked_flags, blocked_warning = _blocked_flags(processed_rows)
     if blocked_warning:
         warnings.append(blocked_warning)
+    track_box_stats = _track_box_stats(trial_config)
+    _extend_track_box_warnings(track_box_stats, warnings)
+    slip_active_frame_count = sum(_bool(row.get("slip_active")) for row in processed_rows)
+    logical_blocked_feedback_frame_count = sum(
+        _bool(row.get("blocked_force_active")) for row in processed_rows
+    )
 
     summary = {
         "status": "OK",
@@ -131,14 +152,21 @@ def analyze_session(
             session_meta.get("is_formal_scene", ""),
         ),
         "time_column_used": times.column,
+        "time_axis_mode": times.axis_mode,
+        "time_zero": times.zero,
+        "time_axis_label": times.axis_label,
         "total_processed_frames": len(processed_rows),
         "total_events": len(recorded_events),
         "total_haptic_records": len(haptic_rows),
         "haptic_active_frame_count": sum(haptic_active_flags),
         "haptic_event_count": _edge_count(haptic_active_flags),
+        "hardware_haptic_active_frame_count": sum(haptic_active_flags),
+        "hardware_haptic_event_count": _edge_count(haptic_active_flags),
         "contact_enter_count": _count_event_type(recorded_events, "contact_enter"),
         "contact_exit_count": _count_event_type(recorded_events, "contact_exit"),
-        "slip_active_frame_count": sum(_bool(row.get("slip_active")) for row in processed_rows),
+        "slip_active_frame_count": slip_active_frame_count,
+        "logical_slip_feedback_frame_count": slip_active_frame_count,
+        "logical_blocked_feedback_frame_count": logical_blocked_feedback_frame_count,
         "slip_start_count": _count_event_type(all_events, "slip_start"),
         "slip_end_count": _count_event_type(all_events, "slip_end"),
         "blocked_frame_count": sum(blocked_flags),
@@ -164,9 +192,11 @@ def analyze_session(
             "block_center_task_y",
             "block_center_task_z",
         ),
-        "track_box_count": _track_box_count(trial_config),
+        "track_box_count": track_box_stats.total,
+        "valid_track_box_count": track_box_stats.valid,
+        "skipped_track_box_count": track_box_stats.skipped,
         "target_region_present": isinstance(trial_config.get("target_region"), dict),
-        "trajectory_map_used_track_boxes": _has_track_boxes(trial_config),
+        "trajectory_map_used_track_boxes": track_box_stats.valid > 0,
         "derived_event_counts": derived_event_counts,
         "generated_plots": [],
         "skipped_event_label_count": skipped_event_label_count,
@@ -258,14 +288,14 @@ def _plot_timeseries_xyz(
 ) -> None:
     del haptic_rows, trial_config, warnings
     plt.figure(figsize=(11, 6))
-    _plot_series(plt, times.values, rows, "pinch_center_task_x", "pinch x")
-    _plot_series(plt, times.values, rows, "pinch_center_task_y", "pinch y")
-    _plot_series(plt, times.values, rows, "pinch_center_task_z", "pinch z")
-    _plot_series(plt, times.values, rows, "block_center_task_x", "block x")
-    _plot_series(plt, times.values, rows, "block_center_task_y", "block y")
-    _plot_series(plt, times.values, rows, "block_center_task_z", "block z")
-    _annotate_events(plt, events, event_label_limit)
-    plt.xlabel(times.column)
+    _plot_series(plt, times.axis_values, rows, "pinch_center_task_x", "pinch x")
+    _plot_series(plt, times.axis_values, rows, "pinch_center_task_y", "pinch y")
+    _plot_series(plt, times.axis_values, rows, "pinch_center_task_z", "pinch z")
+    _plot_series(plt, times.axis_values, rows, "block_center_task_x", "block x")
+    _plot_series(plt, times.axis_values, rows, "block_center_task_y", "block y")
+    _plot_series(plt, times.axis_values, rows, "block_center_task_z", "block z")
+    _annotate_events(plt, events, event_label_limit, times)
+    plt.xlabel(times.axis_label)
     plt.ylabel("task coordinate")
     plt.legend(loc="best")
     plt.tight_layout()
@@ -286,7 +316,7 @@ def _plot_pinch_distance(
 ) -> None:
     del haptic_rows, warnings
     plt.figure(figsize=(11, 5))
-    _plot_series(plt, times.values, rows, "pinch_distance", "pinch distance")
+    _plot_series(plt, times.axis_values, rows, "pinch_distance", "pinch distance")
     threshold = trial_config.get("pinch_threshold")
     if isinstance(threshold, dict):
         for label, value in threshold.items():
@@ -297,8 +327,8 @@ def _plot_pinch_distance(
         number = _float_or_none(threshold)
         if number is not None:
             plt.axhline(number, linestyle="--", label="pinch threshold")
-    _annotate_events(plt, events, event_label_limit)
-    plt.xlabel(times.column)
+    _annotate_events(plt, events, event_label_limit, times)
+    plt.xlabel(times.axis_label)
     plt.ylabel("pinch distance")
     plt.legend(loc="best")
     plt.tight_layout()
@@ -362,18 +392,18 @@ def _plot_state_timeline(
     ytick_labels: list[str] = []
     for offset, (column, label) in enumerate(state_specs):
         values = [offset + (1.0 if _bool(row.get(column)) else 0.0) * 0.8 for row in rows]
-        plt.step(_filled_times(times.values), values, where="post", label=label)
+        plt.step(_filled_times(times.axis_values), values, where="post", label=label)
         ytick_positions.append(offset + 0.4)
         ytick_labels.append(label)
     base = len(state_specs)
     for index, column in enumerate(("contact_state", "block_motion_state")):
         mapped = _categorical_values(rows, column)
         values = [base + index + (value * 0.1) for value in mapped]
-        plt.plot(_filled_times(times.values), values, label=column)
+        plt.plot(_filled_times(times.axis_values), values, label=column)
         ytick_positions.append(base + index + 0.2)
         ytick_labels.append(column)
     plt.yticks(ytick_positions, ytick_labels)
-    plt.xlabel(times.column)
+    plt.xlabel(times.axis_label)
     plt.legend(loc="best")
     plt.tight_layout()
     plt.savefig(path)
@@ -394,14 +424,14 @@ def _plot_haptic_timeline(
     del trial_config, events, event_label_limit, warnings
     plt.figure(figsize=(11, 5))
     source_rows = haptic_rows if haptic_rows else rows
-    plot_times = times.values[: len(source_rows)]
+    plot_times = times.axis_values[: len(source_rows)]
     active = [_haptic_row_active(row) for row in source_rows]
     slip = [_bool(row.get("slip_active")) for row in source_rows]
     blocked = [_bool(row.get("blocked_force_active")) for row in source_rows]
     plt.step(_filled_times(plot_times), [1 if value else 0 for value in active], where="post", label="haptic active")
     plt.step(_filled_times(plot_times), [1.2 if value else 0 for value in slip], where="post", label="slip")
     plt.step(_filled_times(plot_times), [1.4 if value else 0 for value in blocked], where="post", label="blocked force")
-    plt.xlabel(times.column)
+    plt.xlabel(times.axis_label)
     plt.yticks([0, 1, 1.2, 1.4], ["off", "haptic", "slip", "blocked"])
     plt.legend(loc="best")
     plt.tight_layout()
@@ -419,6 +449,8 @@ def _select_time_series(
     rows: list[dict[str, str]],
     requested_column: str,
     warnings: list[str],
+    *,
+    relative_time: bool,
 ) -> TimeSeries:
     candidates: list[str] = []
     for column in (requested_column, "sample_time", "trial_time", "raw_timestamp", "frame_index"):
@@ -435,12 +467,44 @@ def _select_time_series(
             warnings.append(f"time column used: {column}")
             if column == "frame_index":
                 warnings.append("using frame_index as time axis because no time column was available.")
-            return TimeSeries(column=column, values=values)
+            return _time_series_with_axis(column, values, relative_time=relative_time)
 
     warnings.append("using frame_index as time axis because no time column was available.")
+    return _time_series_with_axis(
+        "frame_index",
+        [float(index) for index, _ in enumerate(rows)],
+        relative_time=relative_time,
+    )
+
+
+def _time_series_with_axis(
+    column: str,
+    values: list[float | None],
+    *,
+    relative_time: bool,
+) -> TimeSeries:
+    if not relative_time:
+        return TimeSeries(
+            column=column,
+            values=values,
+            axis_values=values,
+            axis_mode="absolute",
+            zero=None,
+            axis_label=column,
+        )
+
+    time_zero = next((value for value in values if value is not None), None)
+    axis_values = [
+        None if value is None or time_zero is None else value - time_zero
+        for value in values
+    ]
     return TimeSeries(
-        column="frame_index",
-        values=[float(index) for index, _ in enumerate(rows)],
+        column=column,
+        values=values,
+        axis_values=axis_values,
+        axis_mode="relative",
+        zero=time_zero,
+        axis_label="time since session start (s)",
     )
 
 
@@ -574,19 +638,33 @@ def _blocked_flags(rows: list[dict[str, str]]) -> tuple[list[bool], str | None]:
     return flags, "blocked_force_active unavailable; blocked_frame_count used state-string fallback."
 
 
-def _has_track_boxes(trial_config: dict[str, Any]) -> bool:
+def _track_box_stats(trial_config: dict[str, Any]) -> TrackBoxStats:
     track_boxes = trial_config.get("track_boxes")
-    return isinstance(track_boxes, list) and any(
-        isinstance(box, dict) and _normalize_bounds(box) is not None
-        for box in track_boxes
+    if not isinstance(track_boxes, list):
+        return TrackBoxStats(total=0, valid=0, skipped=0, skipped_indices=[])
+    skipped_indices: list[int] = []
+    valid = 0
+    for index, box in enumerate(track_boxes):
+        if isinstance(box, dict) and _normalize_bounds(box) is not None:
+            valid += 1
+        else:
+            skipped_indices.append(index)
+    return TrackBoxStats(
+        total=len(track_boxes),
+        valid=valid,
+        skipped=len(skipped_indices),
+        skipped_indices=skipped_indices,
     )
 
 
-def _track_box_count(trial_config: dict[str, Any]) -> int:
-    track_boxes = trial_config.get("track_boxes")
-    if not isinstance(track_boxes, list):
-        return 0
-    return len(track_boxes)
+def _extend_track_box_warnings(stats: TrackBoxStats, warnings: list[str]) -> None:
+    for index in stats.skipped_indices:
+        _append_warning_once(warnings, f"track_boxes[{index}] could not be parsed and was skipped.")
+
+
+def _append_warning_once(warnings: list[str], warning: str) -> None:
+    if warning not in warnings:
+        warnings.append(warning)
 
 
 def _plot_series(
@@ -607,16 +685,24 @@ def _plot_series(
     plt.plot(x, y, label=label)
 
 
-def _annotate_events(plt: Any, events: list[dict[str, Any]], event_label_limit: int) -> None:
+def _annotate_events(
+    plt: Any,
+    events: list[dict[str, Any]],
+    event_label_limit: int,
+    times: TimeSeries,
+) -> None:
     labeled = 0
     for event in events:
         if event["event_type"] not in KEY_EVENT_TYPES or event.get("time") is None:
             continue
+        event_time = _axis_time(event["time"], times)
+        if event_time is None:
+            continue
         color = "0.75" if labeled >= event_label_limit else "0.55"
-        plt.axvline(event["time"], color=color, linewidth=0.8, alpha=0.5)
+        plt.axvline(event_time, color=color, linewidth=0.8, alpha=0.5)
         if labeled < event_label_limit:
             plt.text(
-                event["time"],
+                event_time,
                 0.98,
                 event["event_type"],
                 rotation=90,
@@ -625,6 +711,15 @@ def _annotate_events(plt: Any, events: list[dict[str, Any]], event_label_limit: 
                 fontsize=7,
             )
         labeled += 1
+
+
+def _axis_time(value: Any, times: TimeSeries) -> float | None:
+    number = _float_or_none(value)
+    if number is None:
+        return None
+    if times.axis_mode == "relative" and times.zero is not None:
+        return number - times.zero
+    return number
 
 
 def _plot_track_geometry(plt: Any, trial_config: dict[str, Any], warnings: list[str]) -> None:
@@ -644,7 +739,7 @@ def _plot_track_boxes(plt: Any, trial_config: dict[str, Any], warnings: list[str
     for index, box in enumerate(track_boxes):
         bounds = _normalize_bounds(box)
         if bounds is None:
-            warnings.append(f"track_boxes[{index}] could not be parsed and was skipped.")
+            _append_warning_once(warnings, f"track_boxes[{index}] could not be parsed and was skipped.")
             continue
         valid_boxes.append({"payload": box, "bounds": bounds})
     if not valid_boxes:
@@ -1074,6 +1169,20 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--event-label-limit", type=int, default=40)
     parser.add_argument("--overwrite", action="store_true")
+    time_axis_group = parser.add_mutually_exclusive_group()
+    time_axis_group.add_argument(
+        "--relative-time",
+        dest="relative_time",
+        action="store_true",
+        default=True,
+        help="Use selected time minus the first finite selected time on plot x-axes (default).",
+    )
+    time_axis_group.add_argument(
+        "--absolute-time",
+        dest="relative_time",
+        action="store_false",
+        help="Use the selected time column directly on plot x-axes.",
+    )
     parser.add_argument(
         "--time-column",
         default="sample_time",
@@ -1091,6 +1200,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         event_label_limit=args.event_label_limit,
         overwrite=args.overwrite,
         time_column=args.time_column,
+        relative_time=args.relative_time,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 1 if summary.get("status") == "ERROR" else 0

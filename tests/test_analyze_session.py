@@ -40,10 +40,34 @@ def test_analyze_session_writes_summary_and_derives_state_edges(tmp_path: Path) 
     assert summary["pinch_distance_max"] == 0.05
     assert summary["block_displacement_task"]["dx"] == 0.4
     assert summary["time_column_used"] == "sample_time"
+    assert summary["time_axis_mode"] == "relative"
+    assert summary["time_zero"] == 10.0
+    assert summary["time_axis_label"] == "time since session start (s)"
     assert "time column used: sample_time" in summary["warnings"]
     assert "post-hoc auto calibration" in " ".join(summary["warnings"])
     assert summary["derived_event_counts"]["slip_start"] == 1
     assert summary["derived_event_counts"]["blocked_start"] == 1
+    assert summary["logical_slip_feedback_frame_count"] == summary["slip_active_frame_count"]
+    assert summary["logical_blocked_feedback_frame_count"] == 1
+    assert summary["hardware_haptic_active_frame_count"] == summary["haptic_active_frame_count"]
+    assert summary["hardware_haptic_event_count"] == summary["haptic_event_count"]
+    assert summary["valid_track_box_count"] == 0
+    assert summary["skipped_track_box_count"] == 0
+
+
+def test_absolute_time_keeps_selected_time_axis(tmp_path: Path) -> None:
+    session_dir = _fake_session(tmp_path)
+
+    summary = analyze_session.analyze_session(
+        session_dir=session_dir,
+        no_plots=True,
+        overwrite=True,
+        relative_time=False,
+    )
+
+    assert summary["time_axis_mode"] == "absolute"
+    assert summary["time_zero"] is None
+    assert summary["time_axis_label"] == "sample_time"
 
 
 def test_time_column_fallback_uses_sample_time_when_requested_column_empty(tmp_path: Path) -> None:
@@ -70,6 +94,8 @@ def test_time_column_fallback_can_use_frame_index(tmp_path: Path) -> None:
     )
 
     assert summary["time_column_used"] == "frame_index"
+    assert summary["time_axis_mode"] == "relative"
+    assert summary["time_zero"] == 0.0
     assert any("using frame_index" in warning for warning in summary["warnings"])
 
 
@@ -160,6 +186,8 @@ def test_analysis_summary_reports_map_track_boxes(tmp_path: Path) -> None:
     assert summary["map_config_version"] == 1
     assert summary["map_source_type"] == "manual"
     assert summary["track_box_count"] == 2
+    assert summary["valid_track_box_count"] == 2
+    assert summary["skipped_track_box_count"] == 0
     assert summary["target_region_present"] is True
     assert summary["trajectory_map_used_track_boxes"] is True
 
@@ -194,6 +222,25 @@ def test_bad_track_box_warns_without_failing(tmp_path: Path) -> None:
 
     assert summary["status"] == "OK"
     assert summary["track_box_count"] == 3
+    assert summary["valid_track_box_count"] == 2
+    assert summary["skipped_track_box_count"] == 1
+    assert summary["trajectory_map_used_track_boxes"] is True
+    assert any("track_boxes[2] could not be parsed" in warning for warning in summary["warnings"])
+
+
+def test_bad_track_box_stats_are_available_without_plots(tmp_path: Path) -> None:
+    session_dir = _fake_session(tmp_path, with_track_boxes=True, bad_track_box=True)
+
+    summary = analyze_session.analyze_session(
+        session_dir=session_dir,
+        no_plots=True,
+        overwrite=True,
+    )
+
+    assert summary["status"] == "OK"
+    assert summary["track_box_count"] == 3
+    assert summary["valid_track_box_count"] == 2
+    assert summary["skipped_track_box_count"] == 1
     assert summary["trajectory_map_used_track_boxes"] is True
     assert any("track_boxes[2] could not be parsed" in warning for warning in summary["warnings"])
 
