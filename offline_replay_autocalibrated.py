@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean, median
@@ -32,6 +33,8 @@ from data_models import Box3D, TrackRegion, Vec3
 from device_frame_models import DeviceAdapterConfig
 from manus_vive_adapter import ManusViveExperimentAdapter
 from map_config import (
+    MapBoxSpec,
+    MapConfig,
     compile_map_to_track_region,
     load_map_config,
     map_config_to_trial_config,
@@ -54,6 +57,10 @@ MAP_CONFIG_POST_HOC_WARNING = (
     "treated as a formal experimental trial."
 )
 
+DIAGNOSTIC_MAP_WARNING = (
+    "This map is generated from replay data and must not be treated as a formal experimental map."
+)
+
 HAPTIC_EVENT_TYPES = {
     "contact_enter",
     "contact_exit",
@@ -62,6 +69,30 @@ HAPTIC_EVENT_TYPES = {
     "blocked_force_start",
     "blocked_force_end",
 }
+
+DIAGNOSTIC_DIRECTIONS = {
+    "x+": np.asarray([1.0, 0.0, 0.0], dtype=float),
+    "x-": np.asarray([-1.0, 0.0, 0.0], dtype=float),
+    "y+": np.asarray([0.0, 1.0, 0.0], dtype=float),
+    "y-": np.asarray([0.0, -1.0, 0.0], dtype=float),
+}
+
+LEFT_TURN = {
+    "x+": "y+",
+    "y+": "x-",
+    "x-": "y-",
+    "y-": "x+",
+}
+
+RIGHT_TURN = {
+    "x+": "y-",
+    "y-": "x-",
+    "x-": "y+",
+    "y+": "x+",
+}
+
+DIAGNOSTIC_MIN_DIRECTION_LENGTH = 1e-4
+DIAGNOSTIC_JUNCTION_OVERLAP_RATIO = 0.25
 
 
 @dataclass(frozen=True)
@@ -90,6 +121,15 @@ class OfflineReplayConfig:
     map_config: Path | None = None
     map_id_override: str | None = None
     strict_map_validation: bool = False
+    diagnostic_map: bool = False
+    diagnostic_map_frames: int = 100
+    diagnostic_map_main_length: float = 1.0
+    diagnostic_map_perp_length: float = 0.5
+    diagnostic_map_width: float = 0.20
+    diagnostic_map_z_tolerance: float = 0.20
+    diagnostic_map_shape: str = "l_shape"
+    diagnostic_map_turn: str = "left"
+    diagnostic_map_id: str = "trajectory_aligned_diagnostic_map"
     write_session: bool = False
     session_dir: Path | None = None
     session_id: str | None = None
@@ -389,20 +429,457 @@ def build_map_config_scene(config: OfflineReplayConfig) -> SceneResult:
     return SceneResult(track_region, block_center, block_size, payload, warnings)
 
 
+def build_diagnostic_map_scene(
+    task_points: np.ndarray,
+    config: OfflineReplayConfig,
+) -> SceneResult:
+    """Build a post-hoc trajectory-aligned MapConfig scene in task space."""
+
+    diagnostic_map = generate_trajectory_aligned_diagnostic_map(task_points, config)
+    validation = validate_map_config(diagnostic_map)
+    if validation.errors:
+        raise ValueError("diagnostic map validation failed: " + "; ".join(validation.errors))
+
+    track_region, block_center, block_size = compile_map_to_track_region(diagnostic_map)
+    payload = map_config_to_trial_config(diagnostic_map)
+    payload.update(
+        {
+            "scene_type": "diagnostic_map",
+            "scene_mode": "diagnostic_map",
+            "is_formal_scene": False,
+            "diagnostic_map_used": True,
+            "diagnostic_map_id": diagnostic_map.map_id,
+            "diagnostic_map_shape": config.diagnostic_map_shape,
+            "diagnostic_map_frames": config.diagnostic_map_frames,
+            "diagnostic_map_main_length": config.diagnostic_map_main_length,
+            "diagnostic_map_perp_length": config.diagnostic_map_perp_length,
+            "diagnostic_map_width": config.diagnostic_map_width,
+            "diagnostic_map_z_tolerance": config.diagnostic_map_z_tolerance,
+            "diagnostic_map_turn": config.diagnostic_map_turn,
+            "raw_main_direction": diagnostic_map.metadata.get("raw_main_direction"),
+            "snapped_main_direction": diagnostic_map.metadata.get("snapped_main_direction"),
+            "snapped_perp_direction": diagnostic_map.metadata.get("snapped_perp_direction"),
+            "snap_angle_degrees": diagnostic_map.metadata.get("snap_angle_degrees"),
+            "map_validation_errors": list(validation.errors),
+            "map_validation_warnings": list(validation.warnings),
+            "track_box_count": len(diagnostic_map.track_boxes),
+            "target_region_present": diagnostic_map.target_region is not None,
+        }
+    )
+    warnings = [DIAGNOSTIC_MAP_WARNING] + list(validation.warnings)
+    metadata_warnings = diagnostic_map.metadata.get("warnings", [])
+    if isinstance(metadata_warnings, list):
+        warnings.extend(str(warning) for warning in metadata_warnings)
+    return SceneResult(track_region, block_center, block_size, payload, warnings)
+
+
+def generate_trajectory_aligned_diagnostic_map(
+    task_points: np.ndarray,
+    config: OfflineReplayConfig,
+) -> MapConfig:
+    """Generate a data-driven diagnostic MapConfig from task-space trajectory points."""
+
+    _validate_diagnostic_map_config(config)
+    if len(task_points) == 0:
+        raise ValueError("diagnostic map requires at least one valid task point.")
+
+    diagnostic_points = np.asarray(task_points[: config.diagnostic_map_frames], dtype=float)
+    if len(diagnostic_points) < 2:
+        raise ValueError("diagnostic map requires at least two valid task points.")
+
+    origin = np.asarray(diagnostic_points[0], dtype=float)
+    raw_direction = _estimate_diagnostic_direction(diagnostic_points, origin)
+    snapped_label, snapped_direction, snap_angle = _snap_direction_to_task_axis(raw_direction)
+    perp_label = _perp_direction_label(snapped_label, config.diagnostic_map_turn)
+    warnings: list[str] = []
+    if snap_angle > 45.0:
+        warnings.append(
+            f"diagnostic map raw direction snap angle is large: {snap_angle:.3f} degrees."
+        )
+
+    boxes = _diagnostic_track_boxes(
+        origin=origin,
+        main_direction=snapped_label,
+        perp_direction=perp_label,
+        config=config,
+    )
+    target = _diagnostic_target_region(
+        segment_box=boxes[-1] if config.diagnostic_map_shape == "l_shape" else boxes[0],
+        direction=perp_label if config.diagnostic_map_shape == "l_shape" else snapped_label,
+        segment_length=(
+            config.diagnostic_map_perp_length
+            if config.diagnostic_map_shape == "l_shape"
+            else config.diagnostic_map_main_length
+        ),
+    )
+
+    return MapConfig(
+        map_id=config.diagnostic_map_id,
+        description="Post-hoc trajectory-aligned diagnostic map.",
+        coordinate_space="task",
+        unit="m",
+        block_initial_center_task=origin.tolist(),
+        block_size=[
+            config.diagnostic_map_width,
+            config.diagnostic_map_width,
+            config.diagnostic_map_z_tolerance * 2.0,
+        ],
+        track_boxes=boxes,
+        target_region=target,
+        metadata={
+            "generated": True,
+            "generator_name": "trajectory_aligned_diagnostic_map",
+            "diagnostic": True,
+            "post_hoc": True,
+            "source": "raw_jsonl_valid_points",
+            "diagnostic_map_frames": config.diagnostic_map_frames,
+            "diagnostic_points_used": int(len(diagnostic_points)),
+            "raw_main_direction": raw_direction.tolist(),
+            "snapped_main_direction": snapped_label,
+            "snapped_main_direction_vector": snapped_direction.tolist(),
+            "snapped_perp_direction": perp_label,
+            "snap_angle_degrees": float(snap_angle),
+            "shape": config.diagnostic_map_shape,
+            "turn": config.diagnostic_map_turn,
+            "main_length": config.diagnostic_map_main_length,
+            "perp_length": config.diagnostic_map_perp_length,
+            "width": config.diagnostic_map_width,
+            "z_tolerance": config.diagnostic_map_z_tolerance,
+            "warning": DIAGNOSTIC_MAP_WARNING,
+            "warnings": warnings,
+        },
+    )
+
+
+def _validate_diagnostic_map_config(config: OfflineReplayConfig) -> None:
+    if config.map_config is not None and config.diagnostic_map:
+        raise ValueError("--map-config and --diagnostic-map cannot be used together.")
+    if config.diagnostic_map_frames <= 0:
+        raise ValueError("diagnostic_map_frames must be > 0.")
+    for name, value in (
+        ("diagnostic_map_main_length", config.diagnostic_map_main_length),
+        ("diagnostic_map_perp_length", config.diagnostic_map_perp_length),
+        ("diagnostic_map_width", config.diagnostic_map_width),
+        ("diagnostic_map_z_tolerance", config.diagnostic_map_z_tolerance),
+    ):
+        if value <= 0:
+            raise ValueError(f"{name} must be > 0.")
+    if config.diagnostic_map_shape not in {"cross", "l_shape", "t_shape"}:
+        raise ValueError("diagnostic_map_shape must be cross, l_shape, or t_shape.")
+    if config.diagnostic_map_turn not in {"left", "right"}:
+        raise ValueError("diagnostic_map_turn must be left or right.")
+
+
+def _estimate_diagnostic_direction(points: np.ndarray, origin: np.ndarray) -> np.ndarray:
+    xy_points = np.asarray(points[:, :2], dtype=float)
+    origin_xy = np.asarray(origin[:2], dtype=float)
+    deltas = xy_points - origin_xy
+    distances = np.linalg.norm(deltas, axis=1)
+    farthest_index = int(np.argmax(distances))
+    farthest = deltas[farthest_index]
+    if float(distances[farthest_index]) >= DIAGNOSTIC_MIN_DIRECTION_LENGTH:
+        return _direction3_from_xy(farthest)
+
+    centered = xy_points - np.mean(xy_points, axis=0)
+    if len(centered) < 2 or float(np.max(np.linalg.norm(centered, axis=1))) < DIAGNOSTIC_MIN_DIRECTION_LENGTH:
+        raise ValueError("Unable to estimate diagnostic map direction from concentrated task points.")
+    _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
+    if len(singular_values) == 0 or singular_values[0] < DIAGNOSTIC_MIN_DIRECTION_LENGTH:
+        raise ValueError("Unable to estimate diagnostic map direction from concentrated task points.")
+    axis = vh[0]
+    direction_hint = points[-1, :2] - origin[:2]
+    if float(np.dot(axis, direction_hint)) < 0.0:
+        axis = -axis
+    if float(np.linalg.norm(axis)) < DIAGNOSTIC_MIN_DIRECTION_LENGTH:
+        raise ValueError("Unable to estimate diagnostic map direction from concentrated task points.")
+    return _direction3_from_xy(axis)
+
+
+def _direction3_from_xy(vector_xy: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vector_xy))
+    if norm < DIAGNOSTIC_MIN_DIRECTION_LENGTH:
+        raise ValueError("Unable to estimate diagnostic map direction from concentrated task points.")
+    return np.asarray([vector_xy[0] / norm, vector_xy[1] / norm, 0.0], dtype=float)
+
+
+def _snap_direction_to_task_axis(direction: np.ndarray) -> tuple[str, np.ndarray, float]:
+    best_label = "x+"
+    best_dot = -math.inf
+    for label, axis in DIAGNOSTIC_DIRECTIONS.items():
+        dot = float(np.dot(direction, axis))
+        if dot > best_dot:
+            best_label = label
+            best_dot = dot
+    best_dot = max(-1.0, min(1.0, best_dot))
+    snap_angle = math.degrees(math.acos(best_dot))
+    return best_label, DIAGNOSTIC_DIRECTIONS[best_label], float(snap_angle)
+
+
+def _perp_direction_label(direction: str, turn: str) -> str:
+    return LEFT_TURN[direction] if turn == "left" else RIGHT_TURN[direction]
+
+
+def _diagnostic_track_boxes(
+    *,
+    origin: np.ndarray,
+    main_direction: str,
+    perp_direction: str,
+    config: OfflineReplayConfig,
+) -> list[MapBoxSpec]:
+    if config.diagnostic_map_shape == "l_shape":
+        return _diagnostic_l_shape_boxes(origin, main_direction, perp_direction, config)
+    if config.diagnostic_map_shape == "cross":
+        return _diagnostic_cross_boxes(origin, main_direction, perp_direction, config)
+    return _diagnostic_t_shape_boxes(origin, main_direction, perp_direction, config)
+
+
+def _diagnostic_l_shape_boxes(
+    origin: np.ndarray,
+    main_direction: str,
+    perp_direction: str,
+    config: OfflineReplayConfig,
+) -> list[MapBoxSpec]:
+    junction = _move_point(origin, main_direction, config.diagnostic_map_main_length)
+    overlap = _diagnostic_junction_overlap(config)
+    return [
+        _diagnostic_segment_box(
+            "segment_00",
+            0,
+            "Diagnostic main segment",
+            origin,
+            main_direction,
+            config.diagnostic_map_main_length,
+            config,
+            end_overlap=overlap,
+            turn_from_previous="straight",
+        ),
+        _diagnostic_segment_box(
+            "segment_01",
+            1,
+            "Diagnostic turn segment",
+            junction,
+            perp_direction,
+            config.diagnostic_map_perp_length,
+            config,
+            start_overlap=overlap,
+            turn_from_previous=config.diagnostic_map_turn,
+        ),
+    ]
+
+
+def _diagnostic_cross_boxes(
+    origin: np.ndarray,
+    main_direction: str,
+    perp_direction: str,
+    config: OfflineReplayConfig,
+) -> list[MapBoxSpec]:
+    return [
+        _diagnostic_segment_box(
+            "segment_00",
+            0,
+            "Diagnostic main segment",
+            origin,
+            main_direction,
+            config.diagnostic_map_main_length,
+            config,
+            turn_from_previous="straight",
+        ),
+        _diagnostic_centered_segment_box(
+            "segment_01",
+            1,
+            "Diagnostic cross segment",
+            origin,
+            perp_direction,
+            config.diagnostic_map_perp_length,
+            config,
+            turn_from_previous="cross",
+        ),
+    ]
+
+
+def _diagnostic_t_shape_boxes(
+    origin: np.ndarray,
+    main_direction: str,
+    perp_direction: str,
+    config: OfflineReplayConfig,
+) -> list[MapBoxSpec]:
+    junction = _move_point(origin, main_direction, config.diagnostic_map_main_length)
+    return [
+        _diagnostic_segment_box(
+            "segment_00",
+            0,
+            "Diagnostic main segment",
+            origin,
+            main_direction,
+            config.diagnostic_map_main_length,
+            config,
+            turn_from_previous="straight",
+        ),
+        _diagnostic_centered_segment_box(
+            "segment_01",
+            1,
+            "Diagnostic t branch",
+            junction,
+            perp_direction,
+            config.diagnostic_map_perp_length,
+            config,
+            turn_from_previous="t_branch",
+        ),
+    ]
+
+
+def _diagnostic_segment_box(
+    box_id: str,
+    order: int,
+    label: str,
+    start: np.ndarray,
+    direction: str,
+    length: float,
+    config: OfflineReplayConfig,
+    *,
+    start_overlap: float = 0.0,
+    end_overlap: float = 0.0,
+    turn_from_previous: str,
+) -> MapBoxSpec:
+    min_corner, max_corner = _segment_bounds_from_axis(
+        start,
+        direction,
+        length,
+        config.diagnostic_map_width,
+        config.diagnostic_map_z_tolerance,
+        start_overlap=start_overlap,
+        end_overlap=end_overlap,
+    )
+    return MapBoxSpec(
+        id=box_id,
+        order=order,
+        label=label,
+        min=min_corner,
+        max=max_corner,
+        metadata={
+            "direction": direction,
+            "segment_direction": direction,
+            "segment_length": length,
+            "turn_from_previous": turn_from_previous,
+        },
+    )
+
+
+def _diagnostic_centered_segment_box(
+    box_id: str,
+    order: int,
+    label: str,
+    center: np.ndarray,
+    direction: str,
+    length: float,
+    config: OfflineReplayConfig,
+    *,
+    turn_from_previous: str,
+) -> MapBoxSpec:
+    start = _move_point(center, direction, -length / 2.0)
+    return _diagnostic_segment_box(
+        box_id,
+        order,
+        label,
+        start,
+        direction,
+        length,
+        config,
+        turn_from_previous=turn_from_previous,
+    )
+
+
+def _segment_bounds_from_axis(
+    start: np.ndarray,
+    direction: str,
+    length: float,
+    width: float,
+    z_tolerance: float,
+    *,
+    start_overlap: float,
+    end_overlap: float,
+) -> tuple[list[float], list[float]]:
+    start = np.asarray(start, dtype=float)
+    half_width = width / 2.0
+    x, y, z = float(start[0]), float(start[1]), float(start[2])
+    if direction == "x+":
+        x0, x1 = x - start_overlap, x + length + end_overlap
+        y0, y1 = y - half_width, y + half_width
+    elif direction == "x-":
+        x0, x1 = x - length - end_overlap, x + start_overlap
+        y0, y1 = y - half_width, y + half_width
+    elif direction == "y+":
+        y0, y1 = y - start_overlap, y + length + end_overlap
+        x0, x1 = x - half_width, x + half_width
+    elif direction == "y-":
+        y0, y1 = y - length - end_overlap, y + start_overlap
+        x0, x1 = x - half_width, x + half_width
+    else:
+        raise ValueError(f"unsupported diagnostic direction: {direction}")
+    return [x0, y0, z - z_tolerance], [x1, y1, z + z_tolerance]
+
+
+def _move_point(point: np.ndarray, direction: str, distance: float) -> np.ndarray:
+    return np.asarray(point, dtype=float) + DIAGNOSTIC_DIRECTIONS[direction] * float(distance)
+
+
+def _diagnostic_junction_overlap(config: OfflineReplayConfig) -> float:
+    return min(
+        config.diagnostic_map_width * DIAGNOSTIC_JUNCTION_OVERLAP_RATIO,
+        config.diagnostic_map_main_length * 0.25,
+        config.diagnostic_map_perp_length * 0.25,
+    )
+
+
+def _diagnostic_target_region(
+    *,
+    segment_box: MapBoxSpec,
+    direction: str,
+    segment_length: float,
+) -> MapBoxSpec:
+    target_length = min(0.20, segment_length * 0.25)
+    box_min = list(segment_box.min)
+    box_max = list(segment_box.max)
+    if direction == "x+":
+        box_min[0] = box_max[0] - target_length
+    elif direction == "x-":
+        box_max[0] = box_min[0] + target_length
+    elif direction == "y+":
+        box_min[1] = box_max[1] - target_length
+    elif direction == "y-":
+        box_max[1] = box_min[1] + target_length
+    else:
+        raise ValueError(f"unsupported diagnostic target direction: {direction}")
+    return MapBoxSpec(
+        id="target",
+        order=None,
+        label="Target region",
+        min=box_min,
+        max=box_max,
+        metadata={
+            "type": "target_region",
+            "based_on_segment_id": segment_box.id,
+            "target_length": target_length,
+        },
+    )
+
+
 def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
     """Run the full offline autocalibrated replay and return serializable outputs."""
 
+    _validate_scene_source_config(config)
     records = load_samples_from_raw_jsonl(config)
     points_world, point_sources, valid_records = collect_valid_trajectory_points(records)
     calibration = build_autocalibrated_task_coordinate_system(points_world, config)
     task_points = np.vstack(
         [calibration.task_coordinate_system.world_to_task(point) for point in points_world]
     )
-    scene = (
-        build_map_config_scene(config)
-        if config.map_config is not None
-        else build_auto_scene(task_points, config)
-    )
+    if config.diagnostic_map:
+        scene = build_diagnostic_map_scene(task_points, config)
+    elif config.map_config is not None:
+        scene = build_map_config_scene(config)
+    else:
+        scene = build_auto_scene(task_points, config)
 
     engine_config = EngineConfig(
         block_size_x=scene.block_size.x,
@@ -428,7 +905,7 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
             session_meta=_offline_session_meta(config, session_dir),
             calibration=_offline_session_calibration(
                 calibration.payload,
-                warnings=[MAP_CONFIG_POST_HOC_WARNING] if config.map_config is not None else None,
+                warnings=_session_calibration_warnings(config),
             ),
             trial_config=_offline_session_trial_config(
                 scene.payload,
@@ -572,22 +1049,33 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
     }
     if scene.payload.get("map_config_used"):
         summary.update(_map_summary_fields(scene.payload))
+    if scene.payload.get("diagnostic_map_used"):
+        summary.update(_diagnostic_map_summary_fields(scene.payload))
     if session_recorder is not None:
         session_recorder.finalize(summary)
     return OfflineReplayResult(frames, events, calibration.payload, scene.payload, summary)
+
+
+def _validate_scene_source_config(config: OfflineReplayConfig) -> None:
+    if config.map_config is not None and config.diagnostic_map:
+        raise ValueError("--map-config and --diagnostic-map cannot be used together.")
+    if config.diagnostic_map:
+        _validate_diagnostic_map_config(config)
 
 
 def _offline_session_meta(config: OfflineReplayConfig, session_dir: Path) -> dict[str, Any]:
     warnings = [OFFLINE_AUTOCALIBRATED_SESSION_WARNING]
     if config.map_config is not None:
         warnings.append(MAP_CONFIG_POST_HOC_WARNING)
+    if config.diagnostic_map:
+        warnings.append(DIAGNOSTIC_MAP_WARNING)
     session_meta = {
         "session_id": config.session_id or session_dir.name,
         "mode": "offline_autocalibrated",
         "trial_id": "offline_autocalibrated",
         "calibration_type": "post_hoc_auto",
         "is_formal_calibration": False,
-        "scene_type": "map_config" if config.map_config is not None else "post_hoc_auto",
+        "scene_type": _session_scene_type(config),
         "is_formal_scene": False,
         "warnings": warnings,
     }
@@ -596,6 +1084,23 @@ def _offline_session_meta(config: OfflineReplayConfig, session_dir: Path) -> dic
     if config.notes is not None:
         session_meta["notes"] = config.notes
     return session_meta
+
+
+def _session_scene_type(config: OfflineReplayConfig) -> str:
+    if config.diagnostic_map:
+        return "diagnostic_map"
+    if config.map_config is not None:
+        return "map_config"
+    return "post_hoc_auto"
+
+
+def _session_calibration_warnings(config: OfflineReplayConfig) -> list[str] | None:
+    warnings: list[str] = []
+    if config.map_config is not None:
+        warnings.append(MAP_CONFIG_POST_HOC_WARNING)
+    if config.diagnostic_map:
+        warnings.append(DIAGNOSTIC_MAP_WARNING)
+    return warnings or None
 
 
 def _offline_session_calibration(
@@ -618,7 +1123,7 @@ def _offline_session_trial_config(
     engine_config: EngineConfig,
     warnings: list[str],
 ) -> dict[str, Any]:
-    if scene_payload.get("scene_type") == "map_config":
+    if scene_payload.get("scene_type") in {"map_config", "diagnostic_map"}:
         payload = dict(scene_payload)
         payload["pinch_threshold"] = {
             "grab": engine_config.pinch_grab_threshold,
@@ -657,6 +1162,28 @@ def _map_summary_fields(scene_payload: dict[str, Any]) -> dict[str, Any]:
         "track_box_count": scene_payload.get("track_box_count", 0),
         "target_region_present": bool(scene_payload.get("target_region_present")),
         "strict_map_validation": bool(scene_payload.get("strict_map_validation")),
+        "map_validation_errors": list(scene_payload.get("map_validation_errors", [])),
+        "map_validation_warnings": list(scene_payload.get("map_validation_warnings", [])),
+    }
+
+
+def _diagnostic_map_summary_fields(scene_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "diagnostic_map_used": True,
+        "diagnostic_map_id": scene_payload.get("diagnostic_map_id", ""),
+        "diagnostic_map_shape": scene_payload.get("diagnostic_map_shape", ""),
+        "diagnostic_map_frames": scene_payload.get("diagnostic_map_frames", ""),
+        "diagnostic_map_main_length": scene_payload.get("diagnostic_map_main_length", ""),
+        "diagnostic_map_perp_length": scene_payload.get("diagnostic_map_perp_length", ""),
+        "diagnostic_map_width": scene_payload.get("diagnostic_map_width", ""),
+        "diagnostic_map_z_tolerance": scene_payload.get("diagnostic_map_z_tolerance", ""),
+        "diagnostic_map_turn": scene_payload.get("diagnostic_map_turn", ""),
+        "raw_main_direction": scene_payload.get("raw_main_direction"),
+        "snapped_main_direction": scene_payload.get("snapped_main_direction"),
+        "snapped_perp_direction": scene_payload.get("snapped_perp_direction"),
+        "snap_angle_degrees": scene_payload.get("snap_angle_degrees"),
+        "track_box_count": scene_payload.get("track_box_count", 0),
+        "target_region_present": bool(scene_payload.get("target_region_present")),
         "map_validation_errors": list(scene_payload.get("map_validation_errors", [])),
         "map_validation_warnings": list(scene_payload.get("map_validation_warnings", [])),
     }
@@ -705,6 +1232,15 @@ def main() -> None:
         map_config=Path(args.map_config) if args.map_config is not None else None,
         map_id_override=args.map_id_override,
         strict_map_validation=args.strict_map_validation,
+        diagnostic_map=args.diagnostic_map,
+        diagnostic_map_frames=args.diagnostic_map_frames,
+        diagnostic_map_main_length=args.diagnostic_map_main_length,
+        diagnostic_map_perp_length=args.diagnostic_map_perp_length,
+        diagnostic_map_width=args.diagnostic_map_width,
+        diagnostic_map_z_tolerance=args.diagnostic_map_z_tolerance,
+        diagnostic_map_shape=args.diagnostic_map_shape,
+        diagnostic_map_turn=args.diagnostic_map_turn,
+        diagnostic_map_id=args.diagnostic_map_id,
         write_session=args.write_session,
         session_dir=Path(args.session_dir) if args.session_dir is not None else None,
         session_id=args.session_id,
@@ -945,12 +1481,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--z-tolerance", type=float, default=0.20)
     parser.add_argument("--out-dir", default="data/offline_replay")
     parser.add_argument("--offline-max-detach-count", type=int, default=1_000_000_000)
-    parser.add_argument(
+    scene_source = parser.add_mutually_exclusive_group()
+    scene_source.add_argument(
         "--map-config",
         default=None,
         help=(
             "Optional MapConfig JSON scene. When set, replay still uses post-hoc "
             "auto calibration, but block/track geometry comes from this map."
+        ),
+    )
+    scene_source.add_argument(
+        "--diagnostic-map",
+        action="store_true",
+        help=(
+            "Generate a post-hoc trajectory-aligned diagnostic MapConfig scene "
+            "from the first valid task points."
         ),
     )
     parser.add_argument(
@@ -966,6 +1511,22 @@ def _parse_args() -> argparse.Namespace:
             "By default, map validation warnings are recorded but do not stop replay."
         ),
     )
+    parser.add_argument("--diagnostic-map-frames", type=int, default=100)
+    parser.add_argument("--diagnostic-map-main-length", type=float, default=1.0)
+    parser.add_argument("--diagnostic-map-perp-length", type=float, default=0.5)
+    parser.add_argument("--diagnostic-map-width", type=float, default=0.20)
+    parser.add_argument("--diagnostic-map-z-tolerance", type=float, default=0.20)
+    parser.add_argument(
+        "--diagnostic-map-shape",
+        choices=("cross", "l_shape", "t_shape"),
+        default="l_shape",
+    )
+    parser.add_argument(
+        "--diagnostic-map-turn",
+        choices=("left", "right"),
+        default="left",
+    )
+    parser.add_argument("--diagnostic-map-id", default="trajectory_aligned_diagnostic_map")
     parser.add_argument(
         "--write-session",
         action="store_true",

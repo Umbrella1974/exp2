@@ -57,7 +57,7 @@ pytest -q
 当前应为：
 
 ```text
-154 passed
+159 passed
 ```
 
 常用局部测试：
@@ -65,6 +65,7 @@ pytest -q
 ```powershell
 pytest -q tests/test_offline_replay_autocalibrated.py tests/test_offline_replay_session_output.py
 pytest -q tests/test_offline_replay_map_config.py
+pytest -q tests/test_offline_replay_diagnostic_map.py
 pytest -q tests/test_batch_offline_replay_report.py
 pytest -q tests/test_analyze_session.py
 pytest -q tests/test_map_config.py tests/test_map_generator.py
@@ -149,6 +150,10 @@ python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\r
 --map-config                 可选，使用 MapConfig JSON 作为 block/track scene
 --map-id-override            可选，只覆盖本次 replay 输出中的 map_id
 --strict-map-validation      可选，MapConfig warning 也会阻止 replay
+--diagnostic-map             可选，根据旧数据轨迹生成诊断 MapConfig scene
+--diagnostic-map-frames      用前多少个有效 task 点估计主方向，默认 100
+--diagnostic-map-shape       cross / l_shape / t_shape，默认 l_shape
+--diagnostic-map-turn        left / right，默认 left
 --write-session              额外写标准 session 目录
 ```
 
@@ -157,8 +162,9 @@ python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\r
 - replay 时会强制 `subject_end=False`，避免 raw 中途结束导致后续帧无法观察。
 - 离线 replay 基本关闭 trial timeout 和 too-many-detach 限制，方便完整回放一段数据。
 - 临时坐标系和临时 scene 都是 post-hoc 结果，不应作为正式实验结论。
-- 不传 `--map-config` 时，物块初始中心来自第一帧有效输入点，block/track 由 `--scene-mode` 自动生成。
+- 不传 `--map-config` / `--diagnostic-map` 时，物块初始中心来自第一帧有效输入点，block/track 由 `--scene-mode` 自动生成。
 - 传 `--map-config` 时，物块初始中心、物块尺寸和轨道都来自 MapConfig；`--scene-mode`、`--block-size` 等 auto scene 参数不再决定 block/track 几何。
+- `--map-config` 和 `--diagnostic-map` 互斥。
 
 使用 MapConfig 跑旧 raw JSONL：
 
@@ -198,6 +204,40 @@ strict_map_validation
 map_validation_errors
 map_validation_warnings
 ```
+
+使用 trajectory-aligned diagnostic map 跑旧 raw JSONL：
+
+```powershell
+python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_14.jsonl --out-dir data\offline_replay\exp14_diag_lshape --max-frames 5000 --calibration-frames 100 --diagnostic-map --diagnostic-map-shape l_shape --diagnostic-map-turn left --write-session
+```
+
+然后分析：
+
+```powershell
+python analyze_session.py --session-dir data\offline_replay\exp14_diag_lshape\session --overwrite
+```
+
+`--diagnostic-map` 是旧数据诊断工具。它使用前 `--diagnostic-map-frames` 个有效 task 点估计主方向，然后生成 axis-aligned task-space MapConfig。因为当前 `TrackRegion` 是 AABB union，第一版会把主方向 snap 到最近的 `x+ / x- / y+ / y-`。默认 shape 是 `l_shape`：先沿 snapped 主方向走一段，再按 `--diagnostic-map-turn` 转向，target 放在第二段末端。
+
+diagnostic map 输出额外看：
+
+```text
+diagnostic_map_used
+diagnostic_map_id
+diagnostic_map_shape
+diagnostic_map_frames
+diagnostic_map_main_length
+diagnostic_map_perp_length
+diagnostic_map_width
+diagnostic_map_z_tolerance
+diagnostic_map_turn
+raw_main_direction
+snapped_main_direction
+snapped_perp_direction
+snap_angle_degrees
+```
+
+注意：diagnostic map 是 data-driven post-hoc diagnostic map，不是正式实验地图，也不是正式实验标定。
 
 ## `analyze_session.py`
 
@@ -481,6 +521,19 @@ target_region_present
 strict_map_validation
 map_validation_errors
 map_validation_warnings
+```
+
+Diagnostic map replay 额外看：
+
+```text
+diagnostic_map_used
+diagnostic_map_id
+diagnostic_map_shape
+diagnostic_map_turn
+raw_main_direction
+snapped_main_direction
+snapped_perp_direction
+snap_angle_degrees
 ```
 
 判断物块是否真的移动，优先看 `frames.csv` 或 `processed_frames.csv`：

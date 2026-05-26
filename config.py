@@ -15,8 +15,8 @@ class EngineConfig:
     block_size_y: float = 0.2#1.0
     block_size_z: float = 1.0#1.0
     track_epsilon: float = 1e-6
-    pinch_grab_threshold: float = 0.025
-    pinch_release_threshold: float = 0.035
+    pinch_grab_threshold: float = 0.1 #0.025
+    pinch_release_threshold: float = 0.11 #0.035
     max_hand_delta_per_frame: float = 0.25
     min_block_move_distance: float = 1e-5
     blocked_feedback_threshold: float = 1e-4
