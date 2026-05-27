@@ -92,6 +92,7 @@ def analyze_session(
     time_column: str = "sample_time",
     relative_time: bool = True,
     max_footprint_overlays: int = 20,
+    block_end_window: int = 5,
 ) -> dict[str, Any]:
     """Analyze a session directory and write analysis_summary.json."""
 
@@ -149,6 +150,13 @@ def analyze_session(
         warnings=warnings,
     )
     slip_audit = _slip_reason_audit(processed_rows)
+    block_end_diagnostic = _block_end_diagnostic(
+        processed_rows,
+        trial_config,
+        times,
+        warnings,
+        nearby_window=block_end_window,
+    )
 
     summary = {
         "status": "OK",
@@ -243,6 +251,7 @@ def analyze_session(
         "skipped_event_label_count": skipped_event_label_count,
         "warnings": warnings,
     }
+    summary.update(block_end_diagnostic)
 
     if not no_plots:
         plot_dir = Path(out_dir) if out_dir is not None else session_dir / "plots"
@@ -888,6 +897,343 @@ def _slip_reason_audit(rows: list[dict[str, str]]) -> dict[str, Any]:
         "logical_slip_due_to_pinch_insufficient_count": pinch_insufficient,
         "logical_slip_due_to_track_blocked_count": track_blocked,
     }
+
+
+def _block_end_diagnostic(
+    rows: list[dict[str, str]],
+    trial_config: dict[str, Any],
+    times: TimeSeries,
+    warnings: list[str],
+    *,
+    nearby_window: int = 5,
+    movement_epsilon: float = 1e-9,
+) -> dict[str, Any]:
+    del times
+    movement_epsilon = max(0.0, float(movement_epsilon))
+    indexed_centers = [
+        (index, row, _row_block_center(row))
+        for index, row in enumerate(rows)
+    ]
+    valid_centers = [
+        (index, row, center)
+        for index, row, center in indexed_centers
+        if center is not None
+    ]
+    base = {
+        "block_end_diagnostic_available": True,
+        "block_end_movement_epsilon": movement_epsilon,
+        "block_end_secondary_signals": {},
+    }
+    if not valid_centers:
+        return {
+            **base,
+            "block_end_frame_index": None,
+            "block_end_time": None,
+            "block_end_position_task": None,
+            "block_last_moved_frame_index": None,
+            "block_last_moved_time": None,
+            "block_last_moved_position_task": None,
+            "block_first_stop_frame_index": None,
+            "block_first_stop_time": None,
+            "block_end_reason": "no_block_position_detected",
+            "block_end_subreason": "",
+            "block_end_explanation": "No valid block_center_task coordinates were detected in processed_frames.csv.",
+            "block_end_nearby_frames": [],
+        }
+
+    end_index, end_row, end_center = valid_centers[-1]
+    last_moved: tuple[int, dict[str, str], list[float]] | None = None
+    previous_index: int | None = None
+    previous_row: dict[str, str] | None = None
+    previous_center: list[float] | None = None
+    for index, row, center in indexed_centers:
+        if center is None:
+            continue
+        if previous_center is not None:
+            distance = _point_distance(center, previous_center)
+            if distance > movement_epsilon:
+                last_moved = (index, row, center)
+        previous_index = index
+        previous_row = row
+        previous_center = center
+    del previous_index, previous_row
+
+    if last_moved is None:
+        return {
+            **base,
+            "block_end_frame_index": _int_or_none(end_row.get("frame_index")),
+            "block_end_time": _float_or_none(end_row.get("sample_time")),
+            "block_end_position_task": _xyz_payload(end_center),
+            "block_last_moved_frame_index": None,
+            "block_last_moved_time": None,
+            "block_last_moved_position_task": None,
+            "block_first_stop_frame_index": None,
+            "block_first_stop_time": None,
+            "block_end_reason": "no_block_movement_detected",
+            "block_end_subreason": "",
+            "block_end_explanation": (
+                "No block movement greater than movement_epsilon was detected in processed_frames.csv."
+            ),
+            "block_end_nearby_frames": _nearby_frame_payloads(
+                rows,
+                center_index=end_index,
+                nearby_window=nearby_window,
+            ),
+        }
+
+    last_index, last_row, last_center = last_moved
+    first_stop_row = rows[last_index + 1] if last_index + 1 < len(rows) else None
+    first_stop_index = last_index + 1 if first_stop_row is not None else None
+    block_size, _ = _resolve_block_size(trial_config, rows)
+    classification = _classify_block_end_reason(
+        last_moved_row=last_row,
+        first_stop_row=first_stop_row,
+        trial_config=trial_config,
+        block_size=block_size,
+        warnings=warnings,
+    )
+    return {
+        **base,
+        "block_end_frame_index": _int_or_none(end_row.get("frame_index")),
+        "block_end_time": _float_or_none(end_row.get("sample_time")),
+        "block_end_position_task": _xyz_payload(end_center),
+        "block_last_moved_frame_index": _int_or_none(last_row.get("frame_index")),
+        "block_last_moved_time": _float_or_none(last_row.get("sample_time")),
+        "block_last_moved_position_task": _xyz_payload(last_center),
+        "block_first_stop_frame_index": (
+            _int_or_none(first_stop_row.get("frame_index"))
+            if first_stop_row is not None
+            else None
+        ),
+        "block_first_stop_time": (
+            _float_or_none(first_stop_row.get("sample_time"))
+            if first_stop_row is not None
+            else None
+        ),
+        "block_end_nearby_frames": _nearby_frame_payloads(
+            rows,
+            center_index=first_stop_index if first_stop_index is not None else last_index,
+            nearby_window=nearby_window,
+        ),
+        **classification,
+    }
+
+
+def _classify_block_end_reason(
+    *,
+    last_moved_row: dict[str, str],
+    first_stop_row: dict[str, str] | None,
+    trial_config: dict[str, Any],
+    block_size: list[float] | None,
+    warnings: list[str],
+) -> dict[str, Any]:
+    del last_moved_row
+    if first_stop_row is None:
+        return {
+            "block_end_reason": "recording_ended_while_moving",
+            "block_end_subreason": "",
+            "block_end_explanation": (
+                "The replay ended immediately after the last moved frame; no following frame is available to explain why movement stopped."
+            ),
+        }
+    if not _bool(first_stop_row.get("tracker_valid")):
+        return {
+            "block_end_reason": "tracking_invalid",
+            "block_end_subreason": "",
+            "block_end_explanation": "Tracking invalid caused interaction to stop on the first non-moving frame.",
+        }
+    if _row_track_blocked(first_stop_row):
+        track_state = _enum_name(first_stop_row.get("track_state")) or ""
+        return {
+            "block_end_reason": "track_blocked",
+            "block_end_subreason": track_state,
+            "block_end_explanation": (
+                "Movement stopped because the candidate block center was blocked by the track boundary"
+                + (f": {track_state}." if track_state else ".")
+            ),
+        }
+    if _enum_name(first_stop_row.get("stop_reason")) == "PINCH_INSUFFICIENT" or _enum_name(
+        first_stop_row.get("pinch_state")
+    ) == "PINCH_INSUFFICIENT":
+        return _pinch_insufficient_block_end_explanation(first_stop_row, trial_config)
+    if _bool(first_stop_row.get("large_delta")) or _enum_name(first_stop_row.get("stop_reason")) == "LARGE_DELTA":
+        return {
+            "block_end_reason": "large_delta",
+            "block_end_subreason": "LARGE_DELTA",
+            "block_end_explanation": "Movement stopped because the hand delta was classified as LARGE_DELTA.",
+        }
+    detach_state = _enum_name(first_stop_row.get("detach_state"))
+    contact_state = _enum_name(first_stop_row.get("contact_state"))
+    if contact_state == "OUTSIDE_BLOCK" or (detach_state is not None and detach_state != "NONE"):
+        result = _block_end_aabb_explanation(first_stop_row, block_size, warnings)
+        subreason = detach_state or ""
+        return {
+            "block_end_reason": "contact_exit",
+            "block_end_subreason": subreason,
+            "block_end_explanation": result["explanation"],
+        }
+    if _enum_name(first_stop_row.get("block_motion_state")) == "FREE_VISIBLE":
+        return {
+            "block_end_reason": "not_grabbed_or_free_visible",
+            "block_end_subreason": "",
+            "block_end_explanation": (
+                "The first non-moving frame is free-visible/outside interaction, but no explicit detach subtype was available."
+            ),
+        }
+    if _enum_name(first_stop_row.get("pinch_state")) == "PINCH_VALID" and contact_state == "INSIDE_BLOCK":
+        return {
+            "block_end_reason": "unchanged_after_last_move",
+            "block_end_subreason": "",
+            "block_end_explanation": (
+                "The first non-moving frame remained PINCH_VALID and INSIDE_BLOCK; movement may have been below min_block_move_distance or the candidate center may have equaled the previous center."
+            ),
+        }
+    return {
+        "block_end_reason": "unknown",
+        "block_end_subreason": "",
+        "block_end_explanation": "No clear stop reason could be inferred from recorded fields.",
+    }
+
+
+def _pinch_insufficient_block_end_explanation(
+    row: dict[str, str],
+    trial_config: dict[str, Any],
+) -> dict[str, Any]:
+    pinch_distance = _float_or_none(row.get("pinch_distance"))
+    release = _pinch_release_threshold(trial_config)
+    if pinch_distance is not None and release is not None:
+        explanation = (
+            f"Movement stopped because pinch_distance {pinch_distance:.6g} exceeded release threshold {release:.6g}."
+        )
+    elif pinch_distance is not None:
+        explanation = (
+            f"Movement stopped because pinch was classified as insufficient with pinch_distance {pinch_distance:.6g}; release threshold unavailable."
+        )
+    else:
+        explanation = (
+            "Movement stopped because pinch was classified as insufficient; pinch_distance and release threshold unavailable."
+        )
+    return {
+        "block_end_reason": "pinch_insufficient",
+        "block_end_subreason": "PINCH_INSUFFICIENT",
+        "block_end_explanation": explanation,
+    }
+
+
+def _block_end_aabb_explanation(
+    row: dict[str, str],
+    block_size: list[float] | None,
+    warnings: list[str],
+) -> dict[str, Any]:
+    if block_size is None:
+        return {
+            "explanation": (
+                "Movement stopped after contact exit; block_size unavailable, so reconstructed block AABB diagnostic was skipped."
+            )
+        }
+    block = _row_block_center(row)
+    pinch = _row_pinch_center(row)
+    if block is None or pinch is None:
+        return {
+            "explanation": (
+                "Movement stopped after contact exit; block or pinch task coordinates unavailable for reconstructed block AABB diagnostic."
+            )
+        }
+    outside = _aabb_outside_amounts(pinch, block, block_size)
+    if outside:
+        axis, direction, amount = max(outside, key=lambda item: item[2])
+        return {
+            "explanation": (
+                "After the last moved frame, pinch_center_task left the reconstructed block AABB "
+                f"on {axis}{direction} by {amount:.6g} m."
+            )
+        }
+    _append_warning_once(
+        warnings,
+        "block_end diagnostic found contact_exit, but pinch_center_task is inside reconstructed block AABB; inspect block_size or recording semantics.",
+    )
+    return {
+        "explanation": (
+            "Movement stopped after contact exit, but pinch_center_task is inside the reconstructed block AABB; inspect block_size or recording semantics."
+        )
+    }
+
+
+def _aabb_outside_amounts(
+    point: list[float],
+    center: list[float],
+    size: list[float],
+) -> list[tuple[str, str, float]]:
+    axes = ("x", "y", "z")
+    outside: list[tuple[str, str, float]] = []
+    for index, axis in enumerate(axes):
+        minimum = center[index] - size[index] * 0.5
+        maximum = center[index] + size[index] * 0.5
+        if point[index] < minimum:
+            outside.append((axis, "-", minimum - point[index]))
+        elif point[index] > maximum:
+            outside.append((axis, "+", point[index] - maximum))
+    return outside
+
+
+def _pinch_release_threshold(trial_config: dict[str, Any]) -> float | None:
+    threshold = trial_config.get("pinch_threshold")
+    if isinstance(threshold, dict):
+        value = _float_or_none(threshold.get("release"))
+        if value is not None:
+            return value
+    thresholds = trial_config.get("pinch_thresholds")
+    if isinstance(thresholds, dict):
+        value = _float_or_none(thresholds.get("release"))
+        if value is not None:
+            return value
+    value = _float_or_none(trial_config.get("pinch_release_threshold"))
+    if value is not None:
+        return value
+    engine_config = trial_config.get("engine_config")
+    if isinstance(engine_config, dict):
+        return _float_or_none(engine_config.get("pinch_release_threshold"))
+    return None
+
+
+def _nearby_frame_payloads(
+    rows: list[dict[str, str]],
+    *,
+    center_index: int,
+    nearby_window: int,
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    window = max(0, int(nearby_window))
+    start = max(0, center_index - window)
+    end = min(len(rows), center_index + window + 1)
+    return [_compact_frame_payload(row) for row in rows[start:end]]
+
+
+def _compact_frame_payload(row: dict[str, str]) -> dict[str, Any]:
+    return {
+        "frame_index": _int_or_none(row.get("frame_index")),
+        "time": _float_or_none(row.get("sample_time")),
+        "pinch_distance": _float_or_none(row.get("pinch_distance")),
+        "contact_state": row.get("contact_state", ""),
+        "pinch_state": row.get("pinch_state", ""),
+        "block_motion_state": row.get("block_motion_state", ""),
+        "stop_reason": row.get("stop_reason", ""),
+        "track_state": row.get("track_state", ""),
+        "detach_state": row.get("detach_state", ""),
+        "slip_active": _bool(row.get("slip_active")),
+        "slip_reason": row.get("slip_reason", ""),
+    }
+
+
+def _xyz_payload(point: list[float] | None) -> dict[str, float] | None:
+    if point is None:
+        return None
+    return {"x": point[0], "y": point[1], "z": point[2]}
+
+
+def _point_distance(a: list[float], b: list[float]) -> float:
+    return math.sqrt(sum((a[index] - b[index]) ** 2 for index in range(3)))
 
 
 def _resolve_block_size(
@@ -1616,6 +1962,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--event-label-limit", type=int, default=40)
     parser.add_argument("--max-footprint-overlays", type=int, default=20)
+    parser.add_argument("--block-end-window", type=int, default=5)
     parser.add_argument("--overwrite", action="store_true")
     time_axis_group = parser.add_mutually_exclusive_group()
     time_axis_group.add_argument(
@@ -1650,6 +1997,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         time_column=args.time_column,
         relative_time=args.relative_time,
         max_footprint_overlays=args.max_footprint_overlays,
+        block_end_window=args.block_end_window,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 1 if summary.get("status") == "ERROR" else 0

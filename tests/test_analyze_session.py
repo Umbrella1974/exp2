@@ -290,6 +290,141 @@ def test_bad_track_box_stats_are_available_without_plots(tmp_path: Path) -> None
     assert any("track_boxes[2] could not be parsed" in warning for warning in summary["warnings"])
 
 
+def test_block_end_diagnostic_reports_contact_exit(tmp_path: Path) -> None:
+    session_dir = _block_end_session(
+        tmp_path,
+        [
+            _block_end_row(0, block=(0.0, 0.0, 0.0), pinch=(0.0, 0.0, 0.0)),
+            _block_end_row(1, block=(0.04, 0.0, 0.0), pinch=(0.04, 0.0, 0.0)),
+            _block_end_row(
+                2,
+                block=(0.04, 0.0, 0.0),
+                pinch=(0.095, 0.0, 0.0),
+                contact_state="OUTSIDE_BLOCK",
+                motion_state="FREE_VISIBLE",
+                detach_state="UNEXPECTED_DETACH",
+            ),
+        ],
+    )
+
+    summary = analyze_session.analyze_session(
+        session_dir=session_dir,
+        no_plots=True,
+        overwrite=True,
+    )
+
+    assert summary["block_last_moved_frame_index"] == 1
+    assert summary["block_first_stop_frame_index"] == 2
+    assert summary["block_end_reason"] == "contact_exit"
+    assert summary["block_end_subreason"] == "UNEXPECTED_DETACH"
+    assert "reconstructed block AABB" in summary["block_end_explanation"]
+    assert "x+" in summary["block_end_explanation"]
+    assert summary["block_end_secondary_signals"] == {}
+
+
+def test_block_end_diagnostic_reports_pinch_insufficient(tmp_path: Path) -> None:
+    session_dir = _block_end_session(
+        tmp_path,
+        [
+            _block_end_row(0, block=(0.0, 0.0, 0.0), pinch=(0.0, 0.0, 0.0), pinch_distance=0.05),
+            _block_end_row(1, block=(0.02, 0.0, 0.0), pinch=(0.02, 0.0, 0.0), pinch_distance=0.10),
+            _block_end_row(
+                2,
+                block=(0.02, 0.0, 0.0),
+                pinch=(0.03, 0.0, 0.0),
+                pinch_distance=0.12,
+                pinch_state="PINCH_INSUFFICIENT",
+                motion_state="GRABBED_PINCH_INSUFFICIENT",
+                stop_reason="PINCH_INSUFFICIENT",
+                slip_active=True,
+                slip_reason="PINCH_INSUFFICIENT",
+            ),
+        ],
+    )
+
+    summary = analyze_session.analyze_session(
+        session_dir=session_dir,
+        no_plots=True,
+        overwrite=True,
+    )
+
+    assert summary["block_end_reason"] == "pinch_insufficient"
+    assert summary["block_end_subreason"] == "PINCH_INSUFFICIENT"
+    assert "release threshold" in summary["block_end_explanation"]
+    assert "0.11" in summary["block_end_explanation"]
+
+
+def test_block_end_diagnostic_reports_track_blocked(tmp_path: Path) -> None:
+    session_dir = _block_end_session(
+        tmp_path,
+        [
+            _block_end_row(0, block=(0.0, 0.0, 0.0), pinch=(0.0, 0.0, 0.0)),
+            _block_end_row(1, block=(0.02, 0.0, 0.0), pinch=(0.02, 0.0, 0.0)),
+            _block_end_row(
+                2,
+                block=(0.02, 0.0, 0.0),
+                pinch=(0.03, 0.0, 0.0),
+                motion_state="GRABBED_BLOCKED",
+                stop_reason="TRACK_BLOCKED",
+                track_state="BLOCKED_X_POS",
+                blocked_force_active=True,
+                slip_active=True,
+                slip_reason="TRACK_BLOCKED",
+            ),
+        ],
+    )
+
+    summary = analyze_session.analyze_session(
+        session_dir=session_dir,
+        no_plots=True,
+        overwrite=True,
+    )
+
+    assert summary["block_end_reason"] == "track_blocked"
+    assert summary["block_end_subreason"] == "BLOCKED_X_POS"
+
+
+def test_block_end_diagnostic_reports_recording_ended_while_moving(tmp_path: Path) -> None:
+    session_dir = _block_end_session(
+        tmp_path,
+        [
+            _block_end_row(0, block=(0.0, 0.0, 0.0), pinch=(0.0, 0.0, 0.0)),
+            _block_end_row(1, block=(0.02, 0.0, 0.0), pinch=(0.02, 0.0, 0.0)),
+        ],
+    )
+
+    summary = analyze_session.analyze_session(
+        session_dir=session_dir,
+        no_plots=True,
+        overwrite=True,
+    )
+
+    assert summary["block_last_moved_frame_index"] == 1
+    assert summary["block_first_stop_frame_index"] is None
+    assert summary["block_end_reason"] == "recording_ended_while_moving"
+
+
+def test_block_end_diagnostic_reports_no_movement(tmp_path: Path) -> None:
+    session_dir = _block_end_session(
+        tmp_path,
+        [
+            _block_end_row(0, block=(0.0, 0.0, 0.0), pinch=(0.0, 0.0, 0.0)),
+            _block_end_row(1, block=(0.0, 0.0, 0.0), pinch=(0.01, 0.0, 0.0)),
+        ],
+    )
+
+    summary = analyze_session.analyze_session(
+        session_dir=session_dir,
+        no_plots=True,
+        overwrite=True,
+    )
+
+    assert summary["block_last_moved_frame_index"] is None
+    assert summary["block_first_stop_frame_index"] is None
+    assert summary["block_end_reason"] == "no_block_movement_detected"
+    assert summary["block_end_diagnostic_available"] is True
+
+
 def _fake_session(
     tmp_path: Path,
     *,
@@ -331,6 +466,72 @@ def _fake_session(
     _write_csv(session_dir / "events.csv", _event_rows(many_events=many_events))
     _write_csv(session_dir / "haptic.csv", _haptic_rows())
     return session_dir
+
+
+def _block_end_session(tmp_path: Path, rows: list[dict[str, str]]) -> Path:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    _write_json(session_dir / "session_meta.json", {"mode": "offline_autocalibrated"})
+    _write_json(session_dir / "calibration.json", {"calibration_type": "post_hoc_auto"})
+    _write_json(
+        session_dir / "trial_config.json",
+        {
+            "scene_type": "map_template_generated",
+            "is_formal_scene": False,
+            "block_size": [0.1, 0.1, 0.1],
+            "pinch_threshold": {"grab": 0.1, "release": 0.11},
+        },
+    )
+    _write_json(session_dir / "trial_summary.json", {"warnings": []})
+    _write_csv(session_dir / "processed_frames.csv", rows)
+    _write_csv(session_dir / "events.csv", [{"event_index": "0", "frame_index": "0", "time": "10.0", "event_type": "contact_enter", "details_json": "{}"}])
+    _write_csv(session_dir / "haptic.csv", [_haptic_rows()[0]])
+    return session_dir
+
+
+def _block_end_row(
+    frame_index: int,
+    *,
+    block: tuple[float, float, float],
+    pinch: tuple[float, float, float],
+    pinch_distance: float = 0.05,
+    contact_state: str = "INSIDE_BLOCK",
+    pinch_state: str = "PINCH_VALID",
+    motion_state: str = "GRABBED_MOVING",
+    stop_reason: str = "NONE",
+    track_state: str = "INSIDE_TRACK",
+    detach_state: str = "NONE",
+    slip_active: bool = False,
+    slip_reason: str = "",
+    blocked_force_active: bool = False,
+) -> dict[str, str]:
+    return {
+        "frame_index": str(frame_index),
+        "sample_time": f"{10.0 + frame_index * 0.1:.1f}",
+        "trial_time": f"{frame_index * 0.1:.1f}",
+        "raw_timestamp": str(1000 + frame_index),
+        "tracker_valid": "True",
+        "pinch_valid": "True",
+        "pinch_distance": str(pinch_distance),
+        "pinch_center_task_x": str(pinch[0]),
+        "pinch_center_task_y": str(pinch[1]),
+        "pinch_center_task_z": str(pinch[2]),
+        "block_center_task_x": str(block[0]),
+        "block_center_task_y": str(block[1]),
+        "block_center_task_z": str(block[2]),
+        "contact_state": contact_state,
+        "pinch_state": pinch_state,
+        "block_motion_state": motion_state,
+        "stop_reason": stop_reason,
+        "track_state": track_state,
+        "detach_state": detach_state,
+        "slip_active": str(slip_active),
+        "slip_reason": slip_reason,
+        "blocked_force_active": str(blocked_force_active),
+        "large_delta": "False",
+        "haptic_state": "",
+        "haptic_reason": "",
+    }
 
 
 def _processed_rows(*, empty_trial_time: bool, empty_all_time: bool) -> list[dict[str, str]]:

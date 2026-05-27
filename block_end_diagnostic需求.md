@@ -637,3 +637,31 @@ block_end_explanation = Movement stopped because the candidate block center was 
 - 重新计算状态机。
 - target reached 逻辑。
 
+补充说明：
+
+1. 只在当前帧和上一帧都具有有效 block_center_task_x/y/z 时计算移动距离。
+   如果某帧 block center 缺失，则跳过该 pair，不把缺失/恢复当作移动。
+
+2. analysis_summary.json 中记录：
+   - block_end_movement_epsilon
+
+3. 如果没有找到 last_moved_frame：
+   - block_end_reason = "no_block_movement_detected"
+   - block_last_moved_frame_index = null
+   - block_first_stop_frame_index = null
+   - block_end_diagnostic_available = true
+   - block_end_explanation = "No block movement greater than movement_epsilon was detected in processed_frames.csv."
+
+4. reason 分类以 first_stop_frame 为主。
+   nearby_window 只用于输出 block_end_nearby_frames，第一版不要用附近窗口自动改写 reason。
+
+5. release threshold 读取 best-effort：
+   - trial_config["pinch_threshold"]["release"]
+   - trial_config["pinch_thresholds"]["release"]
+   - trial_config["pinch_release_threshold"]
+   - trial_config["engine_config"]["pinch_release_threshold"]
+   如果找不到，解释中只写 pinch_distance，并说明 release threshold unavailable。
+
+6. 如果多个 reason 条件同时满足，按优先级选择第一个，同时可选记录 block_end_secondary_signals。
+
+7. AABB 解释必须标记为 reconstructed diagnostic，不代表重新运行状态机。

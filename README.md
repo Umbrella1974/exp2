@@ -54,11 +54,7 @@ pip install matplotlib
 pytest -q
 ```
 
-当前应为：
-
-```text
-172 passed
-```
+通过数量会随新增诊断测试变化，以本地 `pytest` 输出为准。
 
 常用局部测试：
 
@@ -369,6 +365,23 @@ slip_frames_with_geometry_check
 slip_frames_pinch_inside_block_count
 slip_frames_pinch_outside_block_count
 ```
+
+Analyzer 还会做 `block end diagnostic`，用于解释图里的 `block end` 为什么停在那个位置。这里的 `block end` 不是事件，而是 `processed_frames.csv` 中最后记录的 block center；诊断会找最后一次真实移动帧，以及之后第一帧不再移动的直接原因。常看字段：
+
+```text
+block_end_frame_index
+block_end_position_task
+block_last_moved_frame_index
+block_first_stop_frame_index
+block_end_reason
+block_end_subreason
+block_end_explanation
+block_end_nearby_frames
+block_end_movement_epsilon
+block_end_secondary_signals
+```
+
+`block_end_reason` 常见值包括 `contact_exit`、`pinch_insufficient`、`track_blocked`、`tracking_invalid`、`recording_ended_while_moving`、`no_block_movement_detected`。`block_end_explanation` 是 analyzer 根据已有 CSV 字段做的 reconstructed diagnostic，不代表重新运行状态机。`block_end_secondary_signals` 第一版是可选补充字段，可能为空；主结论只以 `block_end_reason`、`block_end_subreason` 和 `block_end_explanation` 为准。
 
 如果 session 没有 `track_boxes`，会回退到旧的 bounds 字段，例如：
 
