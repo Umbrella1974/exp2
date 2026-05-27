@@ -27,6 +27,7 @@ GENERATED_PLOT_NAMES = [
     "timeseries_xyz_with_events.png",
     "pinch_distance_with_events.png",
     "trajectory_track_map.png",
+    "trajectory_track_map_with_block_footprint.png",
     "state_timeline.png",
     "haptic_timeline.png",
 ]
@@ -71,6 +72,16 @@ class TrackBoxStats:
     skipped_indices: list[int]
 
 
+@dataclass(frozen=True)
+class BlockFootprintOverlay:
+    """One x-y block footprint reconstructed from a block center and size."""
+
+    kind: str
+    label: str
+    center: list[float]
+    size: list[float]
+
+
 def analyze_session(
     *,
     session_dir: Path,
@@ -80,6 +91,7 @@ def analyze_session(
     overwrite: bool = False,
     time_column: str = "sample_time",
     relative_time: bool = True,
+    max_footprint_overlays: int = 20,
 ) -> dict[str, Any]:
     """Analyze a session directory and write analysis_summary.json."""
 
@@ -130,6 +142,13 @@ def analyze_session(
     logical_blocked_feedback_frame_count = sum(
         _bool(row.get("blocked_force_active")) for row in processed_rows
     )
+    footprint_analysis = _block_footprint_analysis(
+        processed_rows,
+        trial_config,
+        max_footprint_overlays=max_footprint_overlays,
+        warnings=warnings,
+    )
+    slip_audit = _slip_reason_audit(processed_rows)
 
     summary = {
         "status": "OK",
@@ -165,8 +184,17 @@ def analyze_session(
         "contact_enter_count": _count_event_type(recorded_events, "contact_enter"),
         "contact_exit_count": _count_event_type(recorded_events, "contact_exit"),
         "slip_active_frame_count": slip_active_frame_count,
+        "slip_frame_count": slip_active_frame_count,
         "logical_slip_feedback_frame_count": slip_active_frame_count,
+        "slip_reason_counts": slip_audit["slip_reason_counts"],
+        "logical_slip_due_to_pinch_insufficient_count": slip_audit[
+            "logical_slip_due_to_pinch_insufficient_count"
+        ],
+        "logical_slip_due_to_track_blocked_count": slip_audit[
+            "logical_slip_due_to_track_blocked_count"
+        ],
         "logical_blocked_feedback_frame_count": logical_blocked_feedback_frame_count,
+        "blocked_force_active_count": logical_blocked_feedback_frame_count,
         "slip_start_count": _count_event_type(all_events, "slip_start"),
         "slip_end_count": _count_event_type(all_events, "slip_end"),
         "blocked_frame_count": sum(blocked_flags),
@@ -197,6 +225,19 @@ def analyze_session(
         "skipped_track_box_count": track_box_stats.skipped,
         "target_region_present": isinstance(trial_config.get("target_region"), dict),
         "trajectory_map_used_track_boxes": track_box_stats.valid > 0,
+        "track_region_semantics": "block_center_feasible_region",
+        "block_footprint_overlay_count": footprint_analysis["block_footprint_overlay_count"],
+        "slip_footprint_overlay_count": footprint_analysis["slip_footprint_overlay_count"],
+        "blocked_footprint_overlay_count": footprint_analysis["blocked_footprint_overlay_count"],
+        "slip_frames_with_geometry_check": footprint_analysis[
+            "slip_frames_with_geometry_check"
+        ],
+        "slip_frames_pinch_inside_block_count": footprint_analysis[
+            "slip_frames_pinch_inside_block_count"
+        ],
+        "slip_frames_pinch_outside_block_count": footprint_analysis[
+            "slip_frames_pinch_outside_block_count"
+        ],
         "derived_event_counts": derived_event_counts,
         "generated_plots": [],
         "skipped_event_label_count": skipped_event_label_count,
@@ -215,6 +256,7 @@ def analyze_session(
             event_label_limit=event_label_limit,
             overwrite=overwrite,
             warnings=warnings,
+            max_footprint_overlays=max_footprint_overlays,
         )
 
     _write_json(summary_path, summary)
@@ -232,6 +274,7 @@ def _write_plots_best_effort(
     event_label_limit: int,
     overwrite: bool,
     warnings: list[str],
+    max_footprint_overlays: int,
 ) -> list[str]:
     try:
         plt = _load_pyplot()
@@ -245,6 +288,10 @@ def _write_plots_best_effort(
         ("timeseries_xyz_with_events.png", _plot_timeseries_xyz),
         ("pinch_distance_with_events.png", _plot_pinch_distance),
         ("trajectory_track_map.png", _plot_trajectory_track_map),
+        (
+            "trajectory_track_map_with_block_footprint.png",
+            _plot_trajectory_track_map_with_block_footprint,
+        ),
         ("state_timeline.png", _plot_state_timeline),
         ("haptic_timeline.png", _plot_haptic_timeline),
     ]
@@ -264,6 +311,7 @@ def _write_plots_best_effort(
                 events,
                 event_label_limit,
                 warnings,
+                max_footprint_overlays,
             )
             generated.append(str(path))
         except Exception as exc:  # pragma: no cover - best effort guard
@@ -285,8 +333,9 @@ def _plot_timeseries_xyz(
     events: list[dict[str, Any]],
     event_label_limit: int,
     warnings: list[str],
+    max_footprint_overlays: int,
 ) -> None:
-    del haptic_rows, trial_config, warnings
+    del haptic_rows, trial_config, warnings, max_footprint_overlays
     plt.figure(figsize=(11, 6))
     _plot_series(plt, times.axis_values, rows, "pinch_center_task_x", "pinch x")
     _plot_series(plt, times.axis_values, rows, "pinch_center_task_y", "pinch y")
@@ -313,8 +362,9 @@ def _plot_pinch_distance(
     events: list[dict[str, Any]],
     event_label_limit: int,
     warnings: list[str],
+    max_footprint_overlays: int,
 ) -> None:
-    del haptic_rows, warnings
+    del haptic_rows, warnings, max_footprint_overlays
     plt.figure(figsize=(11, 5))
     _plot_series(plt, times.axis_values, rows, "pinch_distance", "pinch distance")
     threshold = trial_config.get("pinch_threshold")
@@ -346,9 +396,59 @@ def _plot_trajectory_track_map(
     events: list[dict[str, Any]],
     event_label_limit: int,
     warnings: list[str],
+    max_footprint_overlays: int,
+) -> None:
+    del haptic_rows, event_label_limit, max_footprint_overlays
+    plt.figure(figsize=(7, 7))
+    _plot_trajectory_track_map_contents(plt, rows, trial_config, times, events, warnings)
+    plt.xlabel("task x")
+    plt.ylabel("task y")
+    plt.axis("equal")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def _plot_trajectory_track_map_with_block_footprint(
+    plt: Any,
+    path: Path,
+    rows: list[dict[str, str]],
+    haptic_rows: list[dict[str, str]],
+    trial_config: dict[str, Any],
+    times: TimeSeries,
+    events: list[dict[str, Any]],
+    event_label_limit: int,
+    warnings: list[str],
+    max_footprint_overlays: int,
 ) -> None:
     del haptic_rows, event_label_limit
     plt.figure(figsize=(7, 7))
+    _plot_trajectory_track_map_contents(plt, rows, trial_config, times, events, warnings)
+    _plot_block_footprint_overlays(
+        plt,
+        rows,
+        trial_config,
+        max_footprint_overlays=max_footprint_overlays,
+        warnings=warnings,
+    )
+    plt.xlabel("task x")
+    plt.ylabel("task y")
+    plt.axis("equal")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def _plot_trajectory_track_map_contents(
+    plt: Any,
+    rows: list[dict[str, str]],
+    trial_config: dict[str, Any],
+    times: TimeSeries,
+    events: list[dict[str, Any]],
+    warnings: list[str],
+) -> None:
     pinch_x = _float_column(rows, "pinch_center_task_x")
     pinch_y = _float_column(rows, "pinch_center_task_y")
     block_x = _float_column(rows, "block_center_task_x")
@@ -359,13 +459,6 @@ def _plot_trajectory_track_map(
     _plot_configured_block_start(plt, trial_config, warnings)
     _plot_endpoint_markers(plt, block_x, block_y)
     _plot_event_points(plt, rows, times, events, warnings)
-    plt.xlabel("task x")
-    plt.ylabel("task y")
-    plt.axis("equal")
-    plt.legend(loc="best")
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
 
 
 def _plot_state_timeline(
@@ -378,8 +471,9 @@ def _plot_state_timeline(
     events: list[dict[str, Any]],
     event_label_limit: int,
     warnings: list[str],
+    max_footprint_overlays: int,
 ) -> None:
-    del haptic_rows, trial_config, events, event_label_limit, warnings
+    del haptic_rows, trial_config, events, event_label_limit, warnings, max_footprint_overlays
     plt.figure(figsize=(11, 6))
     state_specs = [
         ("tracker_valid", "tracker_valid"),
@@ -420,8 +514,9 @@ def _plot_haptic_timeline(
     events: list[dict[str, Any]],
     event_label_limit: int,
     warnings: list[str],
+    max_footprint_overlays: int,
 ) -> None:
-    del trial_config, events, event_label_limit, warnings
+    del trial_config, events, event_label_limit, warnings, max_footprint_overlays
     plt.figure(figsize=(11, 5))
     source_rows = haptic_rows if haptic_rows else rows
     plot_times = times.axis_values[: len(source_rows)]
@@ -638,6 +733,299 @@ def _blocked_flags(rows: list[dict[str, str]]) -> tuple[list[bool], str | None]:
     return flags, "blocked_force_active unavailable; blocked_frame_count used state-string fallback."
 
 
+def _block_footprint_analysis(
+    rows: list[dict[str, str]],
+    trial_config: dict[str, Any],
+    *,
+    max_footprint_overlays: int,
+    warnings: list[str],
+) -> dict[str, Any]:
+    limit = max(0, int(max_footprint_overlays))
+    block_size, _ = _resolve_block_size(trial_config, rows)
+    slip_rows = [row for row in rows if _bool(row.get("slip_active"))]
+    geometry_check = _slip_geometry_check(slip_rows, block_size, warnings)
+    if block_size is None:
+        _append_warning_once(
+            warnings,
+            "block_size missing; block footprint overlays and slip geometry checks were skipped.",
+        )
+        return {
+            "overlays": [],
+            "block_footprint_overlay_count": 0,
+            "slip_footprint_overlay_count": 0,
+            "blocked_footprint_overlay_count": 0,
+            **geometry_check,
+        }
+
+    overlays: list[BlockFootprintOverlay] = []
+    configured_center = _point3(trial_config.get("block_initial_center_task"))
+    if configured_center is not None:
+        overlays.append(
+            BlockFootprintOverlay(
+                kind="configured",
+                label="configured block footprint",
+                center=configured_center,
+                size=block_size,
+            )
+        )
+
+    block_centers = [
+        center
+        for center in (_row_block_center(row) for row in rows)
+        if center is not None
+    ]
+    if block_centers:
+        overlays.append(
+            BlockFootprintOverlay(
+                kind="start",
+                label="block start footprint",
+                center=block_centers[0],
+                size=block_size,
+            )
+        )
+        overlays.append(
+            BlockFootprintOverlay(
+                kind="end",
+                label="block end footprint",
+                center=block_centers[-1],
+                size=block_size,
+            )
+        )
+
+    slip_overlays = [
+        BlockFootprintOverlay(
+            kind="slip",
+            label="sampled slip footprint",
+            center=center,
+            size=block_size,
+        )
+        for center in _sample_evenly(
+            [_row_block_center(row) for row in slip_rows],
+            limit,
+        )
+        if center is not None
+    ]
+    blocked_overlays = [
+        BlockFootprintOverlay(
+            kind="blocked",
+            label="sampled blocked footprint",
+            center=center,
+            size=block_size,
+        )
+        for center in _sample_evenly(
+            [_row_block_center(row) for row in rows if _row_track_blocked(row)],
+            limit,
+        )
+        if center is not None
+    ]
+    overlays.extend(slip_overlays)
+    overlays.extend(blocked_overlays)
+    return {
+        "overlays": overlays,
+        "block_footprint_overlay_count": len(overlays),
+        "slip_footprint_overlay_count": len(slip_overlays),
+        "blocked_footprint_overlay_count": len(blocked_overlays),
+        **geometry_check,
+    }
+
+
+def _slip_geometry_check(
+    slip_rows: list[dict[str, str]],
+    block_size: list[float] | None,
+    warnings: list[str],
+) -> dict[str, int]:
+    checked = 0
+    inside = 0
+    outside = 0
+    if block_size is None:
+        return {
+            "slip_frames_with_geometry_check": 0,
+            "slip_frames_pinch_inside_block_count": 0,
+            "slip_frames_pinch_outside_block_count": 0,
+        }
+
+    for row in slip_rows:
+        pinch = _row_pinch_center(row)
+        block = _row_block_center(row)
+        if pinch is None or block is None:
+            continue
+        checked += 1
+        if _point_inside_aabb(pinch, block, block_size):
+            inside += 1
+        else:
+            outside += 1
+    if outside > 0:
+        _append_warning_once(
+            warnings,
+            "Some slip_active frames have pinch_center_task outside the reconstructed block AABB; inspect contact/slip recording semantics.",
+        )
+    return {
+        "slip_frames_with_geometry_check": checked,
+        "slip_frames_pinch_inside_block_count": inside,
+        "slip_frames_pinch_outside_block_count": outside,
+    }
+
+
+def _slip_reason_audit(rows: list[dict[str, str]]) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    pinch_insufficient = 0
+    track_blocked = 0
+    for row in rows:
+        if not _bool(row.get("slip_active")):
+            continue
+        reason = _enum_name(row.get("slip_reason"))
+        if reason is None:
+            reason = _enum_name(row.get("stop_reason"))
+        if reason is None:
+            reason = "UNKNOWN"
+        counts[reason] = counts.get(reason, 0) + 1
+        if reason == "PINCH_INSUFFICIENT":
+            pinch_insufficient += 1
+        elif reason == "TRACK_BLOCKED":
+            track_blocked += 1
+    return {
+        "slip_reason_counts": counts,
+        "logical_slip_due_to_pinch_insufficient_count": pinch_insufficient,
+        "logical_slip_due_to_track_blocked_count": track_blocked,
+    }
+
+
+def _resolve_block_size(
+    trial_config: dict[str, Any],
+    rows: list[dict[str, str]],
+) -> tuple[list[float] | None, str | None]:
+    for key in ("block_size", "block_size_task"):
+        size = _size3(trial_config.get(key))
+        if size is not None:
+            return size, f"trial_config.{key}"
+    for row in rows:
+        for key in ("block_size", "block_size_task"):
+            size = _size3(row.get(key))
+            if size is not None:
+                return size, f"processed_frames.{key}"
+        size = _size_from_columns(row, ("block_size_x", "block_size_y", "block_size_z"))
+        if size is not None:
+            return size, "processed_frames.block_size_xyz"
+        size = _size_from_columns(
+            row,
+            ("block_size_task_x", "block_size_task_y", "block_size_task_z"),
+        )
+        if size is not None:
+            return size, "processed_frames.block_size_task_xyz"
+    return None, None
+
+
+def _size_from_columns(row: dict[str, str], columns: tuple[str, str, str]) -> list[float] | None:
+    values = [_float_or_none(row.get(column)) for column in columns]
+    if any(value is None or value <= 0.0 for value in values):
+        return None
+    return [float(values[0]), float(values[1]), float(values[2])]
+
+
+def _size3(value: Any) -> list[float] | None:
+    if isinstance(value, int | float):
+        number = _float_or_none(value)
+        if number is not None and number > 0.0:
+            return [number, number, number]
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        parsed = _float_or_none(text)
+        if parsed is not None and parsed > 0.0:
+            return [parsed, parsed, parsed]
+        if text.startswith("[") or text.startswith("{"):
+            try:
+                return _size3(json.loads(text))
+            except json.JSONDecodeError:
+                return None
+        parts = [part.strip() for part in text.split(",")]
+        if len(parts) == 3:
+            values = [_float_or_none(part) for part in parts]
+            if not any(value is None or value <= 0.0 for value in values):
+                return [float(values[0]), float(values[1]), float(values[2])]
+        return None
+    if isinstance(value, dict):
+        candidates = [
+            [value.get("x"), value.get("y"), value.get("z")],
+            [value.get("width"), value.get("depth"), value.get("height")],
+        ]
+        for candidate in candidates:
+            size = _size3(candidate)
+            if size is not None:
+                return size
+        return None
+    if isinstance(value, list | tuple) and len(value) >= 3:
+        values = [_float_or_none(item) for item in value[:3]]
+        if not any(item is None or item <= 0.0 for item in values):
+            return [float(values[0]), float(values[1]), float(values[2])]
+    return None
+
+
+def _row_block_center(row: dict[str, str]) -> list[float] | None:
+    return _point3(
+        [
+            row.get("block_center_task_x"),
+            row.get("block_center_task_y"),
+            row.get("block_center_task_z"),
+        ]
+    )
+
+
+def _row_pinch_center(row: dict[str, str]) -> list[float] | None:
+    return _point3(
+        [
+            row.get("pinch_center_task_x"),
+            row.get("pinch_center_task_y"),
+            row.get("pinch_center_task_z"),
+        ]
+    )
+
+
+def _row_track_blocked(row: dict[str, str]) -> bool:
+    if _bool(row.get("blocked_force_active")):
+        return True
+    return "TRACK_BLOCKED" in str(row.get("stop_reason", "")).upper()
+
+
+def _point_inside_aabb(point: list[float], center: list[float], size: list[float]) -> bool:
+    for index in range(3):
+        half = size[index] * 0.5
+        if point[index] < center[index] - half - 1e-9:
+            return False
+        if point[index] > center[index] + half + 1e-9:
+            return False
+    return True
+
+
+def _sample_evenly(values: list[Any], limit: int) -> list[Any]:
+    finite_values = [value for value in values if value is not None]
+    if limit <= 0:
+        return []
+    if len(finite_values) <= limit:
+        return finite_values
+    if limit == 1:
+        return [finite_values[0]]
+    step = (len(finite_values) - 1) / float(limit - 1)
+    indices = [round(index * step) for index in range(limit)]
+    return [finite_values[int(index)] for index in indices]
+
+
+def _enum_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    text = text.upper()
+    if text in {"", "NONE", "OFF", "FALSE", "0"}:
+        return None
+    return text
+
+
 def _track_box_stats(trial_config: dict[str, Any]) -> TrackBoxStats:
     track_boxes = trial_config.get("track_boxes")
     if not isinstance(track_boxes, list):
@@ -789,6 +1177,65 @@ def _plot_configured_block_start(
     if point is None:
         return
     plt.scatter([point[0]], [point[1]], marker="*", s=90, label="configured block start")
+
+
+def _plot_block_footprint_overlays(
+    plt: Any,
+    rows: list[dict[str, str]],
+    trial_config: dict[str, Any],
+    *,
+    max_footprint_overlays: int,
+    warnings: list[str],
+) -> None:
+    analysis = _block_footprint_analysis(
+        rows,
+        trial_config,
+        max_footprint_overlays=max_footprint_overlays,
+        warnings=warnings,
+    )
+    overlays = analysis["overlays"]
+    if not overlays:
+        return
+    styles = {
+        "configured": {"edgecolor": "tab:blue", "linestyle": "-", "alpha": 0.35},
+        "start": {"edgecolor": "tab:cyan", "linestyle": "-", "alpha": 0.35},
+        "end": {"edgecolor": "tab:brown", "linestyle": "-", "alpha": 0.35},
+        "slip": {"edgecolor": "tab:red", "linestyle": "--", "alpha": 0.22},
+        "blocked": {"edgecolor": "tab:orange", "linestyle": ":", "alpha": 0.24},
+    }
+    labels_used: set[str] = set()
+    for overlay in overlays:
+        style = styles.get(overlay.kind, {"edgecolor": "black", "linestyle": "-", "alpha": 0.2})
+        _draw_block_footprint(
+            plt,
+            overlay.center,
+            overlay.size,
+            label=overlay.label if overlay.label not in labels_used else None,
+            **style,
+        )
+        labels_used.add(overlay.label)
+
+
+def _draw_block_footprint(
+    plt: Any,
+    center: list[float],
+    size: list[float],
+    *,
+    label: str | None,
+    edgecolor: str,
+    linestyle: str,
+    alpha: float,
+) -> None:
+    half_x = size[0] * 0.5
+    half_y = size[1] * 0.5
+    x0 = center[0] - half_x
+    x1 = center[0] + half_x
+    y0 = center[1] - half_y
+    y1 = center[1] + half_y
+    xs = [x0, x1, x1, x0, x0]
+    ys = [y0, y0, y1, y1, y0]
+    plt.fill(xs, ys, facecolor=edgecolor, edgecolor=edgecolor, linestyle=linestyle, alpha=alpha, label=label)
+    plt.plot(xs, ys, color=edgecolor, linestyle=linestyle, linewidth=1.0, alpha=min(1.0, alpha + 0.35))
 
 
 def _plot_track_bounds(plt: Any, trial_config: dict[str, Any], warnings: list[str]) -> None:
@@ -1168,6 +1615,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--event-label-limit", type=int, default=40)
+    parser.add_argument("--max-footprint-overlays", type=int, default=20)
     parser.add_argument("--overwrite", action="store_true")
     time_axis_group = parser.add_mutually_exclusive_group()
     time_axis_group.add_argument(
@@ -1201,6 +1649,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         overwrite=args.overwrite,
         time_column=args.time_column,
         relative_time=args.relative_time,
+        max_footprint_overlays=args.max_footprint_overlays,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 1 if summary.get("status") == "ERROR" else 0

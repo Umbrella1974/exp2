@@ -48,11 +48,20 @@ def test_analyze_session_writes_summary_and_derives_state_edges(tmp_path: Path) 
     assert summary["derived_event_counts"]["slip_start"] == 1
     assert summary["derived_event_counts"]["blocked_start"] == 1
     assert summary["logical_slip_feedback_frame_count"] == summary["slip_active_frame_count"]
+    assert summary["slip_reason_counts"] == {"PINCH_INSUFFICIENT": 2}
+    assert summary["logical_slip_due_to_pinch_insufficient_count"] == 2
+    assert summary["logical_slip_due_to_track_blocked_count"] == 0
     assert summary["logical_blocked_feedback_frame_count"] == 1
+    assert summary["blocked_force_active_count"] == 1
     assert summary["hardware_haptic_active_frame_count"] == summary["haptic_active_frame_count"]
     assert summary["hardware_haptic_event_count"] == summary["haptic_event_count"]
     assert summary["valid_track_box_count"] == 0
     assert summary["skipped_track_box_count"] == 0
+    assert summary["track_region_semantics"] == "block_center_feasible_region"
+    assert summary["slip_frame_count"] == 2
+    assert summary["slip_frames_with_geometry_check"] == 2
+    assert summary["slip_frames_pinch_inside_block_count"] == 0
+    assert summary["slip_frames_pinch_outside_block_count"] == 2
 
 
 def test_absolute_time_keeps_selected_time_axis(tmp_path: Path) -> None:
@@ -171,6 +180,42 @@ def test_plot_generation_if_matplotlib_is_available(tmp_path: Path) -> None:
 
     assert summary["generated_plots"]
     assert any(Path(path).name == "trajectory_track_map.png" for path in summary["generated_plots"])
+    assert any(
+        Path(path).name == "trajectory_track_map_with_block_footprint.png"
+        for path in summary["generated_plots"]
+    )
+
+
+def test_footprint_summary_counts_overlays(tmp_path: Path) -> None:
+    session_dir = _fake_session(tmp_path, with_track_boxes=True)
+
+    summary = analyze_session.analyze_session(
+        session_dir=session_dir,
+        no_plots=True,
+        overwrite=True,
+        max_footprint_overlays=1,
+    )
+
+    assert summary["block_footprint_overlay_count"] == 5
+    assert summary["slip_footprint_overlay_count"] == 1
+    assert summary["blocked_footprint_overlay_count"] == 1
+    assert summary["track_region_semantics"] == "block_center_feasible_region"
+    assert any("pinch_center_task outside" in warning for warning in summary["warnings"])
+
+
+def test_missing_block_size_warns_without_failing(tmp_path: Path) -> None:
+    session_dir = _fake_session(tmp_path, missing_block_size=True)
+
+    summary = analyze_session.analyze_session(
+        session_dir=session_dir,
+        no_plots=True,
+        overwrite=True,
+    )
+
+    assert summary["status"] == "OK"
+    assert summary["block_footprint_overlay_count"] == 0
+    assert summary["slip_frames_with_geometry_check"] == 0
+    assert any("block_size missing" in warning for warning in summary["warnings"])
 
 
 def test_analysis_summary_reports_map_track_boxes(tmp_path: Path) -> None:
@@ -253,6 +298,7 @@ def _fake_session(
     many_events: bool = False,
     with_track_boxes: bool = False,
     bad_track_box: bool = False,
+    missing_block_size: bool = False,
 ) -> Path:
     session_dir = tmp_path / "session"
     session_dir.mkdir()
@@ -275,7 +321,10 @@ def _fake_session(
             "is_formal_calibration": False,
         },
     )
-    _write_json(session_dir / "trial_config.json", _trial_config(with_track_boxes, bad_track_box))
+    _write_json(
+        session_dir / "trial_config.json",
+        _trial_config(with_track_boxes, bad_track_box, missing_block_size),
+    )
     _write_json(session_dir / "trial_summary.json", {"warnings": []})
     rows = _processed_rows(empty_trial_time=empty_trial_time, empty_all_time=empty_all_time)
     _write_csv(session_dir / "processed_frames.csv", rows)
@@ -311,6 +360,7 @@ def _processed_rows(*, empty_trial_time: bool, empty_all_time: bool) -> list[dic
                 "block_motion_state": "GRABBED_BLOCKED" if index == 3 else "GRABBED_MOVING",
                 "stop_reason": "TRACK_BLOCKED" if index == 3 else "NONE",
                 "slip_active": "True" if index in (1, 2) else "False",
+                "slip_reason": "PINCH_INSUFFICIENT" if index in (1, 2) else "",
                 "blocked_force_active": "True" if index == 3 else "False",
                 "large_delta": "True" if index == 4 else "False",
                 "haptic_state": "ON" if index in (1, 2) else "",
@@ -350,10 +400,11 @@ def _haptic_rows() -> list[dict[str, str]]:
     ]
 
 
-def _trial_config(with_track_boxes: bool, bad_track_box: bool) -> dict:
+def _trial_config(with_track_boxes: bool, bad_track_box: bool, missing_block_size: bool) -> dict:
     config = {
         "scene_type": "post_hoc_auto",
         "is_formal_scene": False,
+        "block_size": [0.2, 0.2, 0.2],
         "pinch_threshold": {"grab": 0.025, "release": 0.035},
         "scene_auto": {
             "track_bounds": {
@@ -362,6 +413,8 @@ def _trial_config(with_track_boxes: bool, bad_track_box: bool) -> dict:
             }
         },
     }
+    if missing_block_size:
+        config.pop("block_size")
     if not with_track_boxes:
         return config
 

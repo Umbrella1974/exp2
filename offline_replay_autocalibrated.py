@@ -40,6 +40,11 @@ from map_config import (
     map_config_to_trial_config,
     validate_map_config,
 )
+from map_template import (
+    estimate_main_direction_from_points,
+    load_map_template,
+    transform_template_to_map_config,
+)
 from raw_frame_source import JsonlRawFrameSource
 from raw_manus_vive_parser import parse_raw_manus_vive_frame
 from session_recorder import SessionRecorder
@@ -59,6 +64,11 @@ MAP_CONFIG_POST_HOC_WARNING = (
 
 DIAGNOSTIC_MAP_WARNING = (
     "This map is generated from replay data and must not be treated as a formal experimental map."
+)
+
+MAP_TEMPLATE_WARNING = (
+    "This map is generated from a template aligned to replay data and must not be treated "
+    "as a formal experimental map."
 )
 
 HAPTIC_EVENT_TYPES = {
@@ -120,6 +130,8 @@ class OfflineReplayConfig:
     offline_max_detach_count: int = 1_000_000_000
     map_config: Path | None = None
     map_id_override: str | None = None
+    map_template: Path | None = None
+    template_anchor_frames: int = 100
     strict_map_validation: bool = False
     diagnostic_map: bool = False
     diagnostic_map_frames: int = 100
@@ -426,6 +438,63 @@ def build_map_config_scene(config: OfflineReplayConfig) -> SceneResult:
     )
 
     warnings = [MAP_CONFIG_POST_HOC_WARNING] + list(validation.warnings)
+    return SceneResult(track_region, block_center, block_size, payload, warnings)
+
+
+def build_map_template_scene(
+    task_points: np.ndarray,
+    config: OfflineReplayConfig,
+) -> SceneResult:
+    """Build a MapConfig scene from a template aligned to early task trajectory."""
+
+    if config.map_template is None:
+        raise ValueError("map_template path is required to build a template scene.")
+    if len(task_points) == 0:
+        raise ValueError("map template requires at least one valid task point.")
+
+    template_path = Path(config.map_template)
+    template = load_map_template(template_path)
+    direction_info = estimate_main_direction_from_points(
+        task_points,
+        config.template_anchor_frames,
+    )
+    origin_task = task_points[0]
+    generated_map = transform_template_to_map_config(
+        template,
+        origin_task,
+        direction_info.snapped_main_direction,
+        direction_info=direction_info,
+    )
+    validation = validate_map_config(generated_map)
+    if validation.errors:
+        raise ValueError("map template generated invalid map: " + "; ".join(validation.errors))
+    if validation.warnings and config.strict_map_validation:
+        raise ValueError(
+            "strict template map validation failed due to warnings: "
+            + "; ".join(validation.warnings)
+        )
+
+    track_region, block_center, block_size = compile_map_to_track_region(generated_map)
+    payload = map_config_to_trial_config(generated_map)
+    payload.update(
+        {
+            "scene_type": "map_template_generated",
+            "scene_mode": "map_template_generated",
+            "is_formal_scene": False,
+            "map_template_used": True,
+            "map_template_path": str(template_path),
+            "template_id": template.template_id,
+            "template_anchor_frames": config.template_anchor_frames,
+            "raw_main_direction": direction_info.raw_main_direction,
+            "snapped_main_direction": direction_info.snapped_main_direction,
+            "snap_angle_degrees": direction_info.snap_angle_degrees,
+            "map_validation_errors": list(validation.errors),
+            "map_validation_warnings": list(validation.warnings),
+            "track_box_count": len(generated_map.track_boxes),
+            "target_region_present": generated_map.target_region is not None,
+        }
+    )
+    warnings = [MAP_TEMPLATE_WARNING] + list(validation.warnings)
     return SceneResult(track_region, block_center, block_size, payload, warnings)
 
 
@@ -874,7 +943,9 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
     task_points = np.vstack(
         [calibration.task_coordinate_system.world_to_task(point) for point in points_world]
     )
-    if config.diagnostic_map:
+    if config.map_template is not None:
+        scene = build_map_template_scene(task_points, config)
+    elif config.diagnostic_map:
         scene = build_diagnostic_map_scene(task_points, config)
     elif config.map_config is not None:
         scene = build_map_config_scene(config)
@@ -1049,6 +1120,8 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
     }
     if scene.payload.get("map_config_used"):
         summary.update(_map_summary_fields(scene.payload))
+    if scene.payload.get("map_template_used"):
+        summary.update(_map_template_summary_fields(scene.payload))
     if scene.payload.get("diagnostic_map_used"):
         summary.update(_diagnostic_map_summary_fields(scene.payload))
     if session_recorder is not None:
@@ -1059,6 +1132,12 @@ def run_offline_replay(config: OfflineReplayConfig) -> OfflineReplayResult:
 def _validate_scene_source_config(config: OfflineReplayConfig) -> None:
     if config.map_config is not None and config.diagnostic_map:
         raise ValueError("--map-config and --diagnostic-map cannot be used together.")
+    if config.map_config is not None and config.map_template is not None:
+        raise ValueError("--map-config and --map-template cannot be used together.")
+    if config.diagnostic_map and config.map_template is not None:
+        raise ValueError("--diagnostic-map and --map-template cannot be used together.")
+    if config.template_anchor_frames <= 0:
+        raise ValueError("template_anchor_frames must be > 0.")
     if config.diagnostic_map:
         _validate_diagnostic_map_config(config)
 
@@ -1067,6 +1146,8 @@ def _offline_session_meta(config: OfflineReplayConfig, session_dir: Path) -> dic
     warnings = [OFFLINE_AUTOCALIBRATED_SESSION_WARNING]
     if config.map_config is not None:
         warnings.append(MAP_CONFIG_POST_HOC_WARNING)
+    if config.map_template is not None:
+        warnings.append(MAP_TEMPLATE_WARNING)
     if config.diagnostic_map:
         warnings.append(DIAGNOSTIC_MAP_WARNING)
     session_meta = {
@@ -1087,6 +1168,8 @@ def _offline_session_meta(config: OfflineReplayConfig, session_dir: Path) -> dic
 
 
 def _session_scene_type(config: OfflineReplayConfig) -> str:
+    if config.map_template is not None:
+        return "map_template_generated"
     if config.diagnostic_map:
         return "diagnostic_map"
     if config.map_config is not None:
@@ -1098,6 +1181,8 @@ def _session_calibration_warnings(config: OfflineReplayConfig) -> list[str] | No
     warnings: list[str] = []
     if config.map_config is not None:
         warnings.append(MAP_CONFIG_POST_HOC_WARNING)
+    if config.map_template is not None:
+        warnings.append(MAP_TEMPLATE_WARNING)
     if config.diagnostic_map:
         warnings.append(DIAGNOSTIC_MAP_WARNING)
     return warnings or None
@@ -1123,7 +1208,11 @@ def _offline_session_trial_config(
     engine_config: EngineConfig,
     warnings: list[str],
 ) -> dict[str, Any]:
-    if scene_payload.get("scene_type") in {"map_config", "diagnostic_map"}:
+    if scene_payload.get("scene_type") in {
+        "map_config",
+        "diagnostic_map",
+        "map_template_generated",
+    }:
         payload = dict(scene_payload)
         payload["pinch_threshold"] = {
             "grab": engine_config.pinch_grab_threshold,
@@ -1162,6 +1251,25 @@ def _map_summary_fields(scene_payload: dict[str, Any]) -> dict[str, Any]:
         "track_box_count": scene_payload.get("track_box_count", 0),
         "target_region_present": bool(scene_payload.get("target_region_present")),
         "strict_map_validation": bool(scene_payload.get("strict_map_validation")),
+        "map_validation_errors": list(scene_payload.get("map_validation_errors", [])),
+        "map_validation_warnings": list(scene_payload.get("map_validation_warnings", [])),
+    }
+
+
+def _map_template_summary_fields(scene_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "map_template_used": True,
+        "template_id": scene_payload.get("template_id", ""),
+        "map_template_path": scene_payload.get("map_template_path", ""),
+        "template_anchor_frames": scene_payload.get("template_anchor_frames", ""),
+        "map_id": scene_payload.get("map_id", ""),
+        "map_config_version": scene_payload.get("map_config_version", ""),
+        "map_source_type": scene_payload.get("map_source_type", ""),
+        "raw_main_direction": scene_payload.get("raw_main_direction"),
+        "snapped_main_direction": scene_payload.get("snapped_main_direction"),
+        "snap_angle_degrees": scene_payload.get("snap_angle_degrees"),
+        "track_box_count": scene_payload.get("track_box_count", 0),
+        "target_region_present": bool(scene_payload.get("target_region_present")),
         "map_validation_errors": list(scene_payload.get("map_validation_errors", [])),
         "map_validation_warnings": list(scene_payload.get("map_validation_warnings", [])),
     }
@@ -1231,6 +1339,8 @@ def main() -> None:
         offline_max_detach_count=args.offline_max_detach_count,
         map_config=Path(args.map_config) if args.map_config is not None else None,
         map_id_override=args.map_id_override,
+        map_template=Path(args.map_template) if args.map_template is not None else None,
+        template_anchor_frames=args.template_anchor_frames,
         strict_map_validation=args.strict_map_validation,
         diagnostic_map=args.diagnostic_map,
         diagnostic_map_frames=args.diagnostic_map_frames,
@@ -1498,6 +1608,14 @@ def _parse_args() -> argparse.Namespace:
             "from the first valid task points."
         ),
     )
+    scene_source.add_argument(
+        "--map-template",
+        default=None,
+        help=(
+            "Optional template map JSON. The template is rotated to the snapped "
+            "main direction estimated from early task points."
+        ),
+    )
     parser.add_argument(
         "--map-id-override",
         default=None,
@@ -1507,10 +1625,11 @@ def _parse_args() -> argparse.Namespace:
         "--strict-map-validation",
         action="store_true",
         help=(
-            "When used with --map-config, fail on validation warnings as well as errors. "
+            "When used with --map-config or --map-template, fail on validation warnings as well as errors. "
             "By default, map validation warnings are recorded but do not stop replay."
         ),
     )
+    parser.add_argument("--template-anchor-frames", type=int, default=100)
     parser.add_argument("--diagnostic-map-frames", type=int, default=100)
     parser.add_argument("--diagnostic-map-main-length", type=float, default=1.0)
     parser.add_argument("--diagnostic-map-perp-length", type=float, default=0.5)

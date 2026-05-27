@@ -57,7 +57,7 @@ pytest -q
 当前应为：
 
 ```text
-159 passed
+172 passed
 ```
 
 常用局部测试：
@@ -66,8 +66,10 @@ pytest -q
 pytest -q tests/test_offline_replay_autocalibrated.py tests/test_offline_replay_session_output.py
 pytest -q tests/test_offline_replay_map_config.py
 pytest -q tests/test_offline_replay_diagnostic_map.py
+pytest -q tests/test_offline_replay_map_template.py
 pytest -q tests/test_batch_offline_replay_report.py
 pytest -q tests/test_analyze_session.py
+pytest -q tests/test_map_preview.py tests/test_map_template.py
 pytest -q tests/test_map_config.py tests/test_map_generator.py
 pytest -q tests/test_trial_controller.py tests/test_block_controller.py
 ```
@@ -151,6 +153,8 @@ python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\r
 --map-id-override            可选，只覆盖本次 replay 输出中的 map_id
 --strict-map-validation      可选，MapConfig warning 也会阻止 replay
 --diagnostic-map             可选，根据旧数据轨迹生成诊断 MapConfig scene
+--map-template               可选，使用模板地图并按旧数据前段主方向对齐
+--template-anchor-frames     模板地图用前多少个有效 task 点估计主方向，默认 100
 --diagnostic-map-frames      用前多少个有效 task 点估计主方向，默认 100
 --diagnostic-map-shape       cross / l_shape / t_shape，默认 l_shape
 --diagnostic-map-turn        left / right，默认 left
@@ -162,9 +166,9 @@ python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\r
 - replay 时会强制 `subject_end=False`，避免 raw 中途结束导致后续帧无法观察。
 - 离线 replay 基本关闭 trial timeout 和 too-many-detach 限制，方便完整回放一段数据。
 - 临时坐标系和临时 scene 都是 post-hoc 结果，不应作为正式实验结论。
-- 不传 `--map-config` / `--diagnostic-map` 时，物块初始中心来自第一帧有效输入点，block/track 由 `--scene-mode` 自动生成。
+- 不传 `--map-config` / `--diagnostic-map` / `--map-template` 时，物块初始中心来自第一帧有效输入点，block/track 由 `--scene-mode` 自动生成。
 - 传 `--map-config` 时，物块初始中心、物块尺寸和轨道都来自 MapConfig；`--scene-mode`、`--block-size` 等 auto scene 参数不再决定 block/track 几何。
-- `--map-config` 和 `--diagnostic-map` 互斥。
+- `--map-config`、`--diagnostic-map`、`--map-template` 三者互斥。
 
 使用 MapConfig 跑旧 raw JSONL：
 
@@ -239,6 +243,31 @@ snap_angle_degrees
 
 注意：diagnostic map 是 data-driven post-hoc diagnostic map，不是正式实验地图，也不是正式实验标定。
 
+使用 template map 跑旧 raw JSONL：
+
+```powershell
+python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_parts\experiment_14.jsonl --out-dir data\offline_replay\exp14_template_l --max-frames 5000 --calibration-frames 100 --map-template maps\templates\template_l.json --template-anchor-frames 100 --write-session
+```
+
+`--map-template` 用于旧数据诊断和地图探索。模板 JSON 写在局部 template 坐标系里，默认主方向是 `x+`；replay 会先做 post-hoc auto calibration，再用前 `--template-anchor-frames` 个有效 task 点估计主方向并 snap 到 `x+ / x- / y+ / y-`，最后把整个模板旋转和平移成标准 MapConfig。
+
+template map 输出额外看：
+
+```text
+map_template_used
+template_id
+template_anchor_frames
+raw_main_direction
+snapped_main_direction
+snap_angle_degrees
+track_box_count
+target_region_present
+map_validation_errors
+map_validation_warnings
+```
+
+注意：template map 仍是 post-hoc diagnostic map，不是正式实验地图。
+
 ## `analyze_session.py`
 
 这个脚本只读取已记录的 session 目录，生成 `analysis_summary.json` 和可选 PNG 图。它不会重新运行 TrialController / BlockController，也不会写回 `events.csv`。
@@ -262,6 +291,7 @@ python analyze_session.py --session-dir data\offline_replay\experiment_14_block0
 --out-dir              可选，只改变 PNG 输出目录
 --no-plots             不生成 PNG，只写 analysis_summary.json
 --event-label-limit    图中最多标注多少事件文字，默认 40
+--max-footprint-overlays slip/blocked footprint 最多各抽样多少个，默认 20
 --overwrite            覆盖 analysis_summary.json 和本脚本生成的 PNG
 --time-column          sample_time / trial_time / raw_timestamp
 --relative-time        使用相对时间轴，默认开启
@@ -283,6 +313,7 @@ session/analysis_summary.json
 session/plots/timeseries_xyz_with_events.png
 session/plots/pinch_distance_with_events.png
 session/plots/trajectory_track_map.png
+session/plots/trajectory_track_map_with_block_footprint.png
 session/plots/state_timeline.png
 session/plots/haptic_timeline.png
 ```
@@ -318,6 +349,27 @@ block path
 blocked / slip / haptic event points
 ```
 
+`trajectory_track_map_with_block_footprint.png` 在同一张地图基础上额外画物块 footprint：
+
+```text
+configured block initial footprint
+block start footprint
+block end footprint
+sampled slip frame block footprints
+sampled blocked frame block footprints
+```
+
+footprint 由 `block_center_task + block_size` 重建 x-y AABB。当前 `TrackRegion` 的语义是 `block_center_feasible_region`：轨道限制的是物块中心可行区域，不代表完整物块 footprint 必须完全在轨道里。`analysis_summary.json` 会记录 `track_region_semantics`、`block_footprint_overlay_count`、`slip_footprint_overlay_count`、`blocked_footprint_overlay_count`。
+
+Analyzer 还会做一个只读的 slip consistency diagnostic：对 `slip_active=True` 且几何字段齐全的帧，检查 `pinch_center_task` 是否在重建的 block AABB 内。结果写入：
+
+```text
+slip_frame_count
+slip_frames_with_geometry_check
+slip_frames_pinch_inside_block_count
+slip_frames_pinch_outside_block_count
+```
+
 如果 session 没有 `track_boxes`，会回退到旧的 bounds 字段，例如：
 
 ```text
@@ -329,6 +381,29 @@ scene_auto.track_bounds
 ```
 
 识别不了边界时只画轨迹并写 warning，不会让分析失败。
+
+## `map_preview.py`
+
+这个脚本不依赖 replay，也不读取 raw JSONL。它直接读取一个 MapConfig JSON，验证后输出 x-y 地图预览图，用来检查地图结构、track_boxes、target_region 和 configured block 是否符合预期。
+
+```powershell
+python map_preview.py --map-config maps\examples\xoy_turn.json --out data\map_preview\xoy_turn.png --summary-out data\map_preview\xoy_turn_summary.json
+```
+
+常用参数：
+
+```text
+--map-config               必填，MapConfig JSON
+--out                      输出 PNG，默认 map_preview.png
+--summary-out              可选，输出 validation summary JSON
+--show-target-region       默认 true，可用 --no-show-target-region 关闭
+--show-box-labels          默认 true，可用 --no-show-box-labels 关闭
+--show-box-order           默认 true，可用 --no-show-box-order 关闭
+--show-configured-block    默认 true，可用 --no-show-configured-block 关闭
+--annotate-centers         可选，标出 box 中心点
+--padding                  图像边界留白比例，默认 0.1
+--title                    可选标题
+```
 
 ## `batch_offline_replay_report.py`
 
@@ -396,7 +471,7 @@ between
 
 `case_id` 只能包含字母、数字、下划线、短横线和点，避免误删路径。
 
-注意：当前 batch runner 的 case args 还没有透传 `map_config`、`map_id_override`、`strict_map_validation`。如果要批量跑 MapConfig replay，需要先扩展 `batch_offline_replay_report.py` 的 supported case args；单次 MapConfig replay 请直接使用 `offline_replay_autocalibrated.py --map-config`。
+注意：当前 batch runner 的 case args 还没有透传 `map_config`、`map_template`、`map_id_override`、`strict_map_validation`。如果要批量跑 MapConfig/template replay，需要先扩展 `batch_offline_replay_report.py` 的 supported case args；单次地图 replay 请直接使用 `offline_replay_autocalibrated.py --map-config` 或 `--map-template`。
 
 ## `run_live_preview.py`
 
@@ -496,6 +571,10 @@ haptic_active_frame_count
 haptic_event_count
 logical_slip_feedback_frame_count
 logical_blocked_feedback_frame_count
+slip_reason_counts
+logical_slip_due_to_pinch_insufficient_count
+logical_slip_due_to_track_blocked_count
+blocked_force_active_count
 hardware_haptic_active_frame_count
 hardware_haptic_event_count
 pinch_distance_min / mean / max
@@ -504,7 +583,9 @@ block_displacement_task
 warnings
 ```
 
-`haptic_active_frame_count` / `hardware_haptic_active_frame_count` 表示命令或硬件层 active，不等于逻辑 slip。离线 replay 中常见情况是 `logical_slip_feedback_frame_count` 大于 0，但没有真实硬件发送记录。
+当前字段可以区分“逻辑上的 pinch insufficient slip”和“逻辑上的 track blocked slip”：看 `slip_active=True` 帧里的 `slip_reason`。`PINCH_INSUFFICIENT` 表示 pinch 距离不足导致的逻辑 slip；`TRACK_BLOCKED` 表示轨道约束阻挡导致的逻辑 slip。`blocked_force_active=True` 只对应 track blocked 的逻辑反馈。限制是：当前字段能说明状态机给出的逻辑原因，但没有记录连续的 boundary distance，所以不能单靠字段证明“离边界几厘米”。
+
+`haptic_active_frame_count` / `hardware_haptic_active_frame_count` 表示命令或硬件层 active，不等于逻辑 slip。离线 replay 中常见情况是 `logical_slip_feedback_frame_count` 大于 0，但没有真实硬件发送记录。`slip_active`、`slip_reason`、`blocked_force_active` 是逻辑反馈状态；`haptic_state`、`haptic_reason`、`command_type` 更接近 haptic 命令/记录层。
 
 MapConfig replay 额外看：
 
@@ -533,6 +614,16 @@ diagnostic_map_turn
 raw_main_direction
 snapped_main_direction
 snapped_perp_direction
+snap_angle_degrees
+```
+
+Template map replay 额外看：
+
+```text
+map_template_used
+template_id
+raw_main_direction
+snapped_main_direction
 snap_angle_degrees
 ```
 
@@ -672,6 +763,28 @@ min(0.20, last_segment_length * 0.25)
 
 注意：`offline_replay_autocalibrated.py --map-config` 可以把旧 raw JSONL 跑在 MapConfig 地图中，但 calibration 仍然是 post-hoc auto，所以这个流程仍是调试/可视化用途，不是正式实验结果。
 
+### Template Map
+
+`map_template.py` 支持一种诊断用模板地图：JSON 里写 template 局部坐标系下的完整结构，默认主方向为 `x+`。离线 replay 时用旧数据前若干有效 task 点估计第一段主方向，snap 到 task 坐标轴，然后把模板整体做 90 度倍数旋转和平移，生成标准 MapConfig。
+
+最小模板结构：
+
+```json
+{
+  "template_id": "template_l",
+  "coordinate_space": "template",
+  "unit": "m",
+  "anchor_direction": "x+",
+  "block_initial_center_template": [0.0, 0.0, 0.0],
+  "block_size": [0.2, 0.2, 0.2],
+  "track_boxes": [],
+  "target_region": null,
+  "metadata": {}
+}
+```
+
+限制：第一版只支持 x-y 平面上的 `x+ / x- / y+ / y-` 方向和 90 度倍数旋转，不支持斜向 corridor 或任意角度旋转。
+
 ## YAML 现在怎么用
 
 `config_example.yaml` 目前只是模板和记录文件，代码不会自动读取它。修改 YAML 不会自动影响：
@@ -787,6 +900,7 @@ pinch_release_threshold = 0.035
 没有完整 MANUS/Vive rotation fusion
 没有正式在线 calibration 流程
 MapConfig replay 仍使用 post-hoc auto calibration，不能标记成正式实验
+MapTemplate replay 是旧数据诊断/探索工具，不是正式实验地图
 ```
 
 比较自然的下一步是：把 MapConfig 接入正式在线 trial/session 配置路径，并实现正式受试者标定流程。
