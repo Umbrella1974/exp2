@@ -569,6 +569,85 @@ is_formal_calibration = true
 metadata.collection_mode = raw_jsonl_simulated_live / live_stream
 ```
 
+## MVP Live Visual Preview / 明天采数用
+
+`run_live_trial_visual_preview.py` 是一个临时最小实时视觉反馈入口，用于快速采真实 MANUS/Vive 数据、保存 session，并在实验后交给 `analyze_session.py` 出地图、路线、状态和 logical haptic 图。它不是完整 formal experiment runner：
+
+- 它会实时运行 `TrialController + BlockController`，但不做复杂 trial sequence 管理。
+- 它不接真实 haptic hardware，只显示和记录 logical haptic feedback。
+- 它使用 `calibration.json + map_config.json` 创建 task space 和 track scene。
+- 它默认写 session；如只想 smoke test，可加 `--no-write-session`。
+
+启动最小 live visual preview：
+
+```powershell
+python run_live_trial_visual_preview.py ^
+  --calibration-json data\calibration\table_line_calibration.json ^
+  --map-config maps\examples\xoy_turn.json ^
+  --host 127.0.0.1 ^
+  --port 8888 ^
+  --out-dir data\live_trial_preview\debug_01 ^
+  --write-session ^
+  --show-visual
+```
+
+如果 matplotlib 不可用，或现场只想看文本状态：
+
+```powershell
+python run_live_trial_visual_preview.py ^
+  --calibration-json data\calibration\table_line_calibration.json ^
+  --map-config maps\examples\xoy_turn.json ^
+  --out-dir data\live_trial_preview\debug_text ^
+  --visual-mode text
+```
+
+现场可选快速调参：
+
+```text
+--pinch-grab-threshold
+--pinch-release-threshold
+--slip-motion-threshold
+```
+
+未传时使用 `EngineConfig` 默认值；最终阈值会写入 `summary.json` 和 `session/trial_config.json`。
+
+输出：
+
+```text
+out_dir/raw_frames.jsonl
+out_dir/live_metrics.csv
+out_dir/summary.json
+out_dir/session/
+```
+
+`summary.json` 使用 `run_stop_reason` 表示程序整体停止原因，例如 `max_frames / duration_reached / client_disconnected / keyboard_interrupt`。`DashboardSnapshot.stop_reason` 和 `processed_frames.csv.stop_reason` 表示每帧 controller 的 `FrameOutput.feedback_state.stop_reason`。
+
+视觉反馈必须同时使用颜色和英文状态词，不只靠颜色。GUI/text 都会显示：
+
+```text
+MAIN STATE
+CONTACT
+PINCH
+MOTION
+STOP
+FEEDBACK
+```
+
+logical haptic label 会写入 dashboard snapshot、`summary.json.logical_haptic_label_counts`，并作为 `details_json.logical_haptic_label` 写入 `session/haptic.csv`。真实硬件 haptic 始终关闭：
+
+```text
+haptic_hardware_enabled = false
+hardware_haptic_active = false
+```
+
+实验后生成分析图：
+
+```powershell
+python analyze_session.py ^
+  --session-dir data\live_trial_preview\debug_01\session ^
+  --overwrite
+```
+
 ## `analyze_session.py`
 
 这个脚本只读取已记录的 session 目录，生成 `analysis_summary.json` 和可选 PNG 图。它不会重新运行 TrialController / BlockController，也不会写回 `events.csv`。
@@ -1220,7 +1299,7 @@ pinch_release_threshold = 0.035
 
 ```text
 没有正式 GUI
-没有真实 socket live loop
+没有完整正式实验 live runner；当前只有 MVP live visual preview，且不自动重连
 没有触觉硬件控制
 没有自动读取 YAML 配置
 没有完整 MANUS/Vive rotation fusion
@@ -1231,4 +1310,4 @@ run_live_raw_preview.py 只是实时 raw stream smoke test，不启动正式 tri
 MapTemplate replay 是旧数据诊断/探索工具，不是正式实验地图
 ```
 
-比较自然的下一步是：把 MapConfig 接入正式在线 trial/session 配置路径，并实现正式受试者标定流程。
+比较自然的下一步是：把 MVP live visual preview 收敛成正式在线 trial/session 配置路径，并实现正式受试者标定流程。
