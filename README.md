@@ -516,6 +516,59 @@ trial_controller_started = false
 processed_frames_are_trial_outputs = false
 ```
 
+## Stage 5B-1 Live Table-Line Calibration
+
+`live_calibrate_table.py` 是命令行版 live calibration runner。它只采集四段标定动作并生成 `formal_table_lines` 的 `calibration.json`，不启动 `TrialController`，不运行 `BlockController`，不创建地图，也不接 haptic hardware。
+
+四段动作固定为：
+
+```text
+origin             静止 sample_duration_seconds
+long_axis_line     沿长边 / x 方向移动 sample_duration_seconds
+width_axis_line    沿宽边移动 sample_duration_seconds
+diagonal_line      沿对角线移动 sample_duration_seconds
+```
+
+当前推荐先用 raw JSONL simulated live mode 测完整流程。这个模式按文件流顺序和 raw timestamp 切四段：前一段是 origin，接着是 long、width、diagonal。因此 JSONL 本身要已经按这个动作顺序录好；如果你想从任意帧段截取，请继续用 `calibrate_from_raw_jsonl_table.py` 的显式 start-frame 参数。
+
+无设备，用旧 raw JSONL 模拟 live calibration：
+
+```powershell
+python live_calibrate_table.py --raw-jsonl path\to\raw_frames.jsonl --simulate-live --auto-advance --no-confirm-save --out data\calibration\simulated_live_table_calibration.json
+```
+
+常用参数：
+
+```text
+--sample-duration-seconds   默认 5.0，每段采样时长
+--min-samples               默认 10，每段最少有效点
+--min-line-length           默认 0.10，线段最短长度，单位 m
+--point-source              tracker_position_world / pinch_center_world
+--timestamp-scale           默认 0.001，raw timestamp 毫秒转秒
+--replay-real-time          JSONL 按 timestamp 间隔回放；默认 false
+--speed                     replay-real-time 的速度倍率
+--auto-advance              不等待每段 Enter，测试时方便
+--no-confirm-save           有 warning 也直接保存，测试时方便
+```
+
+注意：即使 `--replay-real-time=false`，JSONL simulated live 仍然用 raw timestamp / frame time 切段，不用墙钟时间。如果 raw timestamp 缺失或不能单调形成 frame time，工具会失败并提示改用 `calibrate_from_raw_jsonl_table.py`。
+
+真实 stream calibration：
+
+```powershell
+python live_calibrate_table.py --use-live-stream --live-host 127.0.0.1 --live-port 8888 --out data\calibration\live_table_calibration.json
+```
+
+然后启动发送端，把 newline-delimited combined JSON 发到 `127.0.0.1:8888`。真实 stream 模式每段开始采样前会清空当前 queue，避免按 Enter 前积压的旧帧混入当前 segment；`metadata.queue_cleared_before_segment` 会记录这个行为。
+
+生成的文件是正式 calibration JSON：
+
+```text
+calibration_type = formal_table_lines
+is_formal_calibration = true
+metadata.collection_mode = raw_jsonl_simulated_live / live_stream
+```
+
 ## `analyze_session.py`
 
 这个脚本只读取已记录的 session 目录，生成 `analysis_summary.json` 和可选 PNG 图。它不会重新运行 TrialController / BlockController，也不会写回 `events.csv`。
@@ -1171,7 +1224,7 @@ pinch_release_threshold = 0.035
 没有触觉硬件控制
 没有自动读取 YAML 配置
 没有完整 MANUS/Vive rotation fusion
-没有正式在线 calibration GUI/实时采样流程；Stage 5A 只有离线格式测试和 formal replay
+没有正式在线 calibration GUI；当前只有命令行版 live table-line calibration runner
 offline_replay_autocalibrated.py 的 MapConfig replay 仍使用 post-hoc auto calibration，不能标记成正式实验
 offline_replay_formal_calibrated.py 使用 formal calibration，但仍是 offline replay，不是 live formal trial
 run_live_raw_preview.py 只是实时 raw stream smoke test，不启动正式 trial
