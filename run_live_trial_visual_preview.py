@@ -13,6 +13,7 @@ import json
 import time
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -38,6 +39,7 @@ from map_config import (
 )
 from raw_manus_vive_parser import parse_raw_manus_vive_frame
 from session_recorder import SessionRecorder
+from simulated_live_source import RawJsonlSimulatedLiveSource
 from trial_controller import ExperimentInputSample, TrialController, TrialState
 
 
@@ -73,6 +75,7 @@ class LiveTrialVisualPreviewConfig:
     out_dir: Path = Path("data/live_trial_preview")
     session_dir: Path | None = None
     write_session: bool = True
+    overwrite_session: bool = False
     max_frames: int | None = None
     duration_seconds: float | None = None
     print_every: int = 30
@@ -92,6 +95,10 @@ class LiveTrialVisualPreviewConfig:
     slip_motion_threshold: float | None = None
     socket_timeout: float | None = None
     max_queue_size: int = 300
+    raw_jsonl: Path | None = None
+    simulate_live: bool = False
+    replay_real_time: bool = False
+    speed: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -147,12 +154,7 @@ def run_live_trial_visual_preview(
     trial = TrialController(block_factory, task_system, engine_config)
 
     own_source = source is None
-    live_source = source or LiveRawStreamServer(
-        host=config.host,
-        port=config.port,
-        socket_timeout=config.socket_timeout,
-        max_queue_size=config.max_queue_size,
-    )
+    live_source = source or _build_live_source(config)
     visual_display = display
     if visual_display is None:
         visual_display = create_live_visual_display(
@@ -166,9 +168,9 @@ def run_live_trial_visual_preview(
     raw_handle = raw_path.open("w", encoding="utf-8")
     _write_metrics_header(metrics_path)
     session_recorder = None
-    session_dir = config.session_dir or (out_dir / "session")
+    session_dir = config.session_dir or _default_session_dir(out_dir)
     if config.write_session:
-        session_recorder = SessionRecorder(session_dir)
+        session_recorder = SessionRecorder(session_dir, overwrite=config.overwrite_session)
         session_recorder.start_session(
             session_meta=_session_meta(config, session_dir, calibration),
             calibration=calibration_to_dict(calibration),
@@ -273,7 +275,7 @@ def run_live_trial_visual_preview(
                     large_delta_count += 1
                 if snapshot.slip_active:
                     slip_active_count += 1
-                if snapshot.stop_reason == "TRACK_BLOCKED":
+                if snapshot.stop_reason == "TRACK_BLOCKED" or snapshot.blocked_force_active:
                     blocked_count += 1
                 processing_latencies.append(processing_latency_ms)
 
@@ -344,7 +346,6 @@ def run_live_trial_visual_preview(
             _append_metric_row(metrics_path, row)
     except KeyboardInterrupt:
         run_stop_reason = "keyboard_interrupt"
-        raise
     finally:
         raw_handle.close()
         try:
@@ -371,6 +372,7 @@ def run_live_trial_visual_preview(
         "map_id": map_config.map_id,
         "haptic_hardware_enabled": False,
         "run_stop_reason": run_stop_reason,
+        "session_dir": str(session_dir) if config.write_session else None,
         "total_received_frames": total_received,
         "total_processed_frames": len(metrics),
         "parse_error_count": int(stats.get("parse_error_count", 0)) + raw_parser_error_count,
@@ -419,6 +421,7 @@ def main(argv: list[str] | None = None) -> int:
         out_dir=Path(args.out_dir),
         session_dir=Path(args.session_dir) if args.session_dir is not None else None,
         write_session=args.write_session,
+        overwrite_session=args.overwrite_session,
         max_frames=args.max_frames,
         duration_seconds=args.duration_seconds,
         print_every=args.print_every,
@@ -438,13 +441,16 @@ def main(argv: list[str] | None = None) -> int:
         slip_motion_threshold=args.slip_motion_threshold,
         socket_timeout=args.socket_timeout,
         max_queue_size=args.max_queue_size,
+        raw_jsonl=Path(args.raw_jsonl) if args.raw_jsonl is not None else None,
+        simulate_live=args.simulate_live,
+        replay_real_time=args.replay_real_time,
+        speed=args.speed,
     )
-    try:
-        result = run_live_trial_visual_preview(config)
-    except KeyboardInterrupt:
+    result = run_live_trial_visual_preview(config)
+    print(json.dumps(result.summary, indent=2, ensure_ascii=False, sort_keys=True))
+    if result.summary.get("run_stop_reason") == "keyboard_interrupt":
         print("[LIVE PREVIEW] interrupted by user")
         return 130
-    print(json.dumps(result.summary, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
 
 
@@ -496,6 +502,34 @@ def _parse_and_adapt(
         "error_message": error_message,
     }
     return row, parse_ok, adapter_ok, device_frame, sample, error_message
+
+
+def _build_live_source(config: LiveTrialVisualPreviewConfig) -> Any:
+    if config.raw_jsonl is not None:
+        return RawJsonlSimulatedLiveSource(
+            config.raw_jsonl,
+            timestamp_scale=config.timestamp_scale,
+            real_time=config.replay_real_time,
+            speed=config.speed,
+            max_frames=config.max_frames,
+        )
+    return LiveRawStreamServer(
+        host=config.host,
+        port=config.port,
+        socket_timeout=config.socket_timeout,
+        max_queue_size=config.max_queue_size,
+    )
+
+
+def _default_session_dir(out_dir: Path) -> Path:
+    base = out_dir / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if not base.exists():
+        return base
+    for index in range(1, 1000):
+        candidate = out_dir / f"{base.name}_{index:03d}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("could not allocate a unique session directory.")
 
 
 def _engine_config(config: LiveTrialVisualPreviewConfig, block_size: Any) -> EngineConfig:
@@ -694,6 +728,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.set_defaults(write_session=True)
     parser.add_argument("--write-session", dest="write_session", action="store_true")
     parser.add_argument("--no-write-session", dest="write_session", action="store_false")
+    parser.add_argument("--overwrite-session", action="store_true")
     parser.add_argument("--max-frames", default=None, type=int)
     parser.add_argument("--duration-seconds", default=None, type=float)
     parser.add_argument("--print-every", default=30, type=int)
@@ -715,6 +750,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--slip-motion-threshold", default=None, type=float)
     parser.add_argument("--socket-timeout", default=None, type=float)
     parser.add_argument("--max-queue-size", default=300, type=int)
+    parser.add_argument("--raw-jsonl", default=None)
+    parser.add_argument("--simulate-live", action="store_true")
+    parser.add_argument("--replay-real-time", action="store_true")
+    parser.add_argument("--speed", default=1.0, type=float)
     args = parser.parse_args(argv)
     if args.max_frames is not None and args.max_frames <= 0:
         parser.error("--max-frames must be > 0.")
@@ -726,6 +765,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--visual-history must be > 0.")
     if args.max_queue_size <= 0:
         parser.error("--max-queue-size must be > 0.")
+    if args.raw_jsonl is not None and not args.simulate_live:
+        parser.error("--raw-jsonl requires --simulate-live.")
+    if args.simulate_live and args.raw_jsonl is None:
+        parser.error("--simulate-live requires --raw-jsonl.")
+    if args.speed <= 0.0:
+        parser.error("--speed must be > 0.")
     if args.pinch_grab_threshold is not None and args.pinch_grab_threshold <= 0:
         parser.error("--pinch-grab-threshold must be > 0.")
     if args.pinch_release_threshold is not None and args.pinch_release_threshold <= 0:

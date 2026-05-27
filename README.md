@@ -577,6 +577,8 @@ metadata.collection_mode = raw_jsonl_simulated_live / live_stream
 - 它不接真实 haptic hardware，只显示和记录 logical haptic feedback。
 - 它使用 `calibration.json + map_config.json` 创建 task space 和 track scene。
 - 它默认写 session；如只想 smoke test，可加 `--no-write-session`。
+- 未显式传 `--session-dir` 时，session 会写到 `out_dir/session_YYYYMMDD_HHMMSS`，避免现场重复运行同一个 `out-dir` 时覆盖旧数据。
+- 只有显式传 `--overwrite-session` 时，才会覆盖已有 session 目录。
 
 启动最小 live visual preview：
 
@@ -601,6 +603,29 @@ python run_live_trial_visual_preview.py ^
   --visual-mode text
 ```
 
+无设备时，用 raw JSONL 模拟同一套 GUI/text/session 流程：
+
+```powershell
+python run_live_trial_visual_preview.py ^
+  --calibration-json data\calibration\table_line_calibration.json ^
+  --map-config maps\examples\xoy_turn.json ^
+  --raw-jsonl path\to\raw_frames.jsonl ^
+  --simulate-live ^
+  --out-dir data\live_trial_preview\debug_jsonl ^
+  --visual-mode text
+```
+
+现场如果确实要复用固定 session 目录：
+
+```powershell
+python run_live_trial_visual_preview.py ^
+  --calibration-json data\calibration\table_line_calibration.json ^
+  --map-config maps\examples\xoy_turn.json ^
+  --out-dir data\live_trial_preview\debug_01 ^
+  --session-dir data\live_trial_preview\debug_01\session ^
+  --overwrite-session
+```
+
 现场可选快速调参：
 
 ```text
@@ -617,10 +642,12 @@ python run_live_trial_visual_preview.py ^
 out_dir/raw_frames.jsonl
 out_dir/live_metrics.csv
 out_dir/summary.json
-out_dir/session/
+out_dir/session_YYYYMMDD_HHMMSS/
 ```
 
 `summary.json` 使用 `run_stop_reason` 表示程序整体停止原因，例如 `max_frames / duration_reached / client_disconnected / keyboard_interrupt`。`DashboardSnapshot.stop_reason` 和 `processed_frames.csv.stop_reason` 表示每帧 controller 的 `FrameOutput.feedback_state.stop_reason`。
+
+如果用 Ctrl+C 停止，runner 会尽量正常收尾：关闭 raw 文件和视觉窗口、停止 live source、写 `summary.json`，并在启用 session 时写 `trial_summary.json`。此时 `summary.json.run_stop_reason = keyboard_interrupt`。
 
 视觉反馈必须同时使用颜色和英文状态词，不只靠颜色。GUI/text 都会显示：
 
@@ -644,7 +671,7 @@ hardware_haptic_active = false
 
 ```powershell
 python analyze_session.py ^
-  --session-dir data\live_trial_preview\debug_01\session ^
+  --session-dir data\live_trial_preview\debug_01\session_YYYYMMDD_HHMMSS ^
   --overwrite
 ```
 

@@ -40,7 +40,7 @@ def test_run_live_trial_visual_preview_writes_outputs_and_session(tmp_path: Path
 
     summary = json.loads((config.out_dir / "summary.json").read_text(encoding="utf-8"))
     metrics_rows = _read_csv(config.out_dir / "live_metrics.csv")
-    session_dir = config.out_dir / "session"
+    session_dir = Path(summary["session_dir"])
 
     assert result.summary == summary
     assert summary["mode"] == "live_visual_preview"
@@ -81,6 +81,105 @@ def test_run_live_trial_visual_preview_can_skip_session(tmp_path: Path) -> None:
     assert not (config.out_dir / "session").exists()
 
 
+def test_keyboard_interrupt_still_writes_summary_and_session(tmp_path: Path) -> None:
+    calibration_path = _write_calibration(tmp_path / "calibration.json")
+    map_path = _write_map_config(tmp_path / "map.json")
+    source = KeyboardInterruptSource([_live_frame(0)])
+    session_dir = tmp_path / "preview_interrupt" / "session"
+    config = LiveTrialVisualPreviewConfig(
+        calibration_json=calibration_path,
+        map_config=map_path,
+        out_dir=tmp_path / "preview_interrupt",
+        session_dir=session_dir,
+        max_frames=10,
+        print_every=0,
+        show_visual=False,
+        write_session=True,
+    )
+
+    result = run_live_trial_visual_preview(config, source=source)
+
+    summary = json.loads((config.out_dir / "summary.json").read_text(encoding="utf-8"))
+    session_summary = json.loads((session_dir / "trial_summary.json").read_text(encoding="utf-8"))
+    assert result.summary["run_stop_reason"] == "keyboard_interrupt"
+    assert summary["run_stop_reason"] == "keyboard_interrupt"
+    assert session_summary["run_stop_reason"] == "keyboard_interrupt"
+
+
+def test_overwrite_session_replaces_existing_session_dir(tmp_path: Path) -> None:
+    calibration_path = _write_calibration(tmp_path / "calibration.json")
+    map_path = _write_map_config(tmp_path / "map.json")
+    session_dir = tmp_path / "fixed_session"
+    session_dir.mkdir()
+    (session_dir / "old.txt").write_text("old", encoding="utf-8")
+    config = LiveTrialVisualPreviewConfig(
+        calibration_json=calibration_path,
+        map_config=map_path,
+        out_dir=tmp_path / "preview_overwrite",
+        session_dir=session_dir,
+        overwrite_session=True,
+        max_frames=1,
+        print_every=0,
+        show_visual=False,
+        write_session=True,
+    )
+
+    run_live_trial_visual_preview(config, source=FakeLiveSource([_live_frame(0)]))
+
+    assert not (session_dir / "old.txt").exists()
+    assert (session_dir / "trial_summary.json").exists()
+
+
+def test_blocked_frame_count_includes_blocked_force_active(tmp_path: Path) -> None:
+    calibration_path = _write_calibration(tmp_path / "calibration.json")
+    map_path = _write_map_config(tmp_path / "narrow_map.json", x_max=0.25)
+    positions = [0.0, 0.05, 0.15, 0.25, 0.40]
+    source = FakeLiveSource([_live_frame(index, x=position) for index, position in enumerate(positions)])
+    config = LiveTrialVisualPreviewConfig(
+        calibration_json=calibration_path,
+        map_config=map_path,
+        out_dir=tmp_path / "preview_blocked",
+        max_frames=len(positions),
+        print_every=0,
+        show_visual=False,
+        write_session=False,
+        pinch_grab_threshold=0.03,
+        pinch_release_threshold=0.04,
+    )
+
+    result = run_live_trial_visual_preview(config, source=source)
+
+    assert any(snapshot.blocked_force_active for snapshot in result.snapshots)
+    assert result.summary["blocked_frame_count"] >= 1
+
+
+def test_raw_jsonl_simulated_source_can_run_preview(tmp_path: Path) -> None:
+    calibration_path = _write_calibration(tmp_path / "calibration.json")
+    map_path = _write_map_config(tmp_path / "map.json")
+    raw_path = tmp_path / "raw.jsonl"
+    frames = [_raw_frame(index, x=index * 0.03) for index in range(3)]
+    raw_path.write_text(
+        "\n".join(json.dumps(frame, ensure_ascii=False) for frame in frames) + "\n",
+        encoding="utf-8",
+    )
+    config = LiveTrialVisualPreviewConfig(
+        calibration_json=calibration_path,
+        map_config=map_path,
+        out_dir=tmp_path / "preview_jsonl",
+        max_frames=3,
+        print_every=0,
+        show_visual=False,
+        write_session=False,
+        raw_jsonl=raw_path,
+        simulate_live=True,
+    )
+
+    result = run_live_trial_visual_preview(config)
+
+    assert result.summary["run_stop_reason"] == "max_frames"
+    assert result.summary["total_processed_frames"] == 3
+
+
 class FakeLiveSource:
     def __init__(self, frames: list[LiveRawFrame]) -> None:
         self.frames = list(frames)
@@ -115,8 +214,15 @@ class FakeLiveSource:
         }
 
 
-def _live_frame(index: int) -> LiveRawFrame:
-    raw = _raw_frame(index)
+class KeyboardInterruptSource(FakeLiveSource):
+    def get_frame(self, timeout: float | None = None) -> LiveRawFrame | None:
+        if self.frames:
+            return super().get_frame(timeout=timeout)
+        raise KeyboardInterrupt
+
+
+def _live_frame(index: int, *, x: float | None = None) -> LiveRawFrame:
+    raw = _raw_frame(index, x=x)
     return LiveRawFrame(
         frame_index=index,
         raw_frame=raw,
@@ -126,8 +232,8 @@ def _live_frame(index: int) -> LiveRawFrame:
     )
 
 
-def _raw_frame(index: int) -> dict:
-    position = [index * 0.03, 0.0, 0.0]
+def _raw_frame(index: int, *, x: float | None = None) -> dict:
+    position = [index * 0.03 if x is None else x, 0.0, 0.0]
     return {
         "timestamp": index * 10.0,
         "frame": index,
@@ -152,7 +258,7 @@ def _raw_frame(index: int) -> dict:
     }
 
 
-def _write_map_config(path: Path) -> Path:
+def _write_map_config(path: Path, *, x_max: float = 1.0) -> Path:
     payload = {
         "map_id": "test_map",
         "description": "unit test map",
@@ -165,13 +271,13 @@ def _write_map_config(path: Path) -> Path:
                 "id": "main",
                 "order": 0,
                 "min": [-1.0, -1.0, -1.0],
-                "max": [1.0, 1.0, 1.0],
+                "max": [x_max, 1.0, 1.0],
             }
         ],
         "target_region": {
             "id": "target",
-            "min": [0.6, -0.2, -0.2],
-            "max": [0.9, 0.2, 0.2],
+            "min": [max(-0.9, x_max - 0.3), -0.2, -0.2],
+            "max": [x_max, 0.2, 0.2],
         },
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
