@@ -69,6 +69,7 @@ pytest -q tests/test_map_preview.py tests/test_map_template.py
 pytest -q tests/test_map_config.py tests/test_map_generator.py
 pytest -q tests/test_calibration_geometry.py tests/test_calibration_io.py tests/test_calibration_sampling.py
 pytest -q tests/test_calibrate_from_raw_jsonl_table.py tests/test_offline_replay_formal_calibrated.py
+pytest -q tests/test_live_raw_stream.py tests/test_run_live_raw_preview.py
 pytest -q tests/test_trial_controller.py tests/test_block_controller.py
 ```
 
@@ -403,6 +404,117 @@ is_formal_scene = false
 ```
 
 这里不会写 `post_hoc_auto` warning；但会保留一句 warning：它是使用正式 calibration 文件的 offline replay，不是 live formal trial。
+
+## Stage 5B-0 Live Raw Stream Preview
+
+Stage 5B-0 是实时 raw stream smoke test，用来验证 `manus_vive_com` 发来的 newline-delimited combined JSON 能否被 exp2 实时接收、解析、转换并记录健康指标。它不是正式实验流程：
+
+- 不做 calibration。
+- 不启动 `TrialController`。
+- 不运行 `BlockController`。
+- 不接 haptic hardware。
+- 不写 GUI。
+- 不修改 `manus_vive_com` 仓库。
+
+启动 exp2 receiver：
+
+```powershell
+python run_live_raw_preview.py --host 127.0.0.1 --port 8888 --out-dir data\live_raw_preview\test
+```
+
+然后启动 `manus_vive_com` 的 C++ client，让它连接 `127.0.0.1:8888` 并发送 combined JSON。协议是每行一个 JSON object，以 `\n` 结尾。
+
+常用参数：
+
+```text
+--host                  默认 127.0.0.1
+--port                  默认 8888
+--duration-seconds      可选，到时停止
+--max-frames            可选，处理到指定帧数停止
+--thumb-node            默认 4
+--index-node            默认 9
+--tracker-index         默认 0
+--skeleton-index        默认 0
+--timestamp-scale       默认 0.001
+--out-dir               默认 data/live_raw_preview
+--write-session         额外写标准 session 目录
+--session-dir           可选
+--print-every           默认 30
+--save-raw-jsonl        默认开启
+--no-save-raw-jsonl     不保存 out_dir/raw_frames.jsonl
+--max-queue-size        默认 300
+```
+
+输出：
+
+```text
+out_dir/raw_frames.jsonl
+out_dir/live_metrics.csv
+out_dir/live_summary.json
+```
+
+`live_metrics.csv` 每个合法 raw JSON object 写一行，包含：
+
+```text
+frame_index
+raw_timestamp
+receive_time_monotonic
+receive_wall_time
+parse_ok
+adapter_ok
+tracker_valid
+hand_valid
+pinch_valid
+pinch_distance
+skeleton_count
+tracker_count
+sync_delta_ms
+inter_receive_interval_ms
+processing_latency_ms
+queue_size
+dropped_frame_count
+error_message
+```
+
+bad JSON 指 TCP stream 里某一行不是合法 JSON object，例如 `{bad json}`、截断 JSON 或 `[1, 2, 3]`。这类行不写入逐帧 metrics，也不保存整行大 payload；只在 summary 里计入：
+
+```text
+parse_error_count
+bad_json_line_count
+last_parse_error_message
+last_bad_json_preview
+```
+
+队列满时默认丢弃最旧帧，保留最新实时状态：
+
+```text
+queue_drop_policy = drop_oldest_when_full
+```
+
+client 断开后第一版直接结束，不自动重连。`live_summary.json` 会记录：
+
+```text
+stop_reason = client_disconnected / max_frames / duration_reached / keyboard_interrupt / socket_error
+```
+
+如果使用 `--write-session`，session 会写：
+
+```text
+session_meta.json
+raw_frames.jsonl
+device_frames.jsonl
+trial_summary.json
+live_summary.json
+```
+
+`SessionRecorder` 会创建空的 `processed_frames.csv / events.csv / haptic.csv`，但 live raw preview 不会伪造 TrialController 输出。`session_meta.json` 会明确记录：
+
+```text
+mode = live_raw_preview
+is_live_trial = false
+trial_controller_started = false
+processed_frames_are_trial_outputs = false
+```
 
 ## `analyze_session.py`
 
@@ -1062,6 +1174,7 @@ pinch_release_threshold = 0.035
 没有正式在线 calibration GUI/实时采样流程；Stage 5A 只有离线格式测试和 formal replay
 offline_replay_autocalibrated.py 的 MapConfig replay 仍使用 post-hoc auto calibration，不能标记成正式实验
 offline_replay_formal_calibrated.py 使用 formal calibration，但仍是 offline replay，不是 live formal trial
+run_live_raw_preview.py 只是实时 raw stream smoke test，不启动正式 trial
 MapTemplate replay 是旧数据诊断/探索工具，不是正式实验地图
 ```
 
