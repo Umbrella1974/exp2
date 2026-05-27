@@ -67,6 +67,8 @@ pytest -q tests/test_batch_offline_replay_report.py
 pytest -q tests/test_analyze_session.py
 pytest -q tests/test_map_preview.py tests/test_map_template.py
 pytest -q tests/test_map_config.py tests/test_map_generator.py
+pytest -q tests/test_calibration_geometry.py tests/test_calibration_io.py tests/test_calibration_sampling.py
+pytest -q tests/test_calibrate_from_raw_jsonl_table.py tests/test_offline_replay_formal_calibrated.py
 pytest -q tests/test_trial_controller.py tests/test_block_controller.py
 ```
 
@@ -263,6 +265,144 @@ map_validation_warnings
 ```
 
 注意：template map 仍是 post-hoc diagnostic map，不是正式实验地图。
+
+## Stage 5A 正式桌面三线标定
+
+Stage 5A 新增的是“正式 calibration 文件格式 + 离线验证工具”，不是 live calibration GUI。它解决的问题是：只用 `origin + x axis` 不足以稳定定义真实桌面实验坐标系，因为桌面可能相对 SteamVR world 有倾斜；正式流程需要同时估计桌面平面法向，也就是 task `up`，再由 `x` 和 `up` 构造正交的 `y`。
+
+桌面三线设计：
+
+- `origin`：静止采样，默认 5 秒，用来确定 task 原点。
+- `long_axis_line`：沿桌面长边移动采样，定义 task `x_axis_world`。
+- `width_axis_line`：沿桌面宽边移动采样，只做正交质量检查，不翻转 `y`。
+- `diagonal_line`：沿对角线移动采样，用来检查线段是否在同一平面内，以及对角线是否既不像 x 也不像 y。
+
+坐标系构造规则：
+
+```text
+up_axis_world = fitted table plane normal, flipped toward --up-hint
+x_axis_world = long_axis_line.direction_world projected to table plane
+y_axis_world = normalize(cross(up_axis_world, x_axis_world))
+```
+
+`width_axis_line` 不决定 `y` 的正负方向。即使宽边线方向和构造出的 `y_axis_world` 相反，也只记录角度/quality warning，不改变坐标系。
+
+### 生成 `calibration.json`
+
+`calibrate_from_raw_jsonl_table.py` 用已有 raw JSONL 模拟正式采样窗口，主要用于测试 calibration 文件格式和质量指标。它不是真正 live calibration。
+
+```powershell
+python calibrate_from_raw_jsonl_table.py --raw-jsonl path\to\raw_frames.jsonl --origin-start-frame 100 --long-line-start-frame 300 --width-line-start-frame 600 --diagonal-line-start-frame 900 --sample-duration-seconds 5 --out data\calibration\table_line_calibration.json
+```
+
+如果 raw timestamp 是毫秒，保持默认即可：
+
+```text
+--timestamp-scale 0.001
+```
+
+如果你更想按帧数截窗口，可以传：
+
+```powershell
+python calibrate_from_raw_jsonl_table.py --raw-jsonl path\to\raw_frames.jsonl --origin-start-frame 100 --long-line-start-frame 300 --width-line-start-frame 600 --diagonal-line-start-frame 900 --sample-window-frames 150 --out data\calibration\table_line_calibration.json
+```
+
+常用参数：
+
+```text
+--raw-jsonl                    输入 raw JSONL
+--out                          输出 calibration JSON
+--calibration-id               可选，自定义 calibration id
+--origin-start-frame           origin 采样起始帧
+--long-line-start-frame        长边线采样起始帧
+--width-line-start-frame       宽边线采样起始帧
+--diagonal-line-start-frame    对角线采样起始帧
+--sample-duration-seconds      默认 5.0
+--sample-window-frames         可选；传入后优先按帧数取窗口
+--point-source                 tracker_position_world 或 pinch_center_world，默认 tracker_position_world
+--timestamp-scale              默认 0.001
+--up-hint                      默认 0,0,1
+--min-samples                  默认 10
+--min-line-length              默认 0.10 m
+--notes                        可选备注
+```
+
+输出文件会包含：
+
+```text
+calibration_type = formal_table_lines
+is_formal_calibration = true
+origin / long_axis_line / width_axis_line / diagonal_line
+origin_world / x_axis_world / y_axis_world / up_axis_world
+task_coordinate_system
+quality
+warnings
+metadata
+```
+
+第一版 quality 阈值：
+
+```text
+origin max deviation > 0.02 m -> warning
+line fit rmse > 0.02 m -> warning
+plane fit rmse > 0.02 m -> warning
+long/width angle deviation from 90 deg > 10 deg -> warning
+long/width angle deviation from 90 deg > 25 deg -> error
+diagonal angle to x or y < 10 deg or > 80 deg -> warning
+```
+
+warning 不阻止保存；error 会阻止保存。这个 raw JSONL 版本会在 metadata 中标明它只是 replayed raw JSONL calibration test，不应当当成 live formal calibration。
+
+### 使用正式 calibration 做离线 replay
+
+`offline_replay_formal_calibrated.py` 使用 `calibration.json + map_config.json` 跑旧 raw JSONL。它不做 post-hoc auto calibration，但仍然是 offline replay，不是 live formal trial。
+
+```powershell
+python offline_replay_formal_calibrated.py --raw-jsonl path\to\raw_frames.jsonl --calibration-json data\calibration\table_line_calibration.json --map-config maps\examples\xoy_turn.json --out-dir data\offline_replay_formal\test --write-session
+```
+
+常用参数：
+
+```text
+--raw-jsonl           输入 raw JSONL
+--calibration-json    formal_table_lines calibration JSON
+--map-config          MapConfig JSON
+--out-dir             输出 frames.csv / events.csv / summary.json
+--max-frames          可选，最多处理多少帧
+--write-session       额外写标准 session 目录
+--session-dir         可选，自定义 session 目录
+--session-id          可选
+--subject-id          可选
+--notes               可选
+--thumb-node          默认 4
+--index-node          默认 9
+--tracker-index       默认 0
+--skeleton-index      默认 0
+--timestamp-scale     默认 0.001
+```
+
+输出目录包含：
+
+```text
+frames.csv
+events.csv
+summary.json
+calibration_formal.json
+scene_map_config.json
+```
+
+如果传 `--write-session`，`session_meta.json` 会明确写：
+
+```text
+mode = offline_formal_calibrated_replay
+calibration_type = formal_table_lines
+is_formal_calibration = true
+is_live_trial = false
+scene_type = map_config
+is_formal_scene = false
+```
+
+这里不会写 `post_hoc_auto` warning；但会保留一句 warning：它是使用正式 calibration 文件的 offline replay，不是 live formal trial。
 
 ## `analyze_session.py`
 
@@ -861,10 +1001,18 @@ python run_live_preview.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_
 }
 ```
 
+上面是旧的轻量 task calibration 格式，主要给 preview/smoke 工具用。Stage 5A 新增的正式桌面三线 calibration 也是 JSON，但字段更多，`calibration_type=formal_table_lines`，包含 origin、三条采样线、plane fit 和 quality 指标。生成它请使用：
+
+```powershell
+python calibrate_from_raw_jsonl_table.py --raw-jsonl path\to\raw_frames.jsonl --origin-start-frame 100 --long-line-start-frame 300 --width-line-start-frame 600 --diagonal-line-start-frame 900 --out data\calibration\table_line_calibration.json
+```
+
 `offline_replay_autocalibrated.py` 不读 calibration JSON。它会根据 raw 数据前一段有效输入点自动估计临时 task 坐标系：
 
 - `initial-window`：以前若干有效点中的最远点估计 x 方向。
 - `pca`：用前若干有效点的 PCA 第一主方向估计 x 方向。
+
+如果要用正式 calibration JSON 跑旧数据，请使用 `offline_replay_formal_calibrated.py --calibration-json ... --map-config ...`。
 
 ## 常见问题
 
@@ -911,8 +1059,9 @@ pinch_release_threshold = 0.035
 没有触觉硬件控制
 没有自动读取 YAML 配置
 没有完整 MANUS/Vive rotation fusion
-没有正式在线 calibration 流程
-MapConfig replay 仍使用 post-hoc auto calibration，不能标记成正式实验
+没有正式在线 calibration GUI/实时采样流程；Stage 5A 只有离线格式测试和 formal replay
+offline_replay_autocalibrated.py 的 MapConfig replay 仍使用 post-hoc auto calibration，不能标记成正式实验
+offline_replay_formal_calibrated.py 使用 formal calibration，但仍是 offline replay，不是 live formal trial
 MapTemplate replay 是旧数据诊断/探索工具，不是正式实验地图
 ```
 
