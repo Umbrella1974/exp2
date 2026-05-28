@@ -10,6 +10,7 @@ from live_visual_display import (
     TextLiveVisualDisplay,
     build_status_text,
     create_live_visual_display,
+    guidance_from_snapshot,
 )
 
 
@@ -22,6 +23,10 @@ def test_text_mode_outputs_english_labels(capsys) -> None:
     assert "CONTACT=CONTACT" in output
     assert "PINCH=PINCH_VALID" in output
     assert "FEEDBACK=NONE" in output
+    assert "PINCH_POS=" in output
+    assert "BLOCK_POS=" in output
+    assert "TO_BLOCK=" in output
+    assert "GUIDE:" in output
 
 
 def test_status_text_contains_required_sections() -> None:
@@ -33,6 +38,53 @@ def test_status_text_contains_required_sections() -> None:
     assert "MOTION:" in text
     assert "STOP:" in text
     assert "FEEDBACK:" in text
+    assert "PINCH TASK:" in text
+    assert "BLOCK TASK:" in text
+    assert "TO BLOCK:" in text
+    assert "GUIDE:" in text
+
+
+def test_guidance_reports_direction_to_block() -> None:
+    snapshot = _snapshot(
+        pinch_center_task=[-0.4, -0.3, 0.02],
+        block_center_task=[0.0, 0.0, 0.0],
+        block_size=[0.2, 0.2, 0.2],
+    )
+
+    guidance = guidance_from_snapshot(snapshot)
+
+    assert guidance.available is True
+    assert guidance.message == "GUIDE: MOVE +X +Y"
+    assert guidance.footprint_edge_distance_xy is not None
+    assert guidance.footprint_edge_distance_xy > 0.0
+
+
+def test_guidance_reports_inside_block_footprint() -> None:
+    snapshot = _snapshot(
+        pinch_center_task=[0.02, -0.02, 0.0],
+        block_center_task=[0.0, 0.0, 0.0],
+        block_size=[0.2, 0.2, 0.2],
+    )
+
+    guidance = guidance_from_snapshot(snapshot)
+
+    assert guidance.message == "GUIDE: HAND INSIDE BLOCK, PINCH TO GRAB"
+    assert guidance.pinch_inside_footprint_xy is True
+    assert guidance.pinch_inside_block_aabb is True
+
+
+def test_guidance_reports_z_direction_when_xy_is_aligned() -> None:
+    snapshot = _snapshot(
+        pinch_center_task=[0.02, -0.02, 0.3],
+        block_center_task=[0.0, 0.0, 0.0],
+        block_size=[0.2, 0.2, 0.2],
+    )
+
+    guidance = guidance_from_snapshot(snapshot)
+
+    assert guidance.message == "GUIDE: MOVE -Z"
+    assert guidance.pinch_inside_footprint_xy is True
+    assert guidance.pinch_inside_block_aabb is False
 
 
 def test_matplotlib_unavailable_falls_back_to_text(monkeypatch) -> None:
@@ -55,8 +107,8 @@ def test_matplotlib_unavailable_falls_back_to_text(monkeypatch) -> None:
     display.update(_snapshot())
 
 
-def _snapshot() -> DashboardSnapshot:
-    return DashboardSnapshot(
+def _snapshot(**overrides) -> DashboardSnapshot:
+    payload = dict(
         frame_index=0,
         time=1.0,
         tracker_valid=True,
@@ -89,4 +141,8 @@ def _snapshot() -> DashboardSnapshot:
         status_line="MAIN=MOVING",
         main_state_label="MOVING",
         pinch_label="PINCH VALID, distance=0.020 m",
+    )
+    payload.update(overrides)
+    return DashboardSnapshot(
+        **payload,
     )

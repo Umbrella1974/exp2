@@ -668,6 +668,18 @@ STOP
 FEEDBACK
 ```
 
+为了方便现场把手移动到物块初始位置，live visual preview 还会显示一层导航信息：
+
+```text
+HAND / BLOCK 标签
+pinch to block 虚线和箭头
+PINCH TASK / BLOCK TASK 坐标
+TO BLOCK: dx / dy / dz / edge_xy / edge_xyz / center
+GUIDE: MOVE +X -Y 等方向提示
+```
+
+`dx/dy/dz` 是“从当前 pinch 点到物块中心”的 task-space 向量。比如 `GUIDE: MOVE +X +Y` 表示手需要往 task `+X` 和 `+Y` 方向靠近物块。`edge_xy` 是 pinch 点到物块 x-y footprint 边缘的距离，方便看地图；`edge_xyz` 是到 3D 物块 AABB 的距离，更接近接触判定。`edge_xyz` 接近 `0` 且 pinch 距离满足阈值时，就应该能进入接触/抓取逻辑。matplotlib 视图会自动扩展坐标轴，把当前手和物块都纳入视野；如果 Tk/matplotlib 现场不稳定，可以改用 `--visual-mode text`，命令行同样会打印 `PINCH_POS / BLOCK_POS / TO_BLOCK / GUIDE`。
+
 logical haptic label 会写入 dashboard snapshot、`summary.json.logical_haptic_label_counts`，并作为 `details_json.logical_haptic_label` 写入 `session/haptic.csv`。真实硬件 haptic 始终关闭：
 
 ```text
