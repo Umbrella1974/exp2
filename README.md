@@ -642,6 +642,8 @@ python run_live_trial_visual_preview.py ^
 --slip-motion-threshold
 --ignore-task-z
 --task-z-half-extent
+--anchor-current-pinch
+--anchor-timeout-seconds
 ```
 
 未传时使用 `EngineConfig` 默认值；最终阈值会写入 `summary.json` 和 `session/trial_config.json`。
@@ -666,6 +668,31 @@ python run_live_trial_visual_preview.py ^
 ```
 
 这个开关不会修改原始 map JSON；只会影响本次 preview/session 写出的 `trial_config.json` 和 controller 使用的 scene。`summary.json.task_z_mode = ignore_expanded` 时，说明这次不是严格 3D 接触判定。正式实验前仍建议在同一次 SteamVR/base-station 会话里先跑 `live_calibrate_table.py`，再立刻跑 live preview，避免复用旧 calibration 造成 world 坐标整体漂移。
+
+如果标定原点和实际实验站位不在同一个物理位置，使用当前 pinch 作为本次物块起点：
+
+```powershell
+python run_live_trial_visual_preview.py ^
+  --calibration-json data\calibration\live_table_calibration.json ^
+  --map-config maps\examples\xoy_turn.json ^
+  --host 127.0.0.1 ^
+  --port 8888 ^
+  --out-dir data\live_trial_preview\debug_anchor ^
+  --show-visual ^
+  --anchor-current-pinch ^
+  --ignore-task-z
+```
+
+运行后先把 pinch 放到希望物块出现的位置。程序会等待第一个有效 pinch 点，把整张地图平移到这个点，然后才开始 trial。这个操作只平移本次 preview 内部的 `map/track/block`，不修改原始 map JSON，也不修改 calibration JSON。输出里可看：
+
+```text
+summary.json.map_anchor_mode
+summary.json.map_anchor_task
+summary.json.map_anchor_translation_task
+session/trial_config.json.block_initial_center_task
+```
+
+注意：`--map-config` 只能传正式 MapConfig JSON，也就是文件里必须有 `map_id`、`coordinate_space: "task"`、`block_initial_center_task`、`track_boxes`。只有 `template_id`、`coordinate_space: "template"` 的文件是 MapTemplate，不能直接给 live preview 使用；它需要先转换成 MapConfig，或后续给 live preview 单独加 `--map-template` 支持。
 
 输出：
 

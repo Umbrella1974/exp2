@@ -97,6 +97,8 @@ class LiveTrialVisualPreviewConfig:
     slip_motion_threshold: float | None = None
     ignore_task_z: bool = False
     task_z_half_extent: float = 5.0
+    anchor_current_pinch: bool = False
+    anchor_timeout_seconds: float = 10.0
     socket_timeout: float | None = None
     max_queue_size: int = 300
     raw_jsonl: Path | None = None
@@ -136,17 +138,7 @@ def run_live_trial_visual_preview(
         )
     task_system = build_task_coordinate_system_from_calibration(calibration)
 
-    map_config = _map_config_for_live_preview(load_map_config(config.map_config), config)
-    map_validation = validate_map_config(map_config)
-    if map_validation.errors:
-        raise ValueError("map validation failed: " + "; ".join(map_validation.errors))
-    track_region, block_center, block_size = compile_map_to_track_region(map_config)
-    engine_config = _engine_config(config, block_size)
-    scene_payload = _scene_payload(config, map_config, map_validation.warnings, engine_config)
-
-    def block_factory() -> BlockController:
-        return BlockController(engine_config, track_region, block_center)
-
+    map_config = load_map_config(config.map_config)
     adapter_config = DeviceAdapterConfig(
         skeleton_index=config.skeleton_index,
         tracker_index=config.tracker_index,
@@ -155,10 +147,42 @@ def run_live_trial_visual_preview(
         timestamp_scale=config.timestamp_scale,
     )
     adapter = ManusViveExperimentAdapter(None, config=adapter_config)
-    trial = TrialController(block_factory, task_system, engine_config)
 
     own_source = source is None
     live_source = source or _build_live_source(config)
+    source_started = False
+    anchor_info = _empty_anchor_info(config)
+    if config.anchor_current_pinch:
+        try:
+            if hasattr(live_source, "start"):
+                live_source.start()
+            source_started = True
+            map_config, anchor_info = _anchor_map_to_current_pinch(
+                map_config,
+                config,
+                live_source,
+                adapter_config,
+                adapter,
+                task_system,
+            )
+        except Exception:
+            _stop_started_source(live_source, own_source, source_started, "anchor_failed")
+            raise
+
+    map_config = _map_config_for_live_preview(map_config, config)
+    map_validation = validate_map_config(map_config)
+    if map_validation.errors:
+        _stop_started_source(live_source, own_source, source_started, "setup_failed")
+        raise ValueError("map validation failed: " + "; ".join(map_validation.errors))
+    track_region, block_center, block_size = compile_map_to_track_region(map_config)
+    engine_config = _engine_config(config, block_size)
+    scene_payload = _scene_payload(config, map_config, map_validation.warnings, engine_config, anchor_info)
+
+    def block_factory() -> BlockController:
+        return BlockController(engine_config, track_region, block_center)
+
+    trial = TrialController(block_factory, task_system, engine_config)
+
     visual_display = display
     if visual_display is None:
         visual_display = create_live_visual_display(
@@ -200,8 +224,9 @@ def run_live_trial_visual_preview(
     trial_started = False
 
     try:
-        if hasattr(live_source, "start"):
+        if not source_started and hasattr(live_source, "start"):
             live_source.start()
+            source_started = True
 
         while True:
             if config.duration_seconds is not None and time.monotonic() - run_started >= config.duration_seconds:
@@ -398,10 +423,15 @@ def run_live_trial_visual_preview(
         "warnings": [
             "MVP live visual preview: not a formal experiment runner.",
             "Logical haptic feedback is displayed and recorded; hardware haptic is disabled.",
+            *_anchor_warnings(config),
             *_task_z_warnings(config),
             *calibration_validation.warnings,
             *map_validation.warnings,
         ],
+        "map_anchor_mode": anchor_info["mode"],
+        "map_anchor_task": anchor_info["anchor_task"],
+        "map_anchor_translation_task": anchor_info["translation_task"],
+        "map_anchor_frame_index": anchor_info["frame_index"],
         "task_z_mode": "ignore_expanded" if config.ignore_task_z else "map_config",
         "task_z_half_extent": config.task_z_half_extent if config.ignore_task_z else None,
     }
@@ -448,6 +478,8 @@ def main(argv: list[str] | None = None) -> int:
         slip_motion_threshold=args.slip_motion_threshold,
         ignore_task_z=args.ignore_task_z,
         task_z_half_extent=args.task_z_half_extent,
+        anchor_current_pinch=args.anchor_current_pinch,
+        anchor_timeout_seconds=args.anchor_timeout_seconds,
         socket_timeout=args.socket_timeout,
         max_queue_size=args.max_queue_size,
         raw_jsonl=Path(args.raw_jsonl) if args.raw_jsonl is not None else None,
@@ -520,7 +552,7 @@ def _build_live_source(config: LiveTrialVisualPreviewConfig) -> Any:
             timestamp_scale=config.timestamp_scale,
             real_time=config.replay_real_time,
             speed=config.speed,
-            max_frames=config.max_frames,
+            max_frames=None if config.anchor_current_pinch else config.max_frames,
         )
     return LiveRawStreamServer(
         host=config.host,
@@ -573,6 +605,137 @@ def _map_config_for_live_preview(map_config: MapConfig, config: LiveTrialVisualP
     return _expand_map_config_task_z(map_config, half_extent=config.task_z_half_extent)
 
 
+def _empty_anchor_info(config: LiveTrialVisualPreviewConfig) -> dict[str, Any]:
+    return {
+        "enabled": bool(config.anchor_current_pinch),
+        "mode": "current_pinch" if config.anchor_current_pinch else "none",
+        "frame_index": None,
+        "raw_timestamp": None,
+        "anchor_task": None,
+        "original_block_initial_center_task": None,
+        "translation_task": None,
+        "timeout_seconds": config.anchor_timeout_seconds if config.anchor_current_pinch else None,
+    }
+
+
+def _anchor_map_to_current_pinch(
+    map_config: MapConfig,
+    config: LiveTrialVisualPreviewConfig,
+    live_source: Any,
+    adapter_config: DeviceAdapterConfig,
+    adapter: ManusViveExperimentAdapter,
+    task_system: Any,
+) -> tuple[MapConfig, dict[str, Any]]:
+    print(
+        "[LIVE PREVIEW] waiting for anchor pinch; place your pinch at the desired block start..."
+    )
+    started = time.monotonic()
+    while True:
+        if time.monotonic() - started >= config.anchor_timeout_seconds:
+            raise TimeoutError(
+                "timed out waiting for a valid anchor pinch; check tracking and hand data."
+            )
+        live_frame = live_source.get_frame(timeout=0.1)
+        if live_frame is None:
+            source_reason = _source_stop_reason(live_source)
+            if source_reason in {"client_disconnected", "server_stopped", "socket_error", "eof"}:
+                raise RuntimeError(f"live source stopped before anchor pinch: {source_reason}")
+            continue
+
+        _, parse_ok, adapter_ok, _, sample, _ = _parse_and_adapt(
+            live_frame,
+            adapter_config,
+            adapter,
+            live_source,
+            previous_receive_time=None,
+            process_start=time.monotonic(),
+        )
+        if not parse_ok or not adapter_ok or sample is None:
+            continue
+        if not sample.tracker_valid or sample.pinch_center_world is None:
+            continue
+
+        anchor_task_array = task_system.world_to_task(sample.pinch_center_world)
+        anchor_task = [float(anchor_task_array[0]), float(anchor_task_array[1]), float(anchor_task_array[2])]
+        anchored_map, anchor_info = _translate_map_config_to_block_anchor(
+            map_config,
+            anchor_task,
+            frame_index=live_frame.frame_index,
+            raw_timestamp=live_frame.raw_frame.get("timestamp"),
+            timeout_seconds=config.anchor_timeout_seconds,
+        )
+        print(
+            "[LIVE PREVIEW] anchored block start to current pinch: "
+            f"anchor_task={anchor_info['anchor_task']} "
+            f"translation_task={anchor_info['translation_task']}"
+        )
+        return anchored_map, anchor_info
+
+
+def _translate_map_config_to_block_anchor(
+    map_config: MapConfig,
+    anchor_task: list[float],
+    *,
+    frame_index: int,
+    raw_timestamp: Any,
+    timeout_seconds: float,
+) -> tuple[MapConfig, dict[str, Any]]:
+    original = list(map_config.block_initial_center_task)
+    translation = [float(anchor_task[index]) - float(original[index]) for index in range(3)]
+    anchored = _translate_map_config(map_config, translation)
+    anchor_info = {
+        "enabled": True,
+        "mode": "current_pinch",
+        "frame_index": int(frame_index),
+        "raw_timestamp": raw_timestamp,
+        "anchor_task": [float(value) for value in anchor_task],
+        "original_block_initial_center_task": original,
+        "translation_task": translation,
+        "timeout_seconds": timeout_seconds,
+    }
+    anchored = replace(
+        anchored,
+        metadata={
+            **anchored.metadata,
+            "live_preview_anchor": anchor_info,
+        },
+    )
+    return anchored, anchor_info
+
+
+def _translate_map_config(map_config: MapConfig, translation: list[float]) -> MapConfig:
+    return replace(
+        map_config,
+        block_initial_center_task=_translate_point(map_config.block_initial_center_task, translation),
+        track_boxes=[_translate_box(box, translation) for box in map_config.track_boxes],
+        target_region=(
+            _translate_box(map_config.target_region, translation)
+            if map_config.target_region is not None
+            else None
+        ),
+        metadata={
+            **map_config.metadata,
+            "live_preview_anchor_translation_task": [float(value) for value in translation],
+        },
+    )
+
+
+def _translate_box(box: MapBoxSpec, translation: list[float]) -> MapBoxSpec:
+    return replace(
+        box,
+        min=_translate_point(box.min, translation),
+        max=_translate_point(box.max, translation),
+        metadata={
+            **box.metadata,
+            "live_preview_anchor_translated": True,
+        },
+    )
+
+
+def _translate_point(point: list[float], translation: list[float]) -> list[float]:
+    return [float(point[index]) + float(translation[index]) for index in range(3)]
+
+
 def _expand_map_config_task_z(map_config: MapConfig, *, half_extent: float) -> MapConfig:
     center_z = float(map_config.block_initial_center_task[2])
     z_min = center_z - float(half_extent)
@@ -621,6 +784,7 @@ def _scene_payload(
     map_config: Any,
     map_warnings: list[str],
     engine_config: EngineConfig,
+    anchor_info: dict[str, Any],
 ) -> dict[str, Any]:
     payload = map_config_to_trial_config(map_config)
     payload.update(
@@ -629,6 +793,8 @@ def _scene_payload(
             "scene_type": "map_config",
             "map_config_path": str(config.map_config),
             "haptic_hardware_enabled": False,
+            "map_anchor": anchor_info,
+            "map_anchor_mode": anchor_info["mode"],
             "pinch_threshold": {
                 "grab": engine_config.pinch_grab_threshold,
                 "release": engine_config.pinch_release_threshold,
@@ -638,10 +804,18 @@ def _scene_payload(
             "slip_motion_threshold": engine_config.slip_motion_threshold,
             "trial_timeout_seconds": engine_config.trial_timeout_seconds,
             "max_detach_count": engine_config.max_detach_count,
-            "warnings": [*_task_z_warnings(config), *map_warnings],
+            "warnings": [*_anchor_warnings(config), *_task_z_warnings(config), *map_warnings],
         }
     )
     return payload
+
+
+def _anchor_warnings(config: LiveTrialVisualPreviewConfig) -> list[str]:
+    if not config.anchor_current_pinch:
+        return []
+    return [
+        "Live preview is running with --anchor-current-pinch: map/track/block are translated to the startup pinch point."
+    ]
 
 
 def _task_z_warnings(config: LiveTrialVisualPreviewConfig) -> list[str]:
@@ -667,9 +841,11 @@ def _session_meta(
         "calibration_id": calibration.calibration_id,
         "scene_type": "map_config",
         "haptic_hardware_enabled": False,
+        "map_anchor_mode": "current_pinch" if config.anchor_current_pinch else "none",
         "warnings": [
             "MVP live visual preview: not a formal experiment runner.",
             "Hardware haptic is disabled; only logical haptic feedback is recorded.",
+            *_anchor_warnings(config),
         ],
     }
     if config.subject_id is not None:
@@ -785,6 +961,14 @@ def _stop_source(source: Any, reason: str) -> None:
         source.stop(reason)
 
 
+def _stop_started_source(source: Any, own_source: bool, source_started: bool, reason: str) -> None:
+    if not own_source or not source_started:
+        return
+    _stop_source(source, reason)
+    if hasattr(source, "join"):
+        source.join(timeout=1.0)
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MVP live visual trial preview.")
     parser.add_argument("--calibration-json", required=True)
@@ -818,6 +1002,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--slip-motion-threshold", default=None, type=float)
     parser.add_argument("--ignore-task-z", action="store_true")
     parser.add_argument("--task-z-half-extent", default=5.0, type=float)
+    parser.add_argument("--anchor-current-pinch", action="store_true")
+    parser.add_argument("--anchor-timeout-seconds", default=10.0, type=float)
     parser.add_argument("--socket-timeout", default=None, type=float)
     parser.add_argument("--max-queue-size", default=300, type=int)
     parser.add_argument("--raw-jsonl", default=None)
@@ -849,6 +1035,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--slip-motion-threshold must be >= 0.")
     if args.task_z_half_extent <= 0.0:
         parser.error("--task-z-half-extent must be > 0.")
+    if args.anchor_timeout_seconds <= 0.0:
+        parser.error("--anchor-timeout-seconds must be > 0.")
     return args
 
 

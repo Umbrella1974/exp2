@@ -187,6 +187,45 @@ def test_ignore_task_z_expands_live_preview_contact_layer(tmp_path: Path) -> Non
     assert any("--ignore-task-z" in warning for warning in summary["warnings"])
 
 
+def test_anchor_current_pinch_translates_map_before_trial(tmp_path: Path) -> None:
+    calibration_path = _write_calibration(tmp_path / "calibration.json")
+    map_path = _write_map_config(tmp_path / "map.json")
+    source = FakeLiveSource([
+        _live_frame(0, x=0.5),
+        _live_frame(1, x=0.5),
+    ])
+    config = LiveTrialVisualPreviewConfig(
+        calibration_json=calibration_path,
+        map_config=map_path,
+        out_dir=tmp_path / "preview_anchor",
+        max_frames=1,
+        print_every=0,
+        show_visual=False,
+        write_session=True,
+        anchor_current_pinch=True,
+        anchor_timeout_seconds=1.0,
+        pinch_grab_threshold=0.03,
+        pinch_release_threshold=0.04,
+    )
+
+    result = run_live_trial_visual_preview(config, source=source)
+
+    summary = json.loads((config.out_dir / "summary.json").read_text(encoding="utf-8"))
+    session_dir = Path(summary["session_dir"])
+    trial_config = json.loads((session_dir / "trial_config.json").read_text(encoding="utf-8"))
+
+    assert result.snapshots[0].frame_index == 1
+    assert result.snapshots[0].contact_state == "INSIDE_BLOCK"
+    assert summary["map_anchor_mode"] == "current_pinch"
+    assert summary["map_anchor_task"] == [0.5, 0.0, 0.0]
+    assert summary["map_anchor_translation_task"] == [0.5, 0.0, 0.0]
+    assert summary["map_anchor_frame_index"] == 0
+    assert trial_config["block_initial_center_task"] == [0.5, 0.0, 0.0]
+    assert trial_config["track_boxes"][0]["min"] == [-0.5, -1.0, -1.0]
+    assert trial_config["track_boxes"][0]["max"] == [1.5, 1.0, 1.0]
+    assert any("--anchor-current-pinch" in warning for warning in summary["warnings"])
+
+
 def test_raw_jsonl_simulated_source_can_run_preview(tmp_path: Path) -> None:
     calibration_path = _write_calibration(tmp_path / "calibration.json")
     map_path = _write_map_config(tmp_path / "map.json")
