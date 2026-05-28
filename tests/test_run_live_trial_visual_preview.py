@@ -153,6 +153,40 @@ def test_blocked_frame_count_includes_blocked_force_active(tmp_path: Path) -> No
     assert result.summary["blocked_frame_count"] >= 1
 
 
+def test_ignore_task_z_expands_live_preview_contact_layer(tmp_path: Path) -> None:
+    calibration_path = _write_calibration(tmp_path / "calibration.json")
+    map_path = _write_map_config(tmp_path / "map.json")
+    source = FakeLiveSource([_live_frame(0, z=0.8)])
+    config = LiveTrialVisualPreviewConfig(
+        calibration_json=calibration_path,
+        map_config=map_path,
+        out_dir=tmp_path / "preview_ignore_z",
+        max_frames=1,
+        print_every=0,
+        show_visual=False,
+        write_session=True,
+        ignore_task_z=True,
+        task_z_half_extent=4.0,
+        pinch_grab_threshold=0.03,
+        pinch_release_threshold=0.04,
+    )
+
+    result = run_live_trial_visual_preview(config, source=source)
+
+    summary = json.loads((config.out_dir / "summary.json").read_text(encoding="utf-8"))
+    session_dir = Path(summary["session_dir"])
+    trial_config = json.loads((session_dir / "trial_config.json").read_text(encoding="utf-8"))
+
+    assert result.snapshots[0].contact_state == "INSIDE_BLOCK"
+    assert summary["task_z_mode"] == "ignore_expanded"
+    assert summary["task_z_half_extent"] == 4.0
+    assert summary["engine_config"]["block_size"][2] == 8.0
+    assert trial_config["block_size"][2] == 8.0
+    assert trial_config["track_boxes"][0]["min"][2] == -4.0
+    assert trial_config["track_boxes"][0]["max"][2] == 4.0
+    assert any("--ignore-task-z" in warning for warning in summary["warnings"])
+
+
 def test_raw_jsonl_simulated_source_can_run_preview(tmp_path: Path) -> None:
     calibration_path = _write_calibration(tmp_path / "calibration.json")
     map_path = _write_map_config(tmp_path / "map.json")
@@ -221,8 +255,8 @@ class KeyboardInterruptSource(FakeLiveSource):
         raise KeyboardInterrupt
 
 
-def _live_frame(index: int, *, x: float | None = None) -> LiveRawFrame:
-    raw = _raw_frame(index, x=x)
+def _live_frame(index: int, *, x: float | None = None, z: float = 0.0) -> LiveRawFrame:
+    raw = _raw_frame(index, x=x, z=z)
     return LiveRawFrame(
         frame_index=index,
         raw_frame=raw,
@@ -232,8 +266,8 @@ def _live_frame(index: int, *, x: float | None = None) -> LiveRawFrame:
     )
 
 
-def _raw_frame(index: int, *, x: float | None = None) -> dict:
-    position = [index * 0.03 if x is None else x, 0.0, 0.0]
+def _raw_frame(index: int, *, x: float | None = None, z: float = 0.0) -> dict:
+    position = [index * 0.03 if x is None else x, 0.0, z]
     return {
         "timestamp": index * 10.0,
         "frame": index,
@@ -242,8 +276,8 @@ def _raw_frame(index: int, *, x: float | None = None) -> dict:
                 "gloveId": "glove-a",
                 "side": "left",
                 "nodes": [
-                    {"id": 4, "position": [-0.005, 0.0, 0.0]},
-                    {"id": 9, "position": [0.005, 0.0, 0.0]},
+                    {"id": 4, "position": [-0.005, 0.0, z]},
+                    {"id": 9, "position": [0.005, 0.0, z]},
                 ],
             }
         ],

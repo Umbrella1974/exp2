@@ -640,9 +640,32 @@ python run_live_trial_visual_preview.py ^
 --pinch-grab-threshold
 --pinch-release-threshold
 --slip-motion-threshold
+--ignore-task-z
+--task-z-half-extent
 ```
 
 未传时使用 `EngineConfig` 默认值；最终阈值会写入 `summary.json` 和 `session/trial_config.json`。
+
+如果现场发现 x-y 已经能对准物块，但 `GUIDE` 一直提示 `MOVE +Z` 或 `MOVE -Z`，通常说明当前 calibration 的 task `z=0` 和真实手部 pinch 高度没有对上。MVP 阶段可以先显式忽略 z 判定，只验证 x-y 抓取/移动：
+
+```powershell
+python run_live_trial_visual_preview.py ^
+  --calibration-json data\calibration\live_table_calibration.json ^
+  --map-config maps\examples\xoy_turn.json ^
+  --host 127.0.0.1 ^
+  --port 8888 ^
+  --out-dir data\live_trial_preview\debug_01 ^
+  --show-visual ^
+  --ignore-task-z
+```
+
+`--ignore-task-z` 会保留地图的 x-y 几何，但把 live preview 内部使用的 track / target / block z 范围扩到 `±5m`，等价于“这次实验只看 x-y”。如需改范围：
+
+```powershell
+--ignore-task-z --task-z-half-extent 3.0
+```
+
+这个开关不会修改原始 map JSON；只会影响本次 preview/session 写出的 `trial_config.json` 和 controller 使用的 scene。`summary.json.task_z_mode = ignore_expanded` 时，说明这次不是严格 3D 接触判定。正式实验前仍建议在同一次 SteamVR/base-station 会话里先跑 `live_calibrate_table.py`，再立刻跑 live preview，避免复用旧 calibration 造成 world 坐标整体漂移。
 
 输出：
 

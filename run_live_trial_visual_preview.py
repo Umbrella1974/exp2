@@ -12,7 +12,7 @@ import csv
 import json
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
@@ -29,9 +29,11 @@ from config import EngineConfig
 from dashboard_snapshot import DashboardSnapshot, build_dashboard_snapshot
 from device_frame_models import DeviceAdapterConfig
 from live_raw_stream import LiveRawFrame, LiveRawStreamServer
-from live_visual_display import NullLiveVisualDisplay, create_live_visual_display
+from live_visual_display import NullLiveVisualDisplay, build_compact_status_line, create_live_visual_display
 from manus_vive_adapter import ManusViveExperimentAdapter
 from map_config import (
+    MapBoxSpec,
+    MapConfig,
     compile_map_to_track_region,
     load_map_config,
     map_config_to_trial_config,
@@ -93,6 +95,8 @@ class LiveTrialVisualPreviewConfig:
     pinch_grab_threshold: float | None = None
     pinch_release_threshold: float | None = None
     slip_motion_threshold: float | None = None
+    ignore_task_z: bool = False
+    task_z_half_extent: float = 5.0
     socket_timeout: float | None = None
     max_queue_size: int = 300
     raw_jsonl: Path | None = None
@@ -132,7 +136,7 @@ def run_live_trial_visual_preview(
         )
     task_system = build_task_coordinate_system_from_calibration(calibration)
 
-    map_config = load_map_config(config.map_config)
+    map_config = _map_config_for_live_preview(load_map_config(config.map_config), config)
     map_validation = validate_map_config(map_config)
     if map_validation.errors:
         raise ValueError("map validation failed: " + "; ".join(map_validation.errors))
@@ -318,7 +322,7 @@ def run_live_trial_visual_preview(
                     )
                 visual_display.update(snapshot)
                 if config.print_every > 0 and len(metrics) % config.print_every == 0:
-                    print(f"[LIVE PREVIEW] {snapshot.status_line}")
+                    print(f"[LIVE PREVIEW] {build_compact_status_line(snapshot)}")
                 if trial_result.trial_state in {
                     TrialState.ENDED_BY_SUBJECT,
                     TrialState.FAILED_TIMEOUT,
@@ -394,9 +398,12 @@ def run_live_trial_visual_preview(
         "warnings": [
             "MVP live visual preview: not a formal experiment runner.",
             "Logical haptic feedback is displayed and recorded; hardware haptic is disabled.",
+            *_task_z_warnings(config),
             *calibration_validation.warnings,
             *map_validation.warnings,
         ],
+        "task_z_mode": "ignore_expanded" if config.ignore_task_z else "map_config",
+        "task_z_half_extent": config.task_z_half_extent if config.ignore_task_z else None,
     }
     _write_json(summary_path, summary)
     if session_recorder is not None:
@@ -439,6 +446,8 @@ def main(argv: list[str] | None = None) -> int:
         pinch_grab_threshold=args.pinch_grab_threshold,
         pinch_release_threshold=args.pinch_release_threshold,
         slip_motion_threshold=args.slip_motion_threshold,
+        ignore_task_z=args.ignore_task_z,
+        task_z_half_extent=args.task_z_half_extent,
         socket_timeout=args.socket_timeout,
         max_queue_size=args.max_queue_size,
         raw_jsonl=Path(args.raw_jsonl) if args.raw_jsonl is not None else None,
@@ -558,6 +567,55 @@ def _engine_config(config: LiveTrialVisualPreviewConfig, block_size: Any) -> Eng
     )
 
 
+def _map_config_for_live_preview(map_config: MapConfig, config: LiveTrialVisualPreviewConfig) -> MapConfig:
+    if not config.ignore_task_z:
+        return map_config
+    return _expand_map_config_task_z(map_config, half_extent=config.task_z_half_extent)
+
+
+def _expand_map_config_task_z(map_config: MapConfig, *, half_extent: float) -> MapConfig:
+    center_z = float(map_config.block_initial_center_task[2])
+    z_min = center_z - float(half_extent)
+    z_max = center_z + float(half_extent)
+    block_size = list(map_config.block_size)
+    block_size[2] = max(float(block_size[2]), float(half_extent) * 2.0)
+
+    return replace(
+        map_config,
+        block_size=block_size,
+        track_boxes=[
+            _expand_box_task_z(box, z_min=z_min, z_max=z_max)
+            for box in map_config.track_boxes
+        ],
+        target_region=(
+            _expand_box_task_z(map_config.target_region, z_min=z_min, z_max=z_max)
+            if map_config.target_region is not None
+            else None
+        ),
+        metadata={
+            **map_config.metadata,
+            "live_preview_task_z_mode": "ignore_expanded",
+            "live_preview_task_z_half_extent": float(half_extent),
+        },
+    )
+
+
+def _expand_box_task_z(box: MapBoxSpec, *, z_min: float, z_max: float) -> MapBoxSpec:
+    minimum = list(box.min)
+    maximum = list(box.max)
+    minimum[2] = float(z_min)
+    maximum[2] = float(z_max)
+    return replace(
+        box,
+        min=minimum,
+        max=maximum,
+        metadata={
+            **box.metadata,
+            "live_preview_task_z_mode": "ignore_expanded",
+        },
+    )
+
+
 def _scene_payload(
     config: LiveTrialVisualPreviewConfig,
     map_config: Any,
@@ -575,13 +633,23 @@ def _scene_payload(
                 "grab": engine_config.pinch_grab_threshold,
                 "release": engine_config.pinch_release_threshold,
             },
+            "task_z_mode": "ignore_expanded" if config.ignore_task_z else "map_config",
+            "task_z_half_extent": config.task_z_half_extent if config.ignore_task_z else None,
             "slip_motion_threshold": engine_config.slip_motion_threshold,
             "trial_timeout_seconds": engine_config.trial_timeout_seconds,
             "max_detach_count": engine_config.max_detach_count,
-            "warnings": list(map_warnings),
+            "warnings": [*_task_z_warnings(config), *map_warnings],
         }
     )
     return payload
+
+
+def _task_z_warnings(config: LiveTrialVisualPreviewConfig) -> list[str]:
+    if not config.ignore_task_z:
+        return []
+    return [
+        "Live preview is running with --ignore-task-z: map/track/block z ranges are expanded for MVP x-y testing."
+    ]
 
 
 def _session_meta(
@@ -748,6 +816,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--pinch-grab-threshold", default=None, type=float)
     parser.add_argument("--pinch-release-threshold", default=None, type=float)
     parser.add_argument("--slip-motion-threshold", default=None, type=float)
+    parser.add_argument("--ignore-task-z", action="store_true")
+    parser.add_argument("--task-z-half-extent", default=5.0, type=float)
     parser.add_argument("--socket-timeout", default=None, type=float)
     parser.add_argument("--max-queue-size", default=300, type=int)
     parser.add_argument("--raw-jsonl", default=None)
@@ -777,6 +847,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--pinch-release-threshold must be > 0.")
     if args.slip_motion_threshold is not None and args.slip_motion_threshold < 0:
         parser.error("--slip-motion-threshold must be >= 0.")
+    if args.task_z_half_extent <= 0.0:
+        parser.error("--task-z-half-extent must be > 0.")
     return args
 
 
