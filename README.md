@@ -561,6 +561,14 @@ python live_calibrate_table.py --use-live-stream --live-host 127.0.0.1 --live-po
 
 然后启动发送端，把 newline-delimited combined JSON 发到 `127.0.0.1:8888`。真实 stream 模式每段开始采样前会清空当前 queue，避免按 Enter 前积压的旧帧混入当前 segment；`metadata.queue_cleared_before_segment` 会记录这个行为。
 
+运行后如果还没有发送端连接或还没有收到帧，命令行会显示：
+
+```text
+[LIVE] waiting... client_connected=0 queued=0 received=0
+```
+
+看到 `stream ready: client_connected=1 ...` 后再开始对应动作。如果一直停在 waiting，通常是 `manus_vive_com` 没连到同一个 `host:port`，或发送端还没有实际发送 newline-delimited JSON 帧。
+
 生成的文件是正式 calibration JSON：
 
 ```text

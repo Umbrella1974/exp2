@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
         result = run_live_table_calibration(
             source,
             config,
-            before_segment_callback=_before_segment_callback(config),
+            before_segment_callback=_before_segment_callback(config, source),
             progress_callback=_progress_callback(config),
         )
     except KeyboardInterrupt:
@@ -115,11 +116,13 @@ def _build_source(args: argparse.Namespace) -> Any:
     )
 
 
-def _before_segment_callback(config: CalibrationLiveConfig):
+def _before_segment_callback(config: CalibrationLiveConfig, source: Any):
     def before(segment: CalibrationSegmentSpec) -> None:
         print("")
         print(f"[{segment.label}] {segment.prompt}")
         print(f"Collecting {segment.duration_seconds:.3f} seconds; min samples={segment.min_samples}.")
+        if config.collection_mode == "live_stream":
+            _wait_for_live_stream_ready(source, segment.label)
         if config.require_enter_between_segments and not config.auto_advance:
             input("Press Enter to start this segment...")
     return before
@@ -156,6 +159,72 @@ def _stop_source(source: Any, reason: str) -> None:
         source.stop(reason)
     if hasattr(source, "join"):
         source.join(timeout=1.0)
+
+
+def _wait_for_live_stream_ready(
+    source: Any,
+    segment_label: str,
+    *,
+    timeout: float | None = None,
+    poll_interval: float = 0.1,
+    status_interval: float = 2.0,
+) -> None:
+    """Wait until a live client has connected and at least one frame arrived."""
+
+    started = time.monotonic()
+    next_status_at = started
+    baseline_received = _stats_int(_source_stats(source), "total_received_frames")
+    print(f"[LIVE] waiting for sender before {segment_label}...")
+    while True:
+        stats = _source_stats(source)
+        connected = bool(stats.get("client_connected", False))
+        queued = _stats_int(stats, "queue_size")
+        received = _stats_int(stats, "total_received_frames")
+        stop_reason = str(stats.get("stop_reason") or "")
+        if connected and (queued > 0 or received > baseline_received):
+            print(
+                f"[LIVE] stream ready: client_connected=1 queued={queued} "
+                f"received={received}"
+            )
+            return
+        if stop_reason in {"client_disconnected", "server_stopped", "socket_error"}:
+            raise RuntimeError(f"live stream stopped before calibration data arrived: {stop_reason}")
+        now = time.monotonic()
+        if timeout is not None and now - started >= timeout:
+            raise TimeoutError(
+                "timed out waiting for live stream data; check manus_vive_com connection "
+                "and ensure it is sending newline-delimited JSON frames."
+            )
+        if now >= next_status_at:
+            print(
+                f"[LIVE] waiting... client_connected={int(connected)} "
+                f"queued={queued} received={received}"
+            )
+            next_status_at = now + status_interval
+        time.sleep(poll_interval)
+
+
+def _source_stats(source: Any) -> dict[str, Any]:
+    if hasattr(source, "stats_snapshot"):
+        snapshot = source.stats_snapshot()
+        if isinstance(snapshot, dict):
+            return dict(snapshot)
+        if hasattr(snapshot, "__dict__"):
+            return dict(snapshot.__dict__)
+    return {
+        "client_connected": False,
+        "running": True,
+        "queue_size": source.queue_size() if hasattr(source, "queue_size") else 0,
+        "total_received_frames": getattr(source, "total_received_frames", 0),
+        "stop_reason": getattr(source, "stop_reason", None),
+    }
+
+
+def _stats_int(stats: dict[str, Any], key: str) -> int:
+    try:
+        return int(stats.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _parse_vec3(value: str) -> tuple[float, float, float]:

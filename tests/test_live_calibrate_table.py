@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from live_calibrate_table import main
+from live_calibrate_table import _wait_for_live_stream_ready, main
 
 
 def test_cli_raw_jsonl_simulated_live_writes_calibration(tmp_path: Path) -> None:
@@ -61,6 +61,57 @@ def test_cli_raw_jsonl_requires_simulate_live(tmp_path: Path) -> None:
     raw_path = _write_raw_jsonl(tmp_path / "raw.jsonl", _calibration_raw_frames())
     with pytest.raises(SystemExit):
         main(["--raw-jsonl", str(raw_path)])
+
+
+def test_wait_for_live_stream_ready_reports_connected_source(capsys) -> None:
+    source = FakeLiveStatsSource(client_connected=True, queue_size=1, total_received_frames=3)
+
+    _wait_for_live_stream_ready(
+        source,
+        "origin",
+        timeout=0.1,
+        poll_interval=0.001,
+        status_interval=0.001,
+    )
+
+    output = capsys.readouterr().out
+    assert "stream ready" in output
+    assert "client_connected=1" in output
+
+
+def test_wait_for_live_stream_ready_times_out_without_data() -> None:
+    source = FakeLiveStatsSource(client_connected=False, queue_size=0, total_received_frames=0)
+
+    with pytest.raises(TimeoutError, match="timed out waiting for live stream data"):
+        _wait_for_live_stream_ready(
+            source,
+            "origin",
+            timeout=0.005,
+            poll_interval=0.001,
+            status_interval=0.001,
+        )
+
+
+class FakeLiveStatsSource:
+    def __init__(
+        self,
+        *,
+        client_connected: bool,
+        queue_size: int,
+        total_received_frames: int,
+    ) -> None:
+        self.client_connected = client_connected
+        self._queue_size = queue_size
+        self.total_received_frames = total_received_frames
+
+    def stats_snapshot(self) -> dict:
+        return {
+            "client_connected": self.client_connected,
+            "queue_size": self._queue_size,
+            "total_received_frames": self.total_received_frames,
+            "running": True,
+            "stop_reason": None,
+        }
 
 
 def _write_raw_jsonl(path: Path, frames: list[dict]) -> Path:
