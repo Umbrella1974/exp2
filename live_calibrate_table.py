@@ -130,10 +130,17 @@ def _before_segment_callback(config: CalibrationLiveConfig, source: Any):
 
 def _progress_callback(config: CalibrationLiveConfig):
     def progress(summary: dict[str, Any]) -> None:
+        last_error = str(summary.get("last_error_message", ""))
+        if len(last_error) > 120:
+            last_error = last_error[:117] + "..."
         print(
             f"[{summary['label']}] elapsed={float(summary['duration_seconds']):.2f}s "
             f"valid={summary['valid_sample_count']} "
-            f"tracker={summary['tracker_valid_count']} hand={summary['hand_valid_count']}"
+            f"tracker={summary['tracker_valid_count']} hand={summary['hand_valid_count']} "
+            f"parse_error={summary.get('parse_error_count', 0)} "
+            f"raw_skeletons={summary.get('skeleton_count', 0)} "
+            f"raw_trackers={summary.get('tracker_count', 0)} "
+            f"last_error={last_error}"
         )
     return progress if config.print_every > 0 else None
 

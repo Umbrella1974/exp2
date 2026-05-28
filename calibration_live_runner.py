@@ -6,6 +6,7 @@ does not start trials, blocks, maps, or haptic hardware.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -163,6 +164,11 @@ def collect_calibration_segment(
         "frame_start": None,
         "frame_end": None,
         "points_world": [],
+        "last_error_message": "",
+        "first_raw_keys": [],
+        "first_raw_preview": "",
+        "skeleton_count": 0,
+        "tracker_count": 0,
     }
 
     live_start = time.monotonic()
@@ -225,6 +231,17 @@ def collect_calibration_segment(
         summary["received_frame_count"] += 1
         summary["end_monotonic_time"] = frame_time
         summary["duration_seconds"] = max(0.0, float(elapsed))
+        if not summary["first_raw_keys"]:
+            summary["first_raw_keys"] = processed["raw_keys"]
+            summary["first_raw_preview"] = processed["raw_preview"]
+        summary["skeleton_count"] = max(
+            int(summary["skeleton_count"]),
+            int(processed["skeleton_count"]),
+        )
+        summary["tracker_count"] = max(
+            int(summary["tracker_count"]),
+            int(processed["tracker_count"]),
+        )
         if summary["frame_start"] is None:
             summary["frame_start"] = processed["frame_index"]
         summary["frame_end"] = processed["frame_index"]
@@ -236,12 +253,16 @@ def collect_calibration_segment(
                 summary["hand_valid_count"] += 1
         else:
             summary["parse_error_count"] += 1
+            summary["last_error_message"] = processed["error_message"]
         if processed["parse_ok"] and not processed["adapter_ok"]:
             summary["adapter_error_count"] += 1
+            summary["last_error_message"] = processed["error_message"]
 
         point = processed["point_world"]
         if point is None:
             summary["invalid_sample_count"] += 1
+            if processed["error_message"]:
+                summary["last_error_message"] = processed["error_message"]
         else:
             summary["points_world"].append(point)
             summary["valid_sample_count"] += 1
@@ -526,7 +547,23 @@ def _process_input_frame(
         "hand_valid": bool(getattr(hand, "valid", False)),
         "point_world": point,
         "error_message": error_message,
+        "raw_keys": sorted(str(key) for key in raw.keys()) if isinstance(raw, dict) else [],
+        "raw_preview": _raw_preview(raw),
+        "skeleton_count": _list_count(raw.get("skeletons")) if isinstance(raw, dict) else 0,
+        "tracker_count": _list_count(raw.get("trackers")) if isinstance(raw, dict) else 0,
     }
+
+
+def _raw_preview(raw: Any, *, limit: int = 500) -> str:
+    try:
+        payload = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        payload = str(raw)
+    return payload[:limit]
+
+
+def _list_count(value: Any) -> int:
+    return len(value) if isinstance(value, list) else 0
 
 
 def _adapter_config(config: CalibrationLiveConfig) -> DeviceAdapterConfig:
