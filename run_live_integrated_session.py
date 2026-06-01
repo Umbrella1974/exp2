@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
-from threading import Event
+from threading import Event, Thread
 from typing import Any, Callable
 
 from calibration_io import (
@@ -45,6 +45,10 @@ from trial_controller import ExperimentInputSample
 
 
 InputFn = Callable[[str], str]
+
+
+class LiveGuiDependencyError(RuntimeError):
+    """Raised when --gui is requested but optional GUI dependencies are unavailable."""
 
 
 @dataclass(frozen=True)
@@ -80,6 +84,8 @@ class LiveIntegratedSessionConfig:
     task_z_half_extent: float = 5.0
     display_mode: str = "text"
     print_every: int = 30
+    gui: bool = False
+    gui_fps: float = 30.0
     anchor_current_pinch_debug: bool = False
     anchor_timeout_seconds: float = 10.0
     thumb_node: int = 4
@@ -113,6 +119,8 @@ def run_live_integrated_session(
     """Run a complete live calibration + trial session."""
 
     input_fn = input_fn or input
+    if config.gui:
+        _preflight_live_gui_dependencies()
     out_dir = Path(config.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_log_path = out_dir / "raw_frames.jsonl"
@@ -161,6 +169,9 @@ def run_live_integrated_session(
     logical_counts: Counter[str] = Counter()
     calibration_live_metrics_summary: dict[str, Any] = {}
     calibration_segment_time_mode: str | None = None
+    gui_snapshot_store: Any | None = None
+    gui_diagnostics_path: Path | None = None
+    gui_requested_stop = False
 
     def set_status(
         new_phase: LiveSessionPhase,
@@ -294,6 +305,13 @@ def run_live_integrated_session(
         set_status(LiveSessionPhase.READY_FOR_TRIAL, "Press Enter to start trial.", map_id=map_config.map_id)
         _prompt(input_fn, "Press Enter to start trial...")
         set_status(LiveSessionPhase.TRIAL_RUNNING, "Trial running.", map_id=map_config.map_id)
+        if config.gui:
+            gui_snapshot_store = _make_latest_snapshot_store()
+            gui_diagnostics_path = (
+                session_dir / "gui_diagnostics.csv"
+                if session_recorder is not None
+                else out_dir / "gui_diagnostics.csv"
+            )
 
         display_counter = {"processed": 0}
 
@@ -318,11 +336,26 @@ def run_live_integrated_session(
             map_id=map_config.map_id,
             calibration_id=calibration.calibration_id,
             display_callback=display_snapshot,
+            snapshot_callback=gui_snapshot_store.publish if gui_snapshot_store is not None else None,
             source_stop_reason_getter=lambda: _source_stop_reason_from_pump(pump),
             source_stats_getter=lambda: pump.stats_snapshot(),
             user_quit_checker=_user_requested_quit,
         )
-        live_trial_result = live_trial_runner.run_until_done()
+        if gui_snapshot_store is not None:
+            live_trial_result = _run_live_trial_with_gui(
+                live_trial_runner,
+                snapshot_store=gui_snapshot_store,
+                trial_config=trial_config,
+                gui_fps=config.gui_fps,
+                log_path=gui_diagnostics_path,
+                runtime_stats_getter=lambda: _live_gui_runtime_stats(
+                    snapshot_store=gui_snapshot_store,
+                    live_trial_runner=live_trial_runner,
+                    pump=pump,
+                ),
+            )
+        else:
+            live_trial_result = live_trial_runner.run_until_done()
         trial_runner_summary = dict(live_trial_result.summary)
         trial_stats = live_trial_result.stats
         run_stop_reason = trial_stats.run_stop_reason
@@ -396,6 +429,9 @@ def run_live_integrated_session(
             pump_stop_reason=pump_stop_reason_at_stop,
             trial_controller_started=trial_controller_started,
             errors=errors,
+            gui_snapshot_store=gui_snapshot_store,
+            gui_diagnostics_path=gui_diagnostics_path,
+            gui_requested_stop=gui_requested_stop,
         )
         if trial_runner_summary:
             _merge_live_trial_runner_summary(summary, trial_runner_summary)
@@ -427,7 +463,11 @@ def main(argv: list[str] | None = None) -> int:
 
     args = _parse_args(argv)
     config = _config_from_args(args)
-    result = run_live_integrated_session(config)
+    try:
+        result = run_live_integrated_session(config)
+    except LiveGuiDependencyError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     print(json.dumps(result.summary, indent=2, ensure_ascii=False, sort_keys=True))
     if result.summary.get("run_stop_reason") in {"completed", "max_frames", "duration_reached", "user_quit"}:
         return 0
@@ -830,13 +870,17 @@ def _build_summary(
     pump_stop_reason: str | None,
     trial_controller_started: bool,
     errors: list[str],
+    gui_snapshot_store: Any | None,
+    gui_diagnostics_path: Path | None,
+    gui_requested_stop: bool,
 ) -> dict[str, Any]:
     stats = pump.stats_snapshot()
     buffer_stats = buffer.stats_snapshot()
     total_received = stats.get("total_received_frames")
     if total_received is None:
         total_received = buffer_stats.put_count
-    return {
+    gui_summary = _live_gui_summary(config, gui_snapshot_store, gui_diagnostics_path, gui_requested_stop)
+    summary = {
         "mode": "live_integrated_session",
         "is_live_trial": True,
         "is_formal_experiment": False,
@@ -891,6 +935,8 @@ def _build_summary(
             *map_warnings,
         ],
     }
+    summary.update(gui_summary)
+    return summary
 
 
 class _StatusPrinter:
@@ -968,6 +1014,154 @@ def _write_live_raw_frame(handle: Any, frame: LiveRawFrame) -> None:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+
+def _preflight_live_gui_dependencies() -> None:
+    try:
+        from debug_gui import GuiDependencyError, preflight_gui_dependencies
+    except ImportError as exc:
+        raise LiveGuiDependencyError("Missing GUI dependencies. Install with: pip install PySide6 pyqtgraph") from exc
+
+    try:
+        preflight_gui_dependencies()
+    except GuiDependencyError as exc:
+        raise LiveGuiDependencyError(str(exc)) from exc
+
+
+def _make_latest_snapshot_store() -> Any:
+    from latest_snapshot_store import LatestSnapshotStore
+
+    return LatestSnapshotStore()
+
+
+def _run_live_trial_with_gui(
+    live_trial_runner: LiveTrialRunner,
+    *,
+    snapshot_store: Any,
+    trial_config: dict[str, Any],
+    gui_fps: float,
+    log_path: Path | None,
+    runtime_stats_getter: Callable[[], dict[str, Any]],
+) -> Any:
+    result_holder: dict[str, Any] = {}
+
+    def trial_worker() -> None:
+        try:
+            result_holder["result"] = live_trial_runner.run_until_done()
+        except BaseException as exc:
+            result_holder["error"] = exc
+
+    thread = Thread(target=trial_worker, name="LiveTrialRunnerGUIWorker", daemon=False)
+    thread.start()
+    try:
+        _run_live_debug_gui(
+            snapshot_store=snapshot_store,
+            trial_config=trial_config,
+            gui_fps=gui_fps,
+            log_path=log_path,
+            runtime_stats_getter=runtime_stats_getter,
+        )
+    except KeyboardInterrupt:
+        snapshot_store.mark_gui_closed()
+        live_trial_runner.request_stop("keyboard_interrupt")
+        thread.join()
+        raise
+    except Exception:
+        live_trial_runner.request_stop("gui_error")
+        thread.join()
+        raise
+
+    thread.join()
+    if "error" in result_holder:
+        error = result_holder["error"]
+        if isinstance(error, BaseException):
+            raise error
+        raise RuntimeError(str(error))
+    if "result" not in result_holder:
+        raise RuntimeError("live trial worker exited without a result.")
+    return result_holder["result"]
+
+
+def _run_live_debug_gui(
+    *,
+    snapshot_store: Any,
+    trial_config: dict[str, Any],
+    gui_fps: float,
+    log_path: Path | None,
+    runtime_stats_getter: Callable[[], dict[str, Any]],
+) -> int:
+    try:
+        from debug_gui import GuiDependencyError, run_debug_gui
+        from debug_view_model import scene_view_from_trial_config
+    except ImportError as exc:
+        raise LiveGuiDependencyError("Missing GUI dependencies. Install with: pip install PySide6 pyqtgraph") from exc
+
+    try:
+        return run_debug_gui(
+            snapshot_store=snapshot_store,
+            scene=scene_view_from_trial_config(trial_config),
+            mode="live",
+            gui_fps=gui_fps,
+            title="Exp2 Live Debug GUI",
+            runtime_stats_getter=runtime_stats_getter,
+            log_path=log_path,
+        )
+    except GuiDependencyError as exc:
+        raise LiveGuiDependencyError(str(exc)) from exc
+
+
+def _live_gui_runtime_stats(
+    *,
+    snapshot_store: Any,
+    live_trial_runner: LiveTrialRunner,
+    pump: LatestFramePump,
+) -> dict[str, Any]:
+    store_stats = snapshot_store.stats_snapshot()
+    runner_stats = live_trial_runner.stats_snapshot()
+    pump_stats = pump.stats_snapshot()
+    return {
+        "mode": "live",
+        "total_received_frames": runner_stats.total_received_frames,
+        "parse_error_count": runner_stats.parse_error_count,
+        "raw_dropped_frame_count": int(pump_stats.get("dropped_frame_count", 0) or 0),
+        "overwritten_snapshot_count": store_stats.overwritten_snapshot_count,
+    }
+
+
+def _live_gui_summary(
+    config: LiveIntegratedSessionConfig,
+    snapshot_store: Any | None,
+    diagnostics_path: Path | None,
+    gui_requested_stop: bool,
+) -> dict[str, Any]:
+    if snapshot_store is None:
+        return {
+            "gui_enabled": bool(config.gui),
+            "gui_closed": False,
+            "gui_requested_stop": bool(gui_requested_stop),
+            "gui_fps": float(config.gui_fps) if config.gui else None,
+            "gui_diagnostics_path": str(diagnostics_path) if diagnostics_path is not None else None,
+            "gui_snapshot_update_count": 0,
+            "gui_overwritten_snapshot_count": 0,
+            "gui_last_frame_index": None,
+            "gui_close_time": None,
+        }
+
+    stats = snapshot_store.stats_snapshot()
+    close_time = None
+    if stats.gui_close_wall_time is not None:
+        close_time = datetime.fromtimestamp(stats.gui_close_wall_time).isoformat(timespec="seconds")
+    return {
+        "gui_enabled": bool(config.gui),
+        "gui_closed": bool(stats.gui_closed),
+        "gui_requested_stop": bool(gui_requested_stop),
+        "gui_fps": float(config.gui_fps),
+        "gui_diagnostics_path": str(diagnostics_path) if diagnostics_path is not None else None,
+        "gui_snapshot_update_count": int(stats.update_count),
+        "gui_overwritten_snapshot_count": int(stats.overwritten_snapshot_count),
+        "gui_last_frame_index": stats.last_frame_index,
+        "gui_close_time": close_time,
+    }
 
 
 def _default_session_dir(out_dir: Path) -> Path:
@@ -1155,6 +1349,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--task-z-half-extent", default=5.0, type=float)
     parser.add_argument("--display-mode", choices=("text", "none"), default="text")
     parser.add_argument("--print-every", default=30, type=int)
+    parser.add_argument("--gui", action="store_true", help="Open the debug display during trial running.")
+    parser.add_argument("--gui-fps", default=30.0, type=float)
     parser.add_argument("--anchor-current-pinch-debug", action="store_true")
     parser.add_argument("--anchor-timeout-seconds", default=10.0, type=float)
     parser.add_argument("--thumb-node", default=4, type=int)
@@ -1182,6 +1378,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--duration-seconds must be > 0.")
     if args.print_every < 0:
         parser.error("--print-every must be >= 0.")
+    if args.gui_fps <= 0.0:
+        parser.error("--gui-fps must be > 0.")
     if args.task_z_half_extent <= 0.0:
         parser.error("--task-z-half-extent must be > 0.")
     if args.anchor_timeout_seconds <= 0.0:
@@ -1228,6 +1426,8 @@ def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
         task_z_half_extent=args.task_z_half_extent,
         display_mode=args.display_mode,
         print_every=args.print_every,
+        gui=args.gui,
+        gui_fps=args.gui_fps,
         anchor_current_pinch_debug=args.anchor_current_pinch_debug,
         anchor_timeout_seconds=args.anchor_timeout_seconds,
         thumb_node=args.thumb_node,

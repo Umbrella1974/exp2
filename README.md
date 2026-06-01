@@ -629,6 +629,8 @@ python analyze_session.py --session-dir data\live_integrated_session\debug_01\se
 --task-z-half-extent             默认 5.0，仅配合 --ignore-task-z
 --display-mode                   text / none，默认 text
 --print-every                    默认 30
+--gui                            debug display，在 trial running 阶段打开 GUI
+--gui-fps                        默认 30，GUI 轮询/刷新频率
 --anchor-current-pinch-debug     debug only，默认关闭
 --stream-wait-timeout-seconds    默认 60，等不到任何 raw frame 会安全退出
 --valid-tracker-timeout-seconds  默认 60，等不到 tracker_valid=True 会安全退出
@@ -647,6 +649,28 @@ python run_live_integrated_session.py ^
   --duration-seconds 60 ^
   --display-mode text
 ```
+
+如果要同时打开 live debug GUI，先安装可选 GUI 依赖：
+
+```powershell
+pip install PySide6 pyqtgraph
+```
+
+然后加 `--gui`：
+
+```powershell
+python run_live_integrated_session.py ^
+  --map-config maps\examples\xoy_turn.json ^
+  --host 127.0.0.1 ^
+  --port 8888 ^
+  --out-dir data\live_integrated_session\debug_gui_01 ^
+  --duration-seconds 60 ^
+  --display-mode text ^
+  --gui ^
+  --gui-fps 30
+```
+
+这个 GUI 是 debug display，不是正式实验 lifecycle GUI。它只在 trial running 阶段订阅 `DashboardSnapshot`，calibration / waiting 阶段不伪造 snapshot；窗口刚打开但还没有 trial snapshot 时只显示 waiting 文本。
 
 如果一直没有发送端连接，或连接后一直没有有效 tracker，runner 不会无限等待；它会写 `out_dir/summary.json` 后退出。常见停止原因：
 
@@ -688,6 +712,7 @@ out_dir/session/processed_frames.csv
 out_dir/session/events.csv
 out_dir/session/haptic.csv
 out_dir/session/trial_summary.json
+out_dir/session/gui_diagnostics.csv       仅 --gui 时，优先写入这里
 ```
 
 校验 calibration / trial_config / session_meta 是否使用同一个 calibration：
@@ -738,6 +763,13 @@ live_trial_runner_summary
 callback_error_count
 mean_callback_latency_ms
 max_callback_latency_ms
+gui_enabled
+gui_closed
+gui_requested_stop
+gui_snapshot_update_count
+gui_overwritten_snapshot_count
+gui_diagnostics_path
+gui_close_time
 ```
 
 调试这层结构时可以只跑：
@@ -746,9 +778,9 @@ max_callback_latency_ms
 pytest -q tests/test_live_trial_runner.py tests/test_live_integrated_session.py
 ```
 
-### Stage 5D Replay Debug GUI Prototype
+### Stage 5D Replay / Live Debug GUI Prototype
 
-`run_replay_debug_gui.py` 是第一版实验员调试 GUI 原型，当前优先支持 replay debug。GUI 本身只消费 `DashboardSnapshot`，不直接读 socket、不直接读 raw JSONL 推进 trial，也不实现 parser / adapter / TrialController / BlockController 逻辑。
+`run_replay_debug_gui.py` 和 `run_live_integrated_session.py --gui` 共用第一版实验员调试 GUI 原型。GUI 本身只消费 `DashboardSnapshot`，不直接读 socket、不直接读 raw JSONL 推进 trial，也不实现 parser / adapter / TrialController / BlockController 逻辑。
 
 内部数据流是：
 
@@ -758,6 +790,12 @@ raw/session replay runner
   -> DashboardSnapshot
   -> LatestSnapshotStore
   -> Debug GUI
+
+live integrated runner
+  -> LiveTrialRunner worker thread
+  -> DashboardSnapshot
+  -> LatestSnapshotStore
+  -> Debug GUI on main thread
 ```
 
 安装 GUI 依赖：
@@ -799,7 +837,20 @@ fast     不等待，适合测试或快速 smoke
 
 当前 GUI 显示 x-y task view：track boxes、target、block start footprint、当前 block、当前 pinch，以及右侧状态面板。z 方向第一版以数值显示。GUI Close 只关闭显示层，不直接修改 `TrialController` / `BlockController`，也不接 haptic hardware。缺少 `PySide6` / `pyqtgraph` 时，入口会提示安装命令；非 GUI 测试不依赖这两个包。
 
-当前后置项：`run_live_integrated_session.py --gui` 尚未接入。第一版先保证 replay GUI 和非 GUI 核心层稳定，live GUI 后续再通过同一个 `LatestSnapshotStore` 接 `LiveTrialRunner.snapshot_callback`。
+live `--gui` 的线程模型是：Qt GUI event loop 在主线程运行；`LiveTrialRunner.run_until_done()` 在 worker 线程运行；`snapshot_callback` 只做轻量 `LatestSnapshotStore.publish(snapshot)`。如果 GUI 刷新慢，store 只保留最新 snapshot，不排队旧帧，避免显示延迟越积越大。
+
+live `--gui` 的关闭语义：
+
+```text
+GUI Close 只关闭显示层，不 stop trial/session
+不实现 Stop / Abort / Pause / Resume
+trial ended 后 GUI 保留最后一帧，不自动关闭
+summary/session finalize 会等用户关闭 GUI 后继续
+```
+
+live `--gui` 的 runtime stats 第一版显示已有且可靠的字段：snapshot age、GUI fps/render lag、overwritten snapshot count、raw dropped frames、parse errors。`receive_fps` 如果没有可靠来源，显示为 N/A，不硬造。
+
+已知风险：当前 live `--gui` 是 debug display，不是正式实验 lifecycle GUI。在 Windows/Qt 下，`Ctrl+C` 行为可能不如纯 CLI 模式直接；如果需要停止整个 run，仍依赖现有 runner 的 `KeyboardInterrupt` / `request_stop` / `stop_event` 机制。后续正式 GUI 阶段需要单独设计 Stop / Abort / Pause / Resume 和完整生命周期控制。
 
 ## `analyze_session.py`
 

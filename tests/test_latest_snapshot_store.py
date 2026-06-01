@@ -55,4 +55,7 @@ def test_mark_gui_closed_is_reported() -> None:
 
     store.mark_gui_closed()
 
-    assert store.stats_snapshot().gui_closed is True
+    stats = store.stats_snapshot()
+    assert stats.gui_closed is True
+    assert stats.gui_close_monotonic is not None
+    assert stats.gui_close_wall_time is not None

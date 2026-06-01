@@ -57,6 +57,97 @@ def test_integrated_session_completes_and_keeps_calibration_consistent(tmp_path:
     assert result.summary["calibration_segment_time_mode"] == "monotonic_live"
     assert result.summary["live_trial_runner_summary"]["trial_id"] == "trial_001"
     assert result.summary["live_trial_runner_summary"]["total_processed_frames"] == 3
+    assert result.summary["gui_enabled"] is False
+    assert result.summary["gui_closed"] is False
+    assert result.summary["gui_requested_stop"] is False
+
+
+def test_no_gui_does_not_preflight_gui_dependencies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FakeLiveSource()
+    config = _config(tmp_path, calibration_id="cal_no_gui_preflight", max_frames=1)
+
+    def unexpected_preflight() -> None:
+        raise AssertionError("GUI preflight should not run without --gui")
+
+    monkeypatch.setattr(runner, "_preflight_live_gui_dependencies", unexpected_preflight)
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    assert result.summary["run_stop_reason"] == "max_frames"
+    assert result.summary["gui_enabled"] is False
+
+
+def test_live_gui_publishes_snapshots_and_close_does_not_stop_trial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FakeLiveSource()
+    config = _config(tmp_path, calibration_id="cal_gui", max_frames=3, gui=True, gui_fps=12.0)
+    gui_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner, "_preflight_live_gui_dependencies", lambda: None)
+
+    def fake_debug_gui(**kwargs: Any) -> int:
+        store = kwargs["snapshot_store"]
+        deadline = time.monotonic() + 1.0
+        while store.stats_snapshot().update_count < 1 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        gui_calls.append(
+            {
+                "trial_config": kwargs["trial_config"],
+                "gui_fps": kwargs["gui_fps"],
+                "log_path": kwargs["log_path"],
+                "runtime": kwargs["runtime_stats_getter"](),
+                "updates_before_close": store.stats_snapshot().update_count,
+            }
+        )
+        store.mark_gui_closed()
+        return 0
+
+    monkeypatch.setattr(runner, "_run_live_debug_gui", fake_debug_gui)
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    assert result.summary["run_stop_reason"] == "max_frames"
+    assert result.summary["total_processed_frames"] == 3
+    assert result.summary["gui_enabled"] is True
+    assert result.summary["gui_closed"] is True
+    assert result.summary["gui_requested_stop"] is False
+    assert result.summary["gui_snapshot_update_count"] == 3
+    assert result.summary["gui_overwritten_snapshot_count"] >= 0
+    gui_diagnostics_path = Path(result.summary["gui_diagnostics_path"])
+    assert gui_diagnostics_path.name == "gui_diagnostics.csv"
+    assert gui_diagnostics_path.parent.name == "session"
+    assert gui_calls
+    assert gui_calls[0]["gui_fps"] == pytest.approx(12.0)
+    assert gui_calls[0]["trial_config"]["map_id"] == "test_map"
+    assert gui_calls[0]["runtime"]["mode"] == "live"
+    assert gui_calls[0]["runtime"]["raw_dropped_frame_count"] == 0
+    assert gui_calls[0]["updates_before_close"] >= 1
+
+
+def test_live_gui_dependency_failure_happens_before_live_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FakeLiveSource()
+    config = _config(tmp_path, calibration_id="cal_gui_missing", max_frames=1, gui=True)
+
+    def failing_preflight() -> None:
+        raise runner.LiveGuiDependencyError(
+            "Missing GUI dependencies. Install with: pip install PySide6 pyqtgraph"
+        )
+
+    monkeypatch.setattr(runner, "_preflight_live_gui_dependencies", failing_preflight)
+
+    with pytest.raises(runner.LiveGuiDependencyError):
+        run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    assert source._running is False
+    assert not (tmp_path / "out").exists()
 
 
 def test_debug_anchor_is_explicitly_marked(tmp_path: Path) -> None:
@@ -462,6 +553,8 @@ def _config(
     stream_wait_timeout_seconds: float = 60.0,
     valid_tracker_timeout_seconds: float = 60.0,
     no_frame_timeout_seconds: float = 5.0,
+    gui: bool = False,
+    gui_fps: float = 30.0,
 ) -> LiveIntegratedSessionConfig:
     return LiveIntegratedSessionConfig(
         map_config=map_path or _write_valid_map(tmp_path / "map.json"),
@@ -479,6 +572,8 @@ def _config(
         max_frames=max_frames,
         display_mode=display_mode,
         print_every=print_every,
+        gui=gui,
+        gui_fps=gui_fps,
         anchor_current_pinch_debug=anchor_current_pinch_debug,
         anchor_timeout_seconds=1.0,
         stream_wait_timeout_seconds=stream_wait_timeout_seconds,

@@ -24,6 +24,8 @@ class LatestSnapshotStoreStats:
     has_snapshot: bool
     has_unread_snapshot: bool
     gui_closed: bool
+    gui_close_monotonic: float | None
+    gui_close_wall_time: float | None
 
     @property
     def dropped_snapshot_count(self) -> int:
@@ -45,6 +47,8 @@ class LatestSnapshotStore:
         self._last_update_monotonic: float | None = None
         self._has_unread_snapshot = False
         self._gui_closed = False
+        self._gui_close_monotonic: float | None = None
+        self._gui_close_wall_time: float | None = None
 
     def publish(self, snapshot: Any) -> None:
         """Publish a new snapshot, replacing any unread older snapshot."""
@@ -82,6 +86,8 @@ class LatestSnapshotStore:
 
         with self._lock:
             self._gui_closed = True
+            self._gui_close_monotonic = time.monotonic()
+            self._gui_close_wall_time = time.time()
 
     def stats_snapshot(self) -> LatestSnapshotStoreStats:
         """Return immutable store diagnostics."""
@@ -96,6 +102,8 @@ class LatestSnapshotStore:
                 has_snapshot=self._snapshot is not None,
                 has_unread_snapshot=self._has_unread_snapshot,
                 gui_closed=self._gui_closed,
+                gui_close_monotonic=self._gui_close_monotonic,
+                gui_close_wall_time=self._gui_close_wall_time,
             )
 
 
