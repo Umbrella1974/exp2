@@ -18,12 +18,18 @@ class LatestSnapshotStoreStats:
 
     update_count: int
     read_count: int
-    dropped_snapshot_count: int
+    overwritten_snapshot_count: int
     last_frame_index: int | None
     last_update_monotonic: float | None
     has_snapshot: bool
     has_unread_snapshot: bool
     gui_closed: bool
+
+    @property
+    def dropped_snapshot_count(self) -> int:
+        """Compatibility alias; prefer overwritten_snapshot_count."""
+
+        return self.overwritten_snapshot_count
 
 
 class LatestSnapshotStore:
@@ -34,7 +40,7 @@ class LatestSnapshotStore:
         self._snapshot: Any | None = None
         self._update_count = 0
         self._read_count = 0
-        self._dropped_snapshot_count = 0
+        self._overwritten_snapshot_count = 0
         self._last_frame_index: int | None = None
         self._last_update_monotonic: float | None = None
         self._has_unread_snapshot = False
@@ -45,7 +51,7 @@ class LatestSnapshotStore:
 
         with self._lock:
             if self._has_unread_snapshot:
-                self._dropped_snapshot_count += 1
+                self._overwritten_snapshot_count += 1
             self._snapshot = snapshot
             self._update_count += 1
             self._last_frame_index = _frame_index(snapshot)
@@ -84,7 +90,7 @@ class LatestSnapshotStore:
             return LatestSnapshotStoreStats(
                 update_count=self._update_count,
                 read_count=self._read_count,
-                dropped_snapshot_count=self._dropped_snapshot_count,
+                overwritten_snapshot_count=self._overwritten_snapshot_count,
                 last_frame_index=self._last_frame_index,
                 last_update_monotonic=self._last_update_monotonic,
                 has_snapshot=self._snapshot is not None,

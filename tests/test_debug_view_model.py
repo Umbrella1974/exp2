@@ -64,7 +64,13 @@ def test_snapshot_to_debug_view_model_computes_delta_and_status_text() -> None:
     view_model = snapshot_to_debug_view_model(
         snapshot,
         scene=scene,
-        runtime=DebugRuntimeStats(mode="replay", snapshot_age_seconds=0.05, gui_fps=30.0),
+        runtime=DebugRuntimeStats(
+            mode="replay",
+            snapshot_age_seconds=0.05,
+            gui_fps=30.0,
+            overwritten_snapshot_count=2,
+            raw_dropped_frame_count=1,
+        ),
     )
 
     assert view_model.delta_task == [0.1, 0.2, 0.3]
@@ -72,6 +78,9 @@ def test_snapshot_to_debug_view_model_computes_delta_and_status_text() -> None:
     assert view_model.main_state_label == "MOVING"
     assert any(line == "mode: replay" for line in view_model.status_lines)
     assert any("snapshot_age" in line for line in view_model.status_lines)
+    assert "overwritten snapshots: 2" in view_model.status_lines
+    assert "raw_dropped_frames: 1" in view_model.status_lines
+    assert all(not line.startswith("dropped_frames:") for line in view_model.status_lines)
 
 
 def test_calculate_debug_view_range_includes_map_block_and_pinch() -> None:

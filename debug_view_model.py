@@ -55,9 +55,16 @@ class DebugRuntimeStats:
     render_lag_ms: float | None = None
     total_received_frames: int | None = None
     parse_error_count: int | None = None
-    dropped_frame_count: int | None = None
+    raw_dropped_frame_count: int | None = None
+    overwritten_snapshot_count: int | None = None
     receive_fps: float | None = None
     warnings: tuple[str, ...] = ()
+
+    @property
+    def dropped_frame_count(self) -> int | None:
+        """Compatibility alias for raw stream dropped frames."""
+
+        return self.raw_dropped_frame_count
 
 
 @dataclass(frozen=True)
@@ -282,8 +289,10 @@ def build_status_lines(
         lines.append(f"received_frames: {runtime.total_received_frames}")
     if runtime.parse_error_count is not None:
         lines.append(f"parse_errors: {runtime.parse_error_count}")
-    if runtime.dropped_frame_count is not None:
-        lines.append(f"dropped_frames: {runtime.dropped_frame_count}")
+    if runtime.raw_dropped_frame_count is not None:
+        lines.append(f"raw_dropped_frames: {runtime.raw_dropped_frame_count}")
+    if runtime.overwritten_snapshot_count is not None:
+        lines.append(f"overwritten snapshots: {runtime.overwritten_snapshot_count}")
     if runtime.receive_fps is not None:
         lines.append(f"receive_fps: {_format_optional_float(runtime.receive_fps, 'Hz')}")
     return tuple(lines)

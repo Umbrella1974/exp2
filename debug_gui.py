@@ -25,6 +25,12 @@ class GuiDependencyError(RuntimeError):
 RuntimeStatsGetter = Callable[[], dict[str, Any]]
 
 
+def preflight_gui_dependencies() -> None:
+    """Fail early if optional GUI dependencies are missing."""
+
+    _load_gui_deps()
+
+
 def run_debug_gui(
     *,
     snapshot_store: LatestSnapshotStore,
@@ -156,7 +162,13 @@ class _DebugGuiWindow:
             render_lag_ms=None,
             total_received_frames=_optional_int(runtime_payload.get("total_received_frames")),
             parse_error_count=_optional_int(runtime_payload.get("parse_error_count")),
-            dropped_frame_count=_optional_int(runtime_payload.get("dropped_frame_count")),
+            raw_dropped_frame_count=_optional_int(runtime_payload.get("raw_dropped_frame_count")),
+            overwritten_snapshot_count=_optional_int(
+                runtime_payload.get(
+                    "overwritten_snapshot_count",
+                    runtime_payload.get("dropped_gui_snapshot_count"),
+                )
+            ),
             receive_fps=_optional_float(runtime_payload.get("receive_fps")),
             warnings=tuple(runtime_payload.get("warnings", ()) or ()),
         )

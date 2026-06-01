@@ -13,7 +13,12 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from debug_gui import GuiDependencyError, INSTALL_GUI_DEPS_MESSAGE, run_debug_gui
+from debug_gui import (
+    GuiDependencyError,
+    INSTALL_GUI_DEPS_MESSAGE,
+    preflight_gui_dependencies,
+    run_debug_gui,
+)
 from latest_snapshot_store import LatestSnapshotStore
 from replay_debug_runner import ReplayDebugConfig, load_replay_debug_inputs, run_replay_debug
 
@@ -37,6 +42,12 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result.summary, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
 
+    try:
+        preflight_gui_dependencies()
+    except GuiDependencyError:
+        print(INSTALL_GUI_DEPS_MESSAGE, file=sys.stderr)
+        return 1
+
     result_holder: dict[str, Any] = {}
 
     def replay_worker() -> None:
@@ -58,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime_stats_getter=lambda: {
                 "mode": "replay",
                 "total_received_frames": store.stats_snapshot().update_count,
-                "dropped_frame_count": store.stats_snapshot().dropped_snapshot_count,
+                "overwritten_snapshot_count": store.stats_snapshot().overwritten_snapshot_count,
             },
         )
     except GuiDependencyError:

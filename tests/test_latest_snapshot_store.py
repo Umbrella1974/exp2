@@ -23,6 +23,7 @@ def test_latest_snapshot_store_keeps_only_newest_snapshot() -> None:
     stats = store.stats_snapshot()
     assert stats.update_count == 2
     assert stats.read_count == 1
+    assert stats.overwritten_snapshot_count == 1
     assert stats.dropped_snapshot_count == 1
     assert stats.last_frame_index == 2
     assert stats.has_unread_snapshot is False

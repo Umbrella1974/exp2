@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+import run_replay_debug_gui
+from debug_gui import GuiDependencyError
 from latest_snapshot_store import LatestSnapshotStore
 from replay_debug_runner import ReplayDebugConfig, load_replay_debug_inputs, run_replay_debug
 from run_replay_debug_gui import main as replay_gui_main
@@ -109,6 +111,43 @@ def test_replay_debug_gui_headless_entrypoint(tmp_path: Path, capsys: pytest.Cap
     captured = capsys.readouterr()
     assert exit_code == 0
     assert '"mode": "replay_debug_gui"' in captured.out
+
+
+def test_replay_debug_gui_dependency_preflight_happens_before_worker_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    worker_started = {"value": False}
+
+    def failing_preflight() -> None:
+        raise GuiDependencyError("missing gui deps")
+
+    def unexpected_replay(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        worker_started["value"] = True
+        raise AssertionError("replay worker should not start before GUI preflight")
+
+    monkeypatch.setattr(run_replay_debug_gui, "preflight_gui_dependencies", failing_preflight)
+    monkeypatch.setattr(run_replay_debug_gui, "run_replay_debug", unexpected_replay)
+
+    exit_code = replay_gui_main(
+        [
+            "--raw-jsonl",
+            str(_write_raw_jsonl(tmp_path / "raw_frames.jsonl")),
+            "--calibration-json",
+            str(_write_task_calibration(tmp_path / "calibration.json")),
+            "--trial-config-json",
+            str(_write_trial_config(tmp_path / "trial_config.json")),
+            "--replay-timing",
+            "fast",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert worker_started["value"] is False
+    assert "pip install PySide6 pyqtgraph" in captured.err
 
 
 def _write_raw_jsonl(path: Path) -> Path:
