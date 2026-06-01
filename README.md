@@ -70,7 +70,7 @@ pytest -q tests/test_map_config.py tests/test_map_generator.py
 pytest -q tests/test_calibration_geometry.py tests/test_calibration_io.py tests/test_calibration_sampling.py
 pytest -q tests/test_calibrate_from_raw_jsonl_table.py tests/test_offline_replay_formal_calibrated.py
 pytest -q tests/test_live_raw_stream.py tests/test_run_live_raw_preview.py
-pytest -q tests/test_latest_frame_buffer.py tests/test_live_integrated_session.py
+pytest -q tests/test_latest_frame_buffer.py tests/test_live_trial_runner.py tests/test_live_integrated_session.py
 pytest -q tests/test_trial_controller.py tests/test_block_controller.py
 ```
 
@@ -712,6 +712,38 @@ warning = Map was translated to current pinch for debugging; this is not a forma
 run_stop_reason = keyboard_interrupt
 phase_at_stop
 session_finalized
+```
+
+### Stage 5C LiveTrialRunner 结构
+
+Stage 5C 之后，`run_live_integrated_session.py` 仍然负责完整流程编排：等待 live stream、采集四段 calibration、确认 calibration、加载 `MapConfig`、创建 `SessionRecorder`、保存 summary/session。真正的 trial 实时控制循环已经抽到 `live_trial_runner.py`：
+
+```text
+LatestFrameBuffer
+  -> parse_raw_manus_vive_frame()
+  -> ManusViveExperimentAdapter
+  -> TrialController.update()
+  -> SessionRecorder
+  -> DashboardSnapshot callback
+```
+
+`LiveTrialRunner` 不做 calibration、不验证地图、不画 GUI、不发送真实 haptic hardware。它只接收已经准备好的 `TaskCoordinateSystem`、`TrackRegion`、`EngineConfig`、`SessionRecorder` 和 latest-frame buffer，然后按固定频率推进现有 `TrialController`。这次重构不改 `BlockController` / `TrialController` 的 contact、slip、blocked 语义。
+
+GUI 后续可以订阅 `snapshot_callback(snapshot)`，显示层不需要直接调用 `TrialController`。如果 callback 抛异常，runner 会继续运行，并在 summary 中记录 `callback_error_count`、`mean_callback_latency_ms`、`max_callback_latency_ms` 和 warning。真实 haptic hardware 以后应通过独立 sink 接入；当前 integrated session 仍写逻辑 haptic 状态，但 `haptic_hardware_enabled=false`。
+
+`run_live_integrated_session.py` 的输出仍保持旧字段为主，同时会额外写：
+
+```text
+live_trial_runner_summary
+callback_error_count
+mean_callback_latency_ms
+max_callback_latency_ms
+```
+
+调试这层结构时可以只跑：
+
+```powershell
+pytest -q tests/test_live_trial_runner.py tests/test_live_integrated_session.py
 ```
 
 ## `analyze_session.py`

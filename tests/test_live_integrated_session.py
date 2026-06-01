@@ -55,6 +55,8 @@ def test_integrated_session_completes_and_keeps_calibration_consistent(tmp_path:
     assert result.summary["latest_buffer_last_frame_index"] is not None
     assert result.summary["latest_buffer_overwritten_frame_count"] >= 0
     assert result.summary["calibration_segment_time_mode"] == "monotonic_live"
+    assert result.summary["live_trial_runner_summary"]["trial_id"] == "trial_001"
+    assert result.summary["live_trial_runner_summary"]["total_processed_frames"] == 3
 
 
 def test_debug_anchor_is_explicitly_marked(tmp_path: Path) -> None:
@@ -125,7 +127,7 @@ def test_keyboard_interrupt_during_trial_finalizes_session(
     source = FakeLiveSource()
     config = _config(tmp_path, calibration_id="cal_interrupt_trial", max_frames=None)
     trial_started = {"value": False}
-    original_parse = runner._parse_and_adapt
+    original_step_once = runner.LiveTrialRunner.step_once
 
     def input_fn(message: str) -> str:
         _set_mode_from_prompt(source, message)
@@ -133,12 +135,12 @@ def test_keyboard_interrupt_during_trial_finalizes_session(
             trial_started["value"] = True
         return ""
 
-    def raising_parse(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    def raising_step_once(self: Any) -> Any:
         if trial_started["value"]:
             raise KeyboardInterrupt
-        return original_parse(*args, **kwargs)
+        return original_step_once(self)
 
-    monkeypatch.setattr(runner, "_parse_and_adapt", raising_parse)
+    monkeypatch.setattr(runner.LiveTrialRunner, "step_once", raising_step_once)
 
     result = runner.run_live_integrated_session(config, source=source, input_fn=input_fn)
 

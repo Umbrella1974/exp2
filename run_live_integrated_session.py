@@ -15,7 +15,6 @@ from statistics import mean
 from threading import Event
 from typing import Any, Callable
 
-from block_controller import BlockController
 from calibration_io import (
     FORMAL_CALIBRATION_TYPE,
     FormalCalibration,
@@ -25,11 +24,12 @@ from calibration_io import (
 )
 from calibration_live_runner import CalibrationLiveConfig, CalibrationSegmentSpec, run_live_table_calibration
 from config import EngineConfig
-from dashboard_snapshot import build_compact_status_line, build_dashboard_snapshot
+from dashboard_snapshot import build_compact_status_line
 from device_frame_models import DeviceAdapterConfig
 from latest_frame_buffer import LatestFrameBuffer, LatestFramePump
 from live_raw_stream import LiveRawFrame, LiveRawStreamServer
 from live_session_state import LiveSessionPhase, LiveSessionStatus
+from live_trial_runner import LiveTrialRunner, LiveTrialRunnerConfig
 from manus_vive_adapter import ManusViveExperimentAdapter
 from map_config import (
     MapBoxSpec,
@@ -41,7 +41,7 @@ from map_config import (
 )
 from raw_manus_vive_parser import parse_raw_manus_vive_frame
 from session_recorder import SessionRecorder
-from trial_controller import ExperimentInputSample, TrialController, TrialState
+from trial_controller import ExperimentInputSample
 
 
 InputFn = Callable[[str], str]
@@ -146,6 +146,7 @@ def run_live_integrated_session(
     session_finalized = False
     trial_controller_started = False
     summary: dict[str, Any] = {}
+    trial_runner_summary: dict[str, Any] = {}
     errors: list[str] = []
     warnings: list[str] = []
     processed_count = 0
@@ -191,7 +192,7 @@ def run_live_integrated_session(
 
     adapter_config = _adapter_config(config)
     adapter = ManusViveExperimentAdapter(None, config=adapter_config)
-    trial: TrialController | None = None
+    live_trial_runner: LiveTrialRunner | None = None
     map_config: MapConfig | None = None
     map_anchor = _empty_map_anchor()
     map_warnings: list[str] = []
@@ -275,12 +276,6 @@ def run_live_integrated_session(
         map_config = _map_config_for_live_session(map_config, config)
         track_region, block_center, block_size = compile_map_to_track_region(map_config)
         engine_config = _engine_config(config, block_size)
-
-        def factory() -> BlockController:
-            assert engine_config is not None
-            return BlockController(engine_config, track_region, block_center)
-
-        trial = TrialController(factory, task_system, engine_config)
         trial_config = _trial_config_payload(
             config,
             map_config,
@@ -300,121 +295,48 @@ def run_live_integrated_session(
         _prompt(input_fn, "Press Enter to start trial...")
         set_status(LiveSessionPhase.TRIAL_RUNNING, "Trial running.", map_id=map_config.map_id)
 
-        run_started = time.monotonic()
-        next_tick = time.monotonic()
-        last_new_frame_time = time.monotonic()
-        previous_print_frame = 0
-        while True:
-            if config.duration_seconds is not None and time.monotonic() - run_started >= config.duration_seconds:
-                run_stop_reason = "duration_reached"
-                break
-            if config.max_frames is not None and processed_count >= config.max_frames:
-                run_stop_reason = "max_frames"
-                break
-            if _user_requested_quit():
-                run_stop_reason = "user_quit"
-                break
+        display_counter = {"processed": 0}
 
-            now = time.monotonic()
-            if now < next_tick:
-                time.sleep(min(0.002, next_tick - now))
-                continue
-            next_tick = now + (1.0 / config.control_rate_hz)
-            live_frame = latest_buffer.get_latest()
-            if live_frame is None:
-                no_new_frame_count += 1
-                no_frame_gap = now - last_new_frame_time
-                max_no_new_frame_gap_seconds = max(max_no_new_frame_gap_seconds, no_frame_gap)
-                source_stop_reason = _source_stop_reason_from_pump(pump)
-                if _is_client_disconnected(source_stop_reason):
-                    run_stop_reason = "client_disconnected_during_trial"
-                    break
-                if _is_source_stopped(source_stop_reason, pump):
-                    run_stop_reason = "source_stopped_during_trial"
-                    break
-                if no_frame_gap >= config.no_frame_timeout_seconds:
-                    run_stop_reason = "no_new_frame_timeout"
-                    break
-                continue
+        def display_snapshot(snapshot: Any) -> None:
+            if config.display_mode != "text" or config.print_every <= 0:
+                return
+            display_counter["processed"] += 1
+            if display_counter["processed"] % config.print_every == 0:
+                print(build_compact_status_line(phase.name, snapshot))
 
-            last_new_frame_time = now
-            start_process = time.monotonic()
-            processed = _parse_and_adapt(live_frame, adapter_config, adapter)
-            if processed["device_frame"] is not None:
-                session_recorder.record_device_frame(live_frame.frame_index, processed["device_frame"])
-            if not processed["parse_ok"] or not processed["adapter_ok"] or processed["sample"] is None:
-                continue
-
-            sample = processed["sample"]
-            if not trial_controller_started:
-                trial.start_trial(sample.time, config.trial_id)
-                trial_controller_started = True
-                session_recorder.record_events(live_frame.frame_index, sample.time, trial.event_history[-2:])
-            result = trial.update(sample)
-            processing_latency = (time.monotonic() - start_process) * 1000.0
-            latency_ms.append(processing_latency)
-            processed_count += 1
-            output = result.frame_output
-            hand_valid = bool(processed["hand_valid"])
-            snapshot = build_dashboard_snapshot(
-                frame_index=live_frame.frame_index,
-                trial_result=result,
-                sample=sample,
-                hand_valid=hand_valid,
-                map_id=map_config.map_id,
-                calibration_id=calibration.calibration_id,
-                processing_latency_ms=processing_latency,
-                hardware_haptic_active=False,
-            )
-            logical_counts[snapshot.logical_haptic_label] += 1
-            if not snapshot.tracker_valid:
-                tracker_invalid_count += 1
-            if not snapshot.hand_valid:
-                hand_invalid_count += 1
-            if snapshot.pinch_valid:
-                pinch_valid_count += 1
-            if snapshot.slip_active:
-                slip_active_count += 1
-            if snapshot.stop_reason == "TRACK_BLOCKED" or snapshot.blocked_force_active:
-                blocked_count += 1
-
-            session_recorder.record_raw_frame(live_frame.frame_index, live_frame.raw_frame)
-            session_recorder.record_processed_frame(
-                live_frame.frame_index,
-                live_frame.raw_frame,
-                processed["device_frame"],
-                sample,
-                output,
-                haptic_state=result.haptic_feedback_state,
-                extra={
-                    "input_source": "live_integrated_session",
-                    "trial_time": result.time_since_prompt,
-                },
-            )
-            session_recorder.record_events(live_frame.frame_index, sample.time, result.events)
-            session_recorder.record_haptic(
-                live_frame.frame_index,
-                sample.time,
-                result.haptic_feedback_state,
-                details={
-                    "mode": "live_integrated_session",
-                    "logical_haptic_label": snapshot.logical_haptic_label,
-                    "feedback_label": snapshot.feedback_label,
-                    "hardware_haptic_active": False,
-                    "sent_to_hardware": False,
-                },
-            )
-            if config.display_mode == "text" and config.print_every > 0:
-                if processed_count - previous_print_frame >= config.print_every:
-                    print(build_compact_status_line(phase.name, snapshot))
-                    previous_print_frame = processed_count
-            if result.trial_state in {
-                TrialState.ENDED_BY_SUBJECT,
-                TrialState.FAILED_TIMEOUT,
-                TrialState.FAILED_TOO_MANY_DETACHES,
-            }:
-                run_stop_reason = result.trial_state.name.lower()
-                break
+        live_trial_runner = LiveTrialRunner(
+            latest_frame_buffer=latest_buffer,
+            task_coordinate_system=task_system,
+            track_region=track_region,
+            block_initial_center_task=block_center,
+            block_size=block_size,
+            engine_config=engine_config,
+            session_recorder=session_recorder,
+            config=_live_trial_runner_config(config),
+            map_config_payload=map_config_to_trial_config(map_config),
+            trial_config=trial_config,
+            map_id=map_config.map_id,
+            calibration_id=calibration.calibration_id,
+            display_callback=display_snapshot,
+            source_stop_reason_getter=lambda: _source_stop_reason_from_pump(pump),
+            source_stats_getter=lambda: pump.stats_snapshot(),
+            user_quit_checker=_user_requested_quit,
+        )
+        live_trial_result = live_trial_runner.run_until_done()
+        trial_runner_summary = dict(live_trial_result.summary)
+        trial_stats = live_trial_result.stats
+        run_stop_reason = trial_stats.run_stop_reason
+        trial_controller_started = live_trial_runner.trial_started
+        processed_count = trial_stats.total_processed_frames
+        tracker_invalid_count = trial_stats.tracker_invalid_frame_count
+        hand_invalid_count = trial_stats.hand_invalid_frame_count
+        pinch_valid_count = trial_stats.pinch_valid_frame_count
+        slip_active_count = trial_stats.slip_active_frame_count
+        blocked_count = trial_stats.blocked_frame_count
+        no_new_frame_count = trial_stats.no_new_frame_count
+        max_no_new_frame_gap_seconds = trial_stats.max_no_new_frame_gap_seconds
+        logical_counts = Counter(trial_stats.logical_haptic_label_counts)
+        latency_ms = []
 
         set_status(LiveSessionPhase.TRIAL_ENDED, f"Trial ended: {run_stop_reason}.", map_id=map_config.map_id)
         phase_at_stop = LiveSessionPhase.TRIAL_ENDED.name
@@ -428,6 +350,10 @@ def run_live_integrated_session(
     except KeyboardInterrupt:
         run_stop_reason = "keyboard_interrupt"
         phase_at_stop = phase.name
+        if live_trial_runner is not None:
+            live_trial_runner.request_stop("keyboard_interrupt")
+            trial_runner_summary = dict(live_trial_runner.build_summary())
+            trial_controller_started = live_trial_runner.trial_started
         set_status(LiveSessionPhase.SAVING, "KeyboardInterrupt received; saving session.")
     except Exception as exc:
         run_stop_reason = "error"
@@ -471,6 +397,8 @@ def run_live_integrated_session(
             trial_controller_started=trial_controller_started,
             errors=errors,
         )
+        if trial_runner_summary:
+            _merge_live_trial_runner_summary(summary, trial_runner_summary)
         if session_recorder is not None:
             try:
                 summary["session_finalized"] = True
@@ -1064,6 +992,61 @@ def _adapter_config(config: LiveIntegratedSessionConfig) -> DeviceAdapterConfig:
         index_tip_node_id=config.index_node,
         timestamp_scale=config.timestamp_scale,
     )
+
+
+def _live_trial_runner_config(config: LiveIntegratedSessionConfig) -> LiveTrialRunnerConfig:
+    return LiveTrialRunnerConfig(
+        trial_id=config.trial_id,
+        control_rate_hz=config.control_rate_hz,
+        duration_seconds=config.duration_seconds,
+        max_frames=config.max_frames,
+        no_frame_timeout_seconds=config.no_frame_timeout_seconds,
+        print_every=config.print_every,
+        timestamp_scale=config.timestamp_scale,
+        thumb_node=config.thumb_node,
+        index_node=config.index_node,
+        tracker_index=config.tracker_index,
+        skeleton_index=config.skeleton_index,
+        haptic_hardware_enabled=False,
+    )
+
+
+def _merge_live_trial_runner_summary(
+    summary: dict[str, Any],
+    runner_summary: dict[str, Any],
+) -> None:
+    """Expose LiveTrialRunner stats while preserving legacy summary keys."""
+
+    summary["live_trial_runner_summary"] = dict(runner_summary)
+    legacy_keys = (
+        "total_received_frames",
+        "total_processed_frames",
+        "parse_error_count",
+        "adapter_error_count",
+        "tracker_invalid_frame_count",
+        "hand_invalid_frame_count",
+        "pinch_valid_frame_count",
+        "large_delta_frame_count",
+        "slip_active_frame_count",
+        "blocked_frame_count",
+        "logical_haptic_label_counts",
+        "no_new_frame_count",
+        "max_no_new_frame_gap_seconds",
+        "mean_processing_latency_ms",
+        "max_processing_latency_ms",
+        "callback_error_count",
+        "mean_callback_latency_ms",
+        "max_callback_latency_ms",
+    )
+    for key in legacy_keys:
+        if key in runner_summary:
+            summary[key] = runner_summary[key]
+
+    merged_warnings = list(summary.get("warnings", []))
+    for warning in runner_summary.get("warnings", []) or []:
+        if warning not in merged_warnings:
+            merged_warnings.append(warning)
+    summary["warnings"] = merged_warnings
 
 
 def _metadata_value(sample: Any, key: str) -> Any:
