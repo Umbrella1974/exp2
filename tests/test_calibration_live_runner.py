@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,6 +16,7 @@ from calibration_live_runner import (
     collect_calibration_segment,
     run_live_table_calibration,
 )
+from live_raw_stream import LiveRawFrame
 from simulated_live_source import RawJsonlSimulatedLiveSource
 
 
@@ -68,6 +71,33 @@ def test_collect_calibration_segment_line() -> None:
     assert not summary["errors"]
 
 
+def test_real_live_segment_uses_monotonic_time_not_large_raw_timestamp() -> None:
+    source = _FastLiveSource(raw_timestamp=9_999_999_999_000.0)
+    config = CalibrationLiveConfig(
+        collection_mode="live_stream",
+        sample_duration_seconds=0.04,
+        min_samples=2,
+        min_line_length=0.01,
+        timestamp_scale=0.001,
+        print_every=0,
+    )
+    spec = CalibrationSegmentSpec(
+        label="long_axis_line",
+        prompt="long",
+        duration_seconds=0.04,
+        min_samples=2,
+        segment_type="line",
+    )
+
+    summary = collect_calibration_segment(source, spec, config)
+
+    assert summary["time_mode"] == "monotonic_live"
+    assert summary["valid_sample_count"] >= 2
+    assert summary["duration_seconds_measured"] >= 0.03
+    assert source.frame_index > 2
+    assert not summary["errors"]
+
+
 def test_run_live_table_calibration_builds_formal_calibration(tmp_path: Path) -> None:
     raw_path = _write_raw_jsonl(tmp_path / "raw.jsonl", _calibration_raw_frames())
     source = RawJsonlSimulatedLiveSource(raw_path, timestamp_scale=0.001)
@@ -80,6 +110,7 @@ def test_run_live_table_calibration_builds_formal_calibration(tmp_path: Path) ->
     assert result.calibration.metadata["collection_mode"] == "raw_jsonl_simulated_live"
     assert result.calibration.long_line.sample_count >= 10
     assert result.live_metrics_summary["valid_sample_count"] >= 40
+    assert result.segment_summaries[0]["time_mode"] == "frame_time_simulated"
 
 
 def test_run_live_table_calibration_reports_insufficient_samples(tmp_path: Path) -> None:
@@ -114,6 +145,51 @@ def test_simulated_source_rejects_missing_timestamp(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="numeric raw timestamp"):
         source.get_frame()
+
+
+def test_simulated_segment_missing_frame_time_fails_clearly() -> None:
+    raw = _raw_frame(0.0, [0.0, 0.0, 0.0])
+    raw.pop("timestamp")
+    config = _config()
+    spec = CalibrationSegmentSpec(
+        label="origin",
+        prompt="origin",
+        duration_seconds=5.0,
+        min_samples=1,
+        segment_type="static_point",
+    )
+
+    with pytest.raises(ValueError, match="numeric raw timestamps"):
+        collect_calibration_segment(iter([raw]), spec, config)
+
+
+class _FastLiveSource:
+    def __init__(self, *, raw_timestamp: float) -> None:
+        self.raw_timestamp = raw_timestamp
+        self.frame_index = 0
+
+    def get_frame(self, timeout: float | None = None) -> LiveRawFrame:
+        del timeout
+        time.sleep(0.002)
+        frame_index = self.frame_index
+        self.frame_index += 1
+        raw = _raw_frame(self.raw_timestamp / 1000.0, [frame_index * 0.02, 0.0, 0.0], frame=frame_index)
+        raw["timestamp"] = self.raw_timestamp + frame_index
+        return LiveRawFrame(
+            frame_index=frame_index,
+            raw_frame=raw,
+            receive_time_monotonic=time.monotonic(),
+            receive_wall_time=time.time(),
+            byte_length=len(json.dumps(raw)),
+        )
+
+    def stats_snapshot(self) -> dict[str, Any]:
+        return {
+            "parse_error_count": 0,
+            "bad_json_line_count": 0,
+            "dropped_frame_count": 0,
+            "stop_reason": None,
+        }
 
 
 def _config() -> CalibrationLiveConfig:

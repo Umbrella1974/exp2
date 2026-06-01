@@ -88,6 +88,10 @@ class LiveIntegratedSessionConfig:
     skeleton_index: int = 0
     timestamp_scale: float = 0.001
     socket_timeout: float | None = None
+    stream_wait_timeout_seconds: float = 60.0
+    valid_tracker_timeout_seconds: float = 60.0
+    valid_pinch_timeout_seconds: float = 60.0
+    no_frame_timeout_seconds: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -150,8 +154,12 @@ def run_live_integrated_session(
     pinch_valid_count = 0
     slip_active_count = 0
     blocked_count = 0
+    no_new_frame_count = 0
+    max_no_new_frame_gap_seconds = 0.0
     latency_ms: list[float] = []
     logical_counts: Counter[str] = Counter()
+    calibration_live_metrics_summary: dict[str, Any] = {}
+    calibration_segment_time_mode: str | None = None
 
     def set_status(
         new_phase: LiveSessionPhase,
@@ -192,7 +200,7 @@ def run_live_integrated_session(
     try:
         set_status(LiveSessionPhase.WAITING_FOR_STREAM, f"Listening on {config.host}:{config.port}.")
         pump.start()
-        _wait_for_valid_tracker(latest_buffer, adapter_config, adapter, set_status)
+        _wait_for_valid_tracker(latest_buffer, adapter_config, adapter, set_status, pump, stop_event, config)
         set_status(LiveSessionPhase.READY_FOR_CALIBRATION, "Stream is healthy; ready for calibration.")
 
         while True:
@@ -202,10 +210,20 @@ def run_live_integrated_session(
                 set_status,
                 input_fn,
             )
+            calibration_live_metrics_summary = dict(calibration_result.live_metrics_summary)
+            calibration_segment_time_mode = _calibration_segment_time_mode(calibration_result.segment_summaries)
             if calibration_result.calibration is not None and not calibration_result.errors:
                 calibration = _mark_integrated_calibration(calibration_result.calibration)
                 warnings.extend(calibration_result.warnings)
                 break
+
+            pretrial_stop_reason = _pretrial_stop_reason(pump)
+            if pretrial_stop_reason is not None:
+                errors.extend(calibration_result.errors)
+                run_stop_reason = pretrial_stop_reason
+                phase_at_stop = phase.name
+                set_status(LiveSessionPhase.ERROR, f"Live source stopped before trial: {pretrial_stop_reason}.")
+                raise _SessionAbort
 
             errors.extend(calibration_result.errors)
             set_status(
@@ -284,6 +302,7 @@ def run_live_integrated_session(
 
         run_started = time.monotonic()
         next_tick = time.monotonic()
+        last_new_frame_time = time.monotonic()
         previous_print_frame = 0
         while True:
             if config.duration_seconds is not None and time.monotonic() - run_started >= config.duration_seconds:
@@ -303,8 +322,22 @@ def run_live_integrated_session(
             next_tick = now + (1.0 / config.control_rate_hz)
             live_frame = latest_buffer.get_latest()
             if live_frame is None:
+                no_new_frame_count += 1
+                no_frame_gap = now - last_new_frame_time
+                max_no_new_frame_gap_seconds = max(max_no_new_frame_gap_seconds, no_frame_gap)
+                source_stop_reason = _source_stop_reason_from_pump(pump)
+                if _is_client_disconnected(source_stop_reason):
+                    run_stop_reason = "client_disconnected_during_trial"
+                    break
+                if _is_source_stopped(source_stop_reason, pump):
+                    run_stop_reason = "source_stopped_during_trial"
+                    break
+                if no_frame_gap >= config.no_frame_timeout_seconds:
+                    run_stop_reason = "no_new_frame_timeout"
+                    break
                 continue
 
+            last_new_frame_time = now
             start_process = time.monotonic()
             processed = _parse_and_adapt(live_frame, adapter_config, adapter)
             if processed["device_frame"] is not None:
@@ -385,8 +418,13 @@ def run_live_integrated_session(
 
         set_status(LiveSessionPhase.TRIAL_ENDED, f"Trial ended: {run_stop_reason}.", map_id=map_config.map_id)
         phase_at_stop = LiveSessionPhase.TRIAL_ENDED.name
-    except _SessionAbort:
-        pass
+    except _SessionAbort as abort:
+        if abort.run_stop_reason is not None:
+            run_stop_reason = abort.run_stop_reason
+        if abort.phase_at_stop is not None:
+            phase_at_stop = abort.phase_at_stop
+        if abort.message:
+            errors.append(abort.message)
     except KeyboardInterrupt:
         run_stop_reason = "keyboard_interrupt"
         phase_at_stop = phase.name
@@ -398,6 +436,8 @@ def run_live_integrated_session(
         set_status(LiveSessionPhase.ERROR, str(exc))
     finally:
         set_status(LiveSessionPhase.SAVING, "Saving outputs.")
+        source_stop_reason_at_stop = _source_stop_reason_from_pump(pump)
+        pump_stop_reason_at_stop = pump.stop_reason
         stop_event.set()
         pump.stop(run_stop_reason)
         pump.join(timeout=1.0)
@@ -416,12 +456,18 @@ def run_live_integrated_session(
             pinch_valid_count=pinch_valid_count,
             slip_active_count=slip_active_count,
             blocked_count=blocked_count,
+            no_new_frame_count=no_new_frame_count,
+            max_no_new_frame_gap_seconds=max_no_new_frame_gap_seconds,
             logical_counts=logical_counts,
             latency_ms=latency_ms,
             calibration=calibration,
             calibration_warnings=warnings,
             map_warnings=map_warnings,
             map_anchor=map_anchor,
+            calibration_live_metrics_summary=calibration_live_metrics_summary,
+            calibration_segment_time_mode=calibration_segment_time_mode,
+            source_stop_reason=source_stop_reason_at_stop,
+            pump_stop_reason=pump_stop_reason_at_stop,
             trial_controller_started=trial_controller_started,
             errors=errors,
         )
@@ -436,6 +482,7 @@ def run_live_integrated_session(
                 summary["errors"] = list(errors)
         summary["phase_at_stop"] = phase_at_stop
         summary["session_finalized"] = session_finalized
+        summary["final_phase"] = LiveSessionPhase.STOPPED.name
         _write_json(summary_path, summary)
         set_status(LiveSessionPhase.STOPPED, f"Stopped: {run_stop_reason}.")
 
@@ -519,12 +566,59 @@ def _wait_for_valid_tracker(
     adapter_config: DeviceAdapterConfig,
     adapter: ManusViveExperimentAdapter,
     set_status: Callable[..., None],
+    pump: LatestFramePump,
+    stop_event: Event,
+    config: LiveIntegratedSessionConfig,
 ) -> None:
-    set_status(LiveSessionPhase.WAITING_FOR_VALID_TRACKER, "Waiting for valid tracker frames.")
+    stream_started = time.monotonic()
+    stream_deadline = stream_started + float(config.stream_wait_timeout_seconds)
+    tracker_deadline: float | None = None
+    saw_stream_frame = False
     while True:
+        if stop_event.is_set():
+            raise _SessionAbort(
+                run_stop_reason="source_stopped_before_trial",
+                phase_at_stop=LiveSessionPhase.WAITING_FOR_STREAM.name,
+                message="Stop event was set before a valid tracker was available.",
+            )
+        stop_reason = _source_stop_reason_from_pump(pump)
+        mapped_stop_reason = _pretrial_stop_reason(pump)
+        if mapped_stop_reason is not None:
+            phase_name = (
+                LiveSessionPhase.WAITING_FOR_VALID_TRACKER.name
+                if saw_stream_frame
+                else LiveSessionPhase.WAITING_FOR_STREAM.name
+            )
+            set_status(LiveSessionPhase.ERROR, f"Live source stopped before trial: {stop_reason}.")
+            raise _SessionAbort(
+                run_stop_reason=mapped_stop_reason,
+                phase_at_stop=phase_name,
+                message=f"Live source stopped before trial: {stop_reason}.",
+            )
+
+        now = time.monotonic()
+        if not saw_stream_frame and now >= stream_deadline:
+            set_status(LiveSessionPhase.ERROR, "Timed out waiting for the first live raw frame.")
+            raise _SessionAbort(
+                run_stop_reason="stream_wait_timeout",
+                phase_at_stop=LiveSessionPhase.WAITING_FOR_STREAM.name,
+                message="Timed out waiting for the first live raw frame.",
+            )
+        if saw_stream_frame and tracker_deadline is not None and now >= tracker_deadline:
+            set_status(LiveSessionPhase.ERROR, "Timed out waiting for tracker_valid=True.")
+            raise _SessionAbort(
+                run_stop_reason="valid_tracker_timeout",
+                phase_at_stop=LiveSessionPhase.WAITING_FOR_VALID_TRACKER.name,
+                message="Timed out waiting for tracker_valid=True.",
+            )
+
         frame = buffer.get_frame(timeout=0.1)
         if frame is None:
             continue
+        if not saw_stream_frame:
+            saw_stream_frame = True
+            tracker_deadline = time.monotonic() + float(config.valid_tracker_timeout_seconds)
+            set_status(LiveSessionPhase.WAITING_FOR_VALID_TRACKER, "Live frames received; waiting for valid tracker.")
         processed = _parse_and_adapt(frame, adapter_config, adapter)
         sample = processed.get("sample")
         tracker_valid = bool(getattr(sample, "tracker_valid", False))
@@ -794,12 +888,18 @@ def _build_summary(
     pinch_valid_count: int,
     slip_active_count: int,
     blocked_count: int,
+    no_new_frame_count: int,
+    max_no_new_frame_gap_seconds: float,
     logical_counts: Counter[str],
     latency_ms: list[float],
     calibration: FormalCalibration | None,
     calibration_warnings: list[str],
     map_warnings: list[str],
     map_anchor: dict[str, Any],
+    calibration_live_metrics_summary: dict[str, Any],
+    calibration_segment_time_mode: str | None,
+    source_stop_reason: str | None,
+    pump_stop_reason: str | None,
     trial_controller_started: bool,
     errors: list[str],
 ) -> dict[str, Any]:
@@ -823,17 +923,31 @@ def _build_summary(
         "calibration_id": calibration.calibration_id if calibration is not None else None,
         "calibration_quality": dict(calibration.quality) if calibration is not None else {},
         "calibration_warnings": list(calibration_warnings),
+        "calibration_live_metrics_summary": dict(calibration_live_metrics_summary),
+        "calibration_segment_time_mode": calibration_segment_time_mode,
         "map_warnings": list(map_warnings),
         "map_anchor_mode": str(map_anchor.get("mode", "none")),
         "map_anchor": dict(map_anchor),
+        "stream_wait_timeout_seconds": config.stream_wait_timeout_seconds,
+        "valid_tracker_timeout_seconds": config.valid_tracker_timeout_seconds,
+        "valid_pinch_timeout_seconds": config.valid_pinch_timeout_seconds,
+        "no_frame_timeout_seconds": config.no_frame_timeout_seconds,
         "total_received_frames": int(total_received or 0),
         "total_processed_frames": int(total_processed_frames),
+        "source_stop_reason": source_stop_reason,
+        "pump_stop_reason": pump_stop_reason,
         "dropped_or_overwritten_frame_count": int(
             stats.get("dropped_frame_count", 0) or 0
         )
         + int(buffer_stats.overwritten_frame_count),
         "overwritten_frame_count": int(buffer_stats.overwritten_frame_count),
+        "latest_buffer_overwritten_frame_count": int(buffer_stats.overwritten_frame_count),
+        "latest_buffer_last_frame_index": buffer_stats.last_frame_index,
+        "latest_buffer_put_count": int(buffer_stats.put_count),
+        "latest_buffer_consumed_count": int(buffer_stats.consumed_count),
         "source_dropped_frame_count": int(stats.get("dropped_frame_count", 0) or 0),
+        "no_new_frame_count": int(no_new_frame_count),
+        "max_no_new_frame_gap_seconds": float(max_no_new_frame_gap_seconds),
         "tracker_invalid_frame_count": int(tracker_invalid_count),
         "hand_invalid_frame_count": int(hand_invalid_count),
         "pinch_valid_frame_count": int(pinch_valid_count),
@@ -865,7 +979,19 @@ class _StatusPrinter:
 
 
 class _SessionAbort(Exception):
-    """Internal control-flow signal for expected pre-trial aborts."""
+    """Internal control-flow signal for expected safe aborts."""
+
+    def __init__(
+        self,
+        *,
+        run_stop_reason: str | None = None,
+        phase_at_stop: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        super().__init__(message or "")
+        self.run_stop_reason = run_stop_reason
+        self.phase_at_stop = phase_at_stop
+        self.message = message
 
 
 def _print_calibration_review(
@@ -949,6 +1075,50 @@ def _metadata_value(sample: Any, key: str) -> Any:
     return metadata.get(key)
 
 
+def _calibration_segment_time_mode(segment_summaries: list[dict[str, Any]]) -> str | None:
+    modes = {
+        str(summary.get("time_mode"))
+        for summary in segment_summaries
+        if summary.get("time_mode") not in (None, "")
+    }
+    if not modes:
+        return None
+    if len(modes) == 1:
+        return next(iter(modes))
+    return "mixed"
+
+
+def _pretrial_stop_reason(pump: LatestFramePump) -> str | None:
+    reason = _source_stop_reason_from_pump(pump)
+    if reason is None:
+        return None
+    if _is_client_disconnected(reason):
+        return "client_disconnected_before_trial"
+    if reason in {"server_stopped", "socket_error", "eof", "source_stopped"}:
+        return "source_stopped_before_trial"
+    return None
+
+
+def _source_stop_reason_from_pump(pump: LatestFramePump) -> str | None:
+    reason = pump.stop_reason
+    if reason is not None:
+        return str(reason)
+    stats = pump.stats_snapshot()
+    value = stats.get("stop_reason")
+    return str(value) if value is not None else None
+
+
+def _is_client_disconnected(reason: str | None) -> bool:
+    return reason == "client_disconnected"
+
+
+def _is_source_stopped(reason: str | None, pump: LatestFramePump) -> bool:
+    if reason in {"server_stopped", "socket_error", "eof", "source_stopped"}:
+        return True
+    stats = pump.stats_snapshot()
+    return bool(stats.get("stop_event_set", False))
+
+
 def _parse_vec3(value: str) -> list[float]:
     parts = [float(part.strip()) for part in value.split(",")]
     if len(parts) != 3 or not all(math.isfinite(part) for part in parts):
@@ -1010,6 +1180,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--skeleton-index", default=0, type=int)
     parser.add_argument("--timestamp-scale", default=0.001, type=float)
     parser.add_argument("--socket-timeout", default=None, type=float)
+    parser.add_argument("--stream-wait-timeout-seconds", default=60.0, type=float)
+    parser.add_argument("--valid-tracker-timeout-seconds", default=60.0, type=float)
+    parser.add_argument("--valid-pinch-timeout-seconds", default=60.0, type=float)
+    parser.add_argument("--no-frame-timeout-seconds", default=5.0, type=float)
     args = parser.parse_args(argv)
     if args.sample_duration_seconds <= 0.0:
         parser.error("--sample-duration-seconds must be > 0.")
@@ -1029,6 +1203,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--task-z-half-extent must be > 0.")
     if args.anchor_timeout_seconds <= 0.0:
         parser.error("--anchor-timeout-seconds must be > 0.")
+    if args.stream_wait_timeout_seconds <= 0.0:
+        parser.error("--stream-wait-timeout-seconds must be > 0.")
+    if args.valid_tracker_timeout_seconds <= 0.0:
+        parser.error("--valid-tracker-timeout-seconds must be > 0.")
+    if args.valid_pinch_timeout_seconds <= 0.0:
+        parser.error("--valid-pinch-timeout-seconds must be > 0.")
+    if args.no_frame_timeout_seconds <= 0.0:
+        parser.error("--no-frame-timeout-seconds must be > 0.")
     return args
 
 
@@ -1071,6 +1253,10 @@ def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
         skeleton_index=args.skeleton_index,
         timestamp_scale=args.timestamp_scale,
         socket_timeout=args.socket_timeout,
+        stream_wait_timeout_seconds=args.stream_wait_timeout_seconds,
+        valid_tracker_timeout_seconds=args.valid_tracker_timeout_seconds,
+        valid_pinch_timeout_seconds=args.valid_pinch_timeout_seconds,
+        no_frame_timeout_seconds=args.no_frame_timeout_seconds,
     )
 
 

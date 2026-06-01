@@ -630,7 +630,48 @@ python analyze_session.py --session-dir data\live_integrated_session\debug_01\se
 --display-mode                   text / none，默认 text
 --print-every                    默认 30
 --anchor-current-pinch-debug     debug only，默认关闭
+--stream-wait-timeout-seconds    默认 60，等不到任何 raw frame 会安全退出
+--valid-tracker-timeout-seconds  默认 60，等不到 tracker_valid=True 会安全退出
+--valid-pinch-timeout-seconds    默认 60，第一版只记录到 config/summary
+--no-frame-timeout-seconds       默认 5，trial running 中长时间无新帧会退出
 ```
+
+第一次实机测试建议显式加一个总时长和 text display，避免人还在调发送端时误以为程序卡死：
+
+```powershell
+python run_live_integrated_session.py ^
+  --map-config maps\examples\xoy_turn.json ^
+  --host 127.0.0.1 ^
+  --port 8888 ^
+  --out-dir data\live_integrated_session\debug_01 ^
+  --duration-seconds 60 ^
+  --display-mode text
+```
+
+如果一直没有发送端连接，或连接后一直没有有效 tracker，runner 不会无限等待；它会写 `out_dir/summary.json` 后退出。常见停止原因：
+
+```text
+stream_wait_timeout
+valid_tracker_timeout
+client_disconnected_before_trial
+client_disconnected_during_trial
+no_new_frame_timeout
+keyboard_interrupt
+```
+
+实机排查时优先看 `summary.json` 中这些字段：
+
+```text
+source_stop_reason
+pump_stop_reason
+no_new_frame_count
+max_no_new_frame_gap_seconds
+latest_buffer_overwritten_frame_count
+latest_buffer_last_frame_index
+calibration_segment_time_mode
+```
+
+`calibration_segment_time_mode=monotonic_live` 表示 live calibration 用的是本机 `time.monotonic()` 控制采样时长，不会把 raw timestamp 和本机 monotonic clock 混在一起比较。
 
 输出位置：
 

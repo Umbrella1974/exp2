@@ -147,9 +147,15 @@ def collect_calibration_segment(
     summary: dict[str, Any] = {
         "label": segment_spec.label,
         "segment_type": segment_spec.segment_type,
+        "time_mode": "monotonic_live" if _uses_live_wall_clock(config) else "frame_time_simulated",
         "start_monotonic_time": None,
         "end_monotonic_time": None,
+        "segment_start_monotonic": None,
+        "segment_end_monotonic": None,
+        "segment_start_frame_time": None,
+        "segment_end_frame_time": None,
         "duration_seconds": 0.0,
+        "duration_seconds_measured": 0.0,
         "received_frame_count": 0,
         "valid_sample_count": 0,
         "invalid_sample_count": 0,
@@ -189,6 +195,7 @@ def collect_calibration_segment(
 
         processed = _process_input_frame(frame, adapter_config, adapter, config)
         frame_time = processed["frame_time"]
+        now_monotonic = time.monotonic()
 
         if not _uses_live_wall_clock(config):
             if cursor.simulated_base_time is None:
@@ -211,20 +218,33 @@ def collect_calibration_segment(
                 )
             cursor.previous_simulated_frame_time = frame_time
             elapsed = frame_time - simulated_window_start
+            legacy_start_time = simulated_window_start
+            legacy_end_time = frame_time
+            segment_start_monotonic = None
+            segment_end_monotonic = None
+            segment_start_frame_time = simulated_window_start
+            segment_end_frame_time = frame_time
         else:
-            if frame_time > live_end:
-                break
-            elapsed = frame_time - live_start
+            elapsed = now_monotonic - live_start
+            legacy_start_time = live_start
+            legacy_end_time = now_monotonic
+            segment_start_monotonic = live_start
+            segment_end_monotonic = now_monotonic
+            segment_start_frame_time = frame_time
+            segment_end_frame_time = frame_time
 
         if not segment_started:
             segment_started = True
-            summary["start_monotonic_time"] = (
-                simulated_window_start if not _uses_live_wall_clock(config) else live_start
-            )
+            summary["start_monotonic_time"] = legacy_start_time
+            summary["segment_start_monotonic"] = segment_start_monotonic
+            summary["segment_start_frame_time"] = segment_start_frame_time
 
         summary["received_frame_count"] += 1
-        summary["end_monotonic_time"] = frame_time
+        summary["end_monotonic_time"] = legacy_end_time
+        summary["segment_end_monotonic"] = segment_end_monotonic
+        summary["segment_end_frame_time"] = segment_end_frame_time
         summary["duration_seconds"] = max(0.0, float(elapsed))
+        summary["duration_seconds_measured"] = max(0.0, float(elapsed))
         if summary["frame_start"] is None:
             summary["frame_start"] = processed["frame_index"]
         summary["frame_end"] = processed["frame_index"]
@@ -258,7 +278,10 @@ def collect_calibration_segment(
     if not segment_started:
         summary["start_monotonic_time"] = live_start if _uses_live_wall_clock(config) else None
         summary["end_monotonic_time"] = summary["start_monotonic_time"]
+        summary["segment_start_monotonic"] = summary["start_monotonic_time"]
+        summary["segment_end_monotonic"] = summary["end_monotonic_time"]
         summary["duration_seconds"] = 0.0
+        summary["duration_seconds_measured"] = 0.0
     if summary["valid_sample_count"] < segment_spec.min_samples:
         summary["errors"].append(
             f"{segment_spec.label}: only {summary['valid_sample_count']} valid calibration "
@@ -511,6 +534,8 @@ def _process_input_frame(
         )
     except Exception as exc:
         error_message = str(exc)
+        if not _uses_live_wall_clock(config) and "numeric raw timestamp" in error_message:
+            raise
         if frame_time is None:
             frame_time = time.monotonic()
 

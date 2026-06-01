@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+import run_live_integrated_session as runner
 from live_raw_stream import LiveRawFrame
 from live_session_state import LiveSessionPhase
 from run_live_integrated_session import (
@@ -49,6 +50,11 @@ def test_integrated_session_completes_and_keeps_calibration_consistent(tmp_path:
     assert trial_config["map_anchor_mode"] == "none"
     assert meta["calibration_collection_mode"] == "live_stream_integrated"
     assert meta["haptic_hardware_enabled"] is False
+    assert result.summary["source_stop_reason"] is None
+    assert "pump_stop_reason" in result.summary
+    assert result.summary["latest_buffer_last_frame_index"] is not None
+    assert result.summary["latest_buffer_overwritten_frame_count"] >= 0
+    assert result.summary["calibration_segment_time_mode"] == "monotonic_live"
 
 
 def test_debug_anchor_is_explicitly_marked(tmp_path: Path) -> None:
@@ -94,6 +100,54 @@ def test_keyboard_interrupt_at_trial_prompt_finalizes_session(tmp_path: Path) ->
     assert trial_summary["run_stop_reason"] == "keyboard_interrupt"
 
 
+def test_keyboard_interrupt_at_calibration_prompt_writes_partial_summary(tmp_path: Path) -> None:
+    source = FakeLiveSource()
+    config = _config(tmp_path, calibration_id="cal_interrupt_prompt")
+
+    def input_fn(message: str) -> str:
+        if "[origin]" in message:
+            raise KeyboardInterrupt
+        return ""
+
+    result = run_live_integrated_session(config, source=source, input_fn=input_fn)
+    summary_path = tmp_path / "out" / "summary.json"
+
+    assert summary_path.exists()
+    assert result.summary["run_stop_reason"] == "keyboard_interrupt"
+    assert result.summary["session_finalized"] is False
+    assert result.summary["trial_controller_started"] is False
+
+
+def test_keyboard_interrupt_during_trial_finalizes_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FakeLiveSource()
+    config = _config(tmp_path, calibration_id="cal_interrupt_trial", max_frames=None)
+    trial_started = {"value": False}
+    original_parse = runner._parse_and_adapt
+
+    def input_fn(message: str) -> str:
+        _set_mode_from_prompt(source, message)
+        if "start trial" in message:
+            trial_started["value"] = True
+        return ""
+
+    def raising_parse(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        if trial_started["value"]:
+            raise KeyboardInterrupt
+        return original_parse(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_parse_and_adapt", raising_parse)
+
+    result = runner.run_live_integrated_session(config, source=source, input_fn=input_fn)
+
+    session_dir = Path(result.summary["session_dir"])
+    assert result.summary["run_stop_reason"] == "keyboard_interrupt"
+    assert result.summary["session_finalized"] is True
+    assert _read_json(session_dir / "trial_summary.json")["run_stop_reason"] == "keyboard_interrupt"
+
+
 def test_calibration_error_stops_before_trial(tmp_path: Path) -> None:
     source = FakeLiveSource()
     config = _config(tmp_path, calibration_id="cal_bad", min_line_length=10.0)
@@ -105,6 +159,56 @@ def test_calibration_error_stops_before_trial(tmp_path: Path) -> None:
     assert result.summary["trial_controller_started"] is False
     assert result.summary["session_finalized"] is False
     assert result.summary["errors"]
+
+
+def test_stream_wait_timeout_writes_summary(tmp_path: Path) -> None:
+    source = NoFrameLiveSource()
+    config = _config(
+        tmp_path,
+        calibration_id="cal_stream_timeout",
+        stream_wait_timeout_seconds=0.05,
+    )
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+    disk_summary = _read_json(tmp_path / "out" / "summary.json")
+
+    assert result.summary["run_stop_reason"] == "stream_wait_timeout"
+    assert result.summary["phase_at_stop"] == LiveSessionPhase.WAITING_FOR_STREAM.name
+    assert disk_summary["run_stop_reason"] == "stream_wait_timeout"
+    assert result.summary["stream_wait_timeout_seconds"] == pytest.approx(0.05)
+
+
+def test_valid_tracker_timeout_writes_summary(tmp_path: Path) -> None:
+    source = FakeLiveSource(tracker_valid=False)
+    config = _config(
+        tmp_path,
+        calibration_id="cal_tracker_timeout",
+        valid_tracker_timeout_seconds=0.05,
+    )
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    assert result.summary["run_stop_reason"] == "valid_tracker_timeout"
+    assert result.summary["phase_at_stop"] == LiveSessionPhase.WAITING_FOR_VALID_TRACKER.name
+    assert result.summary["valid_tracker_timeout_seconds"] == pytest.approx(0.05)
+    assert result.summary["session_finalized"] is False
+
+
+def test_trial_client_disconnected_exits_and_writes_summary(tmp_path: Path) -> None:
+    source = FakeLiveSource(disconnect_after_trial_frames=2)
+    config = _config(
+        tmp_path,
+        calibration_id="cal_disconnect_trial",
+        max_frames=None,
+        no_frame_timeout_seconds=0.2,
+    )
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    assert result.summary["run_stop_reason"] == "client_disconnected_during_trial"
+    assert result.summary["session_finalized"] is True
+    assert result.summary["source_stop_reason"] == "client_disconnected"
+    assert result.summary["no_new_frame_count"] > 0
 
 
 def test_map_validation_error_stops_before_trial(tmp_path: Path) -> None:
@@ -143,8 +247,16 @@ def test_text_display_does_not_block_control_loop(tmp_path: Path, capsys: pytest
 class FakeLiveSource:
     """Small latest-frame compatible source for integrated-session tests."""
 
-    def __init__(self, *, frame_interval: float = 0.0015) -> None:
+    def __init__(
+        self,
+        *,
+        frame_interval: float = 0.0015,
+        tracker_valid: bool = True,
+        disconnect_after_trial_frames: int | None = None,
+    ) -> None:
         self.frame_interval = frame_interval
+        self.tracker_valid = tracker_valid
+        self.disconnect_after_trial_frames = disconnect_after_trial_frames
         self.stop_event = threading.Event()
         self.mode = "origin"
         self.frame_index = 0
@@ -210,7 +322,12 @@ class FakeLiveSource:
             mode = self.mode
             mode_index = self.mode_frame_index
             self.mode_frame_index += 1
-        raw = _raw_frame(now, _position_for_mode(mode, mode_index), frame=self.frame_index)
+        raw = _raw_frame(
+            now,
+            _position_for_mode(mode, mode_index),
+            frame=self.frame_index,
+            tracker_valid=self.tracker_valid,
+        )
         live_frame = LiveRawFrame(
             frame_index=self.frame_index,
             raw_frame=raw,
@@ -221,7 +338,48 @@ class FakeLiveSource:
         self.frame_index += 1
         self.total_received_frames += 1
         self._last_emit_time = now
+        if (
+            self.disconnect_after_trial_frames is not None
+            and mode == "trial"
+            and mode_index + 1 >= self.disconnect_after_trial_frames
+        ):
+            self.stop_reason = "client_disconnected"
+            self._running = False
+            self.stop_event.set()
         return live_frame
+
+
+class NoFrameLiveSource:
+    def __init__(self) -> None:
+        self.stop_event = threading.Event()
+        self.stop_reason: str | None = None
+        self.total_received_frames = 0
+        self.dropped_frame_count = 0
+
+    def start(self) -> None:
+        self.stop_event.clear()
+        self.stop_reason = None
+
+    def stop(self, reason: str = "stopped") -> None:
+        self.stop_reason = reason
+        self.stop_event.set()
+
+    def join(self, timeout: float | None = None) -> None:
+        del timeout
+
+    def get_frame(self, timeout: float | None = None) -> None:
+        if timeout:
+            time.sleep(min(float(timeout), 0.002))
+        return None
+
+    def stats_snapshot(self) -> dict[str, Any]:
+        return {
+            "total_received_frames": self.total_received_frames,
+            "parse_error_count": 0,
+            "bad_json_line_count": 0,
+            "dropped_frame_count": self.dropped_frame_count,
+            "stop_reason": self.stop_reason,
+        }
 
 
 def _mode_input(source: FakeLiveSource):
@@ -258,7 +416,13 @@ def _position_for_mode(mode: str, frame_index: int) -> list[float]:
     return [0.0, 0.0, 0.0]
 
 
-def _raw_frame(seconds: float, position: list[float], *, frame: int) -> dict[str, Any]:
+def _raw_frame(
+    seconds: float,
+    position: list[float],
+    *,
+    frame: int,
+    tracker_valid: bool = True,
+) -> dict[str, Any]:
     return {
         "timestamp": seconds * 1000.0,
         "frame": frame,
@@ -277,7 +441,7 @@ def _raw_frame(seconds: float, position: list[float], *, frame: int) -> dict[str
                 "trackerId": "tracker-a",
                 "position": position,
                 "rotation": [0.0, 0.0, 0.0, 1.0],
-                "valid": True,
+                "valid": tracker_valid,
             }
         ],
     }
@@ -293,6 +457,9 @@ def _config(
     display_mode: str = "none",
     print_every: int = 0,
     anchor_current_pinch_debug: bool = False,
+    stream_wait_timeout_seconds: float = 60.0,
+    valid_tracker_timeout_seconds: float = 60.0,
+    no_frame_timeout_seconds: float = 5.0,
 ) -> LiveIntegratedSessionConfig:
     return LiveIntegratedSessionConfig(
         map_config=map_path or _write_valid_map(tmp_path / "map.json"),
@@ -312,6 +479,9 @@ def _config(
         print_every=print_every,
         anchor_current_pinch_debug=anchor_current_pinch_debug,
         anchor_timeout_seconds=1.0,
+        stream_wait_timeout_seconds=stream_wait_timeout_seconds,
+        valid_tracker_timeout_seconds=valid_tracker_timeout_seconds,
+        no_frame_timeout_seconds=no_frame_timeout_seconds,
     )
 
 
