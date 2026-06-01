@@ -746,6 +746,61 @@ max_callback_latency_ms
 pytest -q tests/test_live_trial_runner.py tests/test_live_integrated_session.py
 ```
 
+### Stage 5D Replay Debug GUI Prototype
+
+`run_replay_debug_gui.py` 是第一版实验员调试 GUI 原型，当前优先支持 replay debug。GUI 本身只消费 `DashboardSnapshot`，不直接读 socket、不直接读 raw JSONL 推进 trial，也不实现 parser / adapter / TrialController / BlockController 逻辑。
+
+内部数据流是：
+
+```text
+raw/session replay runner
+  -> LiveTrialRunner
+  -> DashboardSnapshot
+  -> LatestSnapshotStore
+  -> Debug GUI
+```
+
+安装 GUI 依赖：
+
+```powershell
+pip install PySide6 pyqtgraph
+```
+
+从已有 session 启动 replay GUI：
+
+```powershell
+python run_replay_debug_gui.py --session-dir data\offline_replay\exp13_map_xoy_turn\session --replay-timing fixed --replay-fps 60 --out-dir data\debug_gui\exp13
+```
+
+如果只想验证 replay 链路、不打开 GUI：
+
+```powershell
+python run_replay_debug_gui.py --session-dir data\offline_replay\exp13_map_xoy_turn\session --max-frames 200 --replay-timing fast --headless
+```
+
+不使用 session，而是显式传文件：
+
+```powershell
+python run_replay_debug_gui.py ^
+  --raw-jsonl path\to\raw_frames.jsonl ^
+  --calibration-json path\to\calibration.json ^
+  --trial-config-json path\to\trial_config.json ^
+  --replay-timing fixed ^
+  --replay-fps 60
+```
+
+`--replay-timing` 可选：
+
+```text
+raw      按 raw timestamp 间隔回放，默认
+fixed    固定 --replay-fps 回放，适合调 GUI
+fast     不等待，适合测试或快速 smoke
+```
+
+当前 GUI 显示 x-y task view：track boxes、target、block start footprint、当前 block、当前 pinch，以及右侧状态面板。z 方向第一版以数值显示。GUI Close 只关闭显示层，不直接修改 `TrialController` / `BlockController`，也不接 haptic hardware。缺少 `PySide6` / `pyqtgraph` 时，入口会提示安装命令；非 GUI 测试不依赖这两个包。
+
+当前后置项：`run_live_integrated_session.py --gui` 尚未接入。第一版先保证 replay GUI 和非 GUI 核心层稳定，live GUI 后续再通过同一个 `LatestSnapshotStore` 接 `LiveTrialRunner.snapshot_callback`。
+
 ## `analyze_session.py`
 
 这个脚本只读取已记录的 session 目录，生成 `analysis_summary.json` 和可选 PNG 图。它不会重新运行 TrialController / BlockController，也不会写回 `events.csv`。

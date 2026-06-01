@@ -471,23 +471,38 @@ class LiveTrialRunner:
     def _source_stop_reason(self) -> str | None:
         if self.source_stop_reason_getter is None:
             return None
-        value = self.source_stop_reason_getter()
+        try:
+            value = self.source_stop_reason_getter()
+        except Exception as exc:
+            self._warn_once(f"source_stop_reason_getter failed: {exc}")
+            return None
         return str(value) if value is not None else None
 
     def _total_received_frames(self) -> int:
         stats: dict[str, Any] = {}
         if self.source_stats_getter is not None:
-            stats = self.source_stats_getter() or {}
+            try:
+                stats = self.source_stats_getter() or {}
+            except Exception as exc:
+                self._warn_once(f"source_stats_getter failed: {exc}")
+                stats = {}
         value = stats.get("total_received_frames")
         if value is None:
             value = stats.get("latest_put_count")
         if value is None and hasattr(self.latest_frame_buffer, "stats_snapshot"):
-            snapshot = self.latest_frame_buffer.stats_snapshot()
-            value = getattr(snapshot, "put_count", None)
+            try:
+                snapshot = self.latest_frame_buffer.stats_snapshot()
+                value = getattr(snapshot, "put_count", None)
+            except Exception as exc:
+                self._warn_once(f"latest_frame_buffer.stats_snapshot failed: {exc}")
         try:
             return int(value or 0)
         except (TypeError, ValueError):
             return 0
+
+    def _warn_once(self, message: str) -> None:
+        if message not in self.warnings:
+            self.warnings.append(message)
 
 
 def _to_vec3(value: Any) -> Vec3:

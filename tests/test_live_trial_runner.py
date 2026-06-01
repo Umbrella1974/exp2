@@ -138,6 +138,42 @@ def test_session_recorder_can_finalize_runner_summary(tmp_path: Path) -> None:
     assert (tmp_path / "session" / "processed_frames.csv").exists()
 
 
+def test_source_stats_getter_exception_does_not_break_summary(tmp_path: Path) -> None:
+    def bad_stats() -> dict[str, Any]:
+        raise RuntimeError("stats boom")
+
+    runner, _, _ = _make_runner(
+        tmp_path,
+        [_live_frame(0, 0.0)],
+        source_stats_getter=bad_stats,
+    )
+
+    result = runner.run_until_done()
+
+    assert result.stats.run_stop_reason == "max_frames"
+    assert result.stats.total_received_frames == 1
+    assert any("source_stats_getter failed" in warning for warning in result.summary["warnings"])
+
+
+def test_source_stop_reason_getter_exception_does_not_crash_timeout_path(tmp_path: Path) -> None:
+    def bad_stop_reason() -> str | None:
+        raise RuntimeError("stop reason boom")
+
+    runner, _, _ = _make_runner(
+        tmp_path,
+        [],
+        control_rate_hz=1000.0,
+        max_frames=None,
+        no_frame_timeout_seconds=0.01,
+        source_stop_reason_getter=bad_stop_reason,
+    )
+
+    result = runner.run_until_done()
+
+    assert result.stats.run_stop_reason == "no_new_frame_timeout"
+    assert any("source_stop_reason_getter failed" in warning for warning in result.summary["warnings"])
+
+
 class _FakeLatestFrameBuffer:
     def __init__(self, frames: list[LiveRawFrame]) -> None:
         self.frames = list(frames)
@@ -179,6 +215,8 @@ def _make_runner(
     frames: list[LiveRawFrame],
     *,
     snapshot_callback: Any = None,
+    source_stop_reason_getter: Any = None,
+    source_stats_getter: Any = None,
     control_rate_hz: float = 1000.0,
     no_frame_timeout_seconds: float = 0.05,
     max_frames: int | None = 1,
@@ -214,7 +252,8 @@ def _make_runner(
         calibration_id="test_calibration",
         trial_config={"mode": "test_live_trial_runner"},
         snapshot_callback=snapshot_callback,
-        source_stats_getter=lambda: {"total_received_frames": buffer.put_count},
+        source_stop_reason_getter=source_stop_reason_getter,
+        source_stats_getter=source_stats_getter or (lambda: {"total_received_frames": buffer.put_count}),
     )
     return runner, recorder, buffer
 
