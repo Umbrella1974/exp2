@@ -70,6 +70,7 @@ pytest -q tests/test_map_config.py tests/test_map_generator.py
 pytest -q tests/test_calibration_geometry.py tests/test_calibration_io.py tests/test_calibration_sampling.py
 pytest -q tests/test_calibrate_from_raw_jsonl_table.py tests/test_offline_replay_formal_calibrated.py
 pytest -q tests/test_live_raw_stream.py tests/test_run_live_raw_preview.py
+pytest -q tests/test_latest_frame_buffer.py tests/test_live_integrated_session.py
 pytest -q tests/test_trial_controller.py tests/test_block_controller.py
 ```
 
@@ -567,6 +568,109 @@ python live_calibrate_table.py --use-live-stream --live-host 127.0.0.1 --live-po
 calibration_type = formal_table_lines
 is_formal_calibration = true
 metadata.collection_mode = raw_jsonl_simulated_live / live_stream
+```
+
+## Stage 5C Integrated Live Session
+
+`run_live_integrated_session.py` 是第一版“同一个 live session 内完成 calibration + trial”的命令行 runner。它和 `live_calibrate_table.py` 的区别是：`live_calibrate_table.py` 只生成 calibration 文件；integrated runner 会在采完四段桌面标定后，直接使用内存中的同一个 `FormalCalibration` 对象创建 `TaskCoordinateSystem` 并进入 trial，不要求用户先退出程序再加载 `calibration.json`。
+
+推荐正式开发优先用这个连续流程，避免“先保存 calibration 文件、再启动实验程序”造成现场坐标系和 trial 坐标系不一致。当前它仍然标记为 `is_formal_experiment=false`，因为还没有正式 GUI、haptic hardware 和完整实验序列。
+
+运行示例：
+
+```powershell
+python run_live_integrated_session.py ^
+  --map-config maps\examples\xoy_turn.json ^
+  --host 127.0.0.1 ^
+  --port 8888 ^
+  --out-dir data\live_integrated_session\debug_01 ^
+  --subject-id S001 ^
+  --trial-id trial_001
+```
+
+建议流程：
+
+```text
+1. 先启动 run_live_integrated_session.py。
+2. 再启动 manus_vive_com，让它连接 127.0.0.1:8888。
+3. 按提示依次采 origin / long_axis_line / width_axis_line / diagonal_line。
+4. 查看 calibration quality；如果需要确认，按提示继续。
+5. 按 Enter 进入 trial。
+6. 结束后用 analyze_session.py 复盘 session。
+```
+
+分析结果：
+
+```powershell
+python analyze_session.py --session-dir data\live_integrated_session\debug_01\session --overwrite
+```
+
+常用参数：
+
+```text
+--map-config                     必填，MapConfig JSON
+--out-dir                        默认 data/live_integrated_session
+--session-dir                    可选；不传默认 out_dir/session
+--overwrite-session              覆盖已有 session 目录
+--subject-id                     可选
+--trial-id                       默认 live_integrated_trial
+--sample-duration-seconds        默认 5.0，每段标定采样时长
+--min-samples                    默认 10
+--min-line-length                默认 0.10 m
+--point-source                   tracker_position_world / pinch_center_world
+--confirm-calibration / --no-confirm-calibration
+--control-rate-hz                默认 60
+--max-frames                     可选，调试时常用
+--duration-seconds               可选
+--pinch-grab-threshold           可选，覆盖 EngineConfig 默认值
+--pinch-release-threshold        可选，覆盖 EngineConfig 默认值
+--slip-motion-threshold          可选，覆盖 EngineConfig 默认值
+--ignore-task-z                  debug only，放宽 z 方向地图判定
+--task-z-half-extent             默认 5.0，仅配合 --ignore-task-z
+--display-mode                   text / none，默认 text
+--print-every                    默认 30
+--anchor-current-pinch-debug     debug only，默认关闭
+```
+
+输出位置：
+
+```text
+out_dir/raw_frames.jsonl
+out_dir/calibration.json
+out_dir/summary.json
+out_dir/session/session_meta.json
+out_dir/session/calibration.json
+out_dir/session/trial_config.json
+out_dir/session/raw_frames.jsonl
+out_dir/session/device_frames.jsonl
+out_dir/session/processed_frames.csv
+out_dir/session/events.csv
+out_dir/session/haptic.csv
+out_dir/session/trial_summary.json
+```
+
+校验 calibration / trial_config / session_meta 是否使用同一个 calibration：
+
+```powershell
+python -c "import json, pathlib; s=pathlib.Path(r'data\live_integrated_session\debug_01\session'); c=json.loads((s/'calibration.json').read_text()); m=json.loads((s/'session_meta.json').read_text()); t=json.loads((s/'trial_config.json').read_text()); print(c['calibration_id'], m['calibration_id'], t['calibration_id']); print(t['task_coordinate_system']==c['task_coordinate_system'])"
+```
+
+期望输出中三个 `calibration_id` 一致，最后一行是 `True`。这表示 trial 使用的 task 坐标系和保存到 session 的 calibration JSON 一致。
+
+`--anchor-current-pinch-debug` 只能用于调试地图位置。启用后 runner 只平移 `MapConfig`，不会修改 calibration；并且会在 `session_meta.json`、`trial_config.json`、`summary.json` 中写：
+
+```text
+map_anchor_mode = current_pinch_debug
+is_formal_experiment = false
+warning = Map was translated to current pinch for debugging; this is not a formal calibrated trial.
+```
+
+单次 `Ctrl+C` 会进入安全收尾：停止接收线程、finalize session、写 `summary.json`，并记录：
+
+```text
+run_stop_reason = keyboard_interrupt
+phase_at_stop
+session_finalized
 ```
 
 ## `analyze_session.py`
@@ -1204,8 +1308,8 @@ python calibrate_from_raw_jsonl_table.py --raw-jsonl path\to\raw_frames.jsonl --
 当前默认阈值在 `config.py`：
 
 ```text
-pinch_grab_threshold = 0.025
-pinch_release_threshold = 0.035
+pinch_grab_threshold = 0.1
+pinch_release_threshold = 0.12
 ```
 
 单位按米理解。如果真实 pinch distance 常见值远大于 0.035，需要重新评估 node、坐标尺度或阈值。
@@ -1220,15 +1324,15 @@ pinch_release_threshold = 0.035
 
 ```text
 没有正式 GUI
-没有真实 socket live loop
 没有触觉硬件控制
 没有自动读取 YAML 配置
 没有完整 MANUS/Vive rotation fusion
-没有正式在线 calibration GUI；当前只有命令行版 live table-line calibration runner
+没有正式在线 calibration GUI；当前只有命令行版 live table-line calibration / integrated runner
+run_live_integrated_session.py 是 Stage 5C 第一版 CLI 连续流程，仍标记 is_formal_experiment=false
 offline_replay_autocalibrated.py 的 MapConfig replay 仍使用 post-hoc auto calibration，不能标记成正式实验
 offline_replay_formal_calibrated.py 使用 formal calibration，但仍是 offline replay，不是 live formal trial
 run_live_raw_preview.py 只是实时 raw stream smoke test，不启动正式 trial
 MapTemplate replay 是旧数据诊断/探索工具，不是正式实验地图
 ```
 
-比较自然的下一步是：把 MapConfig 接入正式在线 trial/session 配置路径，并实现正式受试者标定流程。
+比较自然的下一步是：把 integrated runner 发展成正式 GUI/实验序列，并接入真实 haptic hardware。

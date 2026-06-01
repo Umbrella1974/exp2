@@ -113,11 +113,23 @@ def build_axes_from_table_lines(
     plane_fit = fit_plane_3d(all_points)
 
     up_axis = np.asarray(choose_up_direction(plane_fit["normal_world"], up_hint), dtype=float)
+    long_raw_fitted_direction = np.asarray(normalize_vector(long_fit["direction_world"]), dtype=float)
+    long_fitted_direction = long_raw_fitted_direction.copy()
+    long_motion_direction = _motion_direction_from_record(long_line)
+    long_direction_flipped = False
+    if long_motion_direction is not None and float(np.dot(long_fitted_direction, long_motion_direction)) < 0.0:
+        long_fitted_direction = -long_fitted_direction
+        long_direction_flipped = True
+    long_fit = {
+        **long_fit,
+        "direction_world": long_fitted_direction.tolist(),
+    }
     long_direction = np.asarray(project_vector_to_plane(long_fit["direction_world"], up_axis))
     width_direction = np.asarray(project_vector_to_plane(width_fit["direction_world"], up_axis))
     diagonal_direction = np.asarray(project_vector_to_plane(diagonal_fit["direction_world"], up_axis))
     y_axis = _normalize(np.cross(up_axis, long_direction))
     x_axis = _normalize(np.cross(y_axis, up_axis))
+    width_dot_y = float(np.dot(width_direction, y_axis))
 
     quality = {
         "plane_fit_rmse_m": plane_fit["rmse_m"],
@@ -128,6 +140,14 @@ def build_axes_from_table_lines(
         "long_line_length_m": long_fit["line_length_m"],
         "width_line_length_m": width_fit["line_length_m"],
         "diagonal_line_length_m": diagonal_fit["line_length_m"],
+        "long_line_motion_direction_world": (
+            long_motion_direction.tolist() if long_motion_direction is not None else None
+        ),
+        "long_line_fitted_direction_world": long_raw_fitted_direction.tolist(),
+        "long_line_direction_flipped_to_match_motion": long_direction_flipped,
+        "width_line_dot_y_axis": width_dot_y,
+        "width_line_angle_to_y_axis_degrees": angle_degrees(width_direction, y_axis),
+        "width_line_direction_matches_y_positive": width_dot_y >= 0.0,
         "long_width_angle_degrees": _acute_angle(long_direction, width_direction),
         "width_y_angle_degrees": _acute_angle(width_direction, y_axis),
         "x_y_angle_degrees": angle_degrees(x_axis, y_axis),
@@ -168,6 +188,16 @@ def _line_fit_from_record(record: object) -> dict[str, Any]:
     if points is None:
         raise ValueError("line record must contain fit, direction_world, or points_world.")
     return fit_line_3d(points)
+
+
+def _motion_direction_from_record(record: object) -> np.ndarray | None:
+    payload = _record_payload(record)
+    points = payload.get("points_world", payload.get("samples_world"))
+    if points is None or len(points) < 2:
+        return None
+    array = _as_points(points, minimum=2)
+    motion = array[-1] - array[0]
+    return _normalize(motion)
 
 
 def _collect_line_points(*records: object) -> np.ndarray:
