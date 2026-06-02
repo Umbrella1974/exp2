@@ -45,6 +45,9 @@ def test_integrated_session_completes_and_keeps_calibration_consistent(tmp_path:
     assert meta["calibration_id"] == "cal_consistent"
     assert trial_config["calibration_id"] == "cal_consistent"
     assert trial_config["task_coordinate_system"] == calibration["task_coordinate_system"]
+    assert trial_config["pinch_position_mode"] == "nodes_world"
+    assert meta["pinch_position_mode"] == "nodes_world"
+    assert result.summary["pinch_position_mode"] == "nodes_world"
     assert result.summary["map_anchor_mode"] == "none"
     assert meta["map_anchor_mode"] == "none"
     assert trial_config["map_anchor_mode"] == "none"
@@ -78,6 +81,32 @@ def test_no_gui_does_not_preflight_gui_dependencies(
 
     assert result.summary["run_stop_reason"] == "max_frames"
     assert result.summary["gui_enabled"] is False
+
+
+def test_rejecting_calibration_confirmation_restarts_calibration(tmp_path: Path) -> None:
+    source = FakeLiveSource(frame_interval=0.001)
+    config = _config(
+        tmp_path,
+        calibration_id="cal_retry_confirm",
+        max_frames=1,
+        confirm_calibration=True,
+    )
+    continue_prompts = 0
+
+    def input_fn(message: str) -> str:
+        nonlocal continue_prompts
+        _set_mode_from_prompt(source, message)
+        if "Continue with this calibration" in message:
+            continue_prompts += 1
+            return "n" if continue_prompts == 1 else "y"
+        return ""
+
+    result = run_live_integrated_session(config, source=source, input_fn=input_fn)
+
+    assert continue_prompts == 2
+    assert result.summary["run_stop_reason"] == "max_frames"
+    assert result.summary["session_finalized"] is True
+    assert any("restarting calibration" in status.message for status in result.statuses)
 
 
 def test_live_gui_publishes_snapshots_and_close_does_not_stop_trial(
@@ -555,6 +584,8 @@ def _config(
     no_frame_timeout_seconds: float = 5.0,
     gui: bool = False,
     gui_fps: float = 30.0,
+    sample_duration_seconds: float = 1.02,
+    confirm_calibration: bool = False,
 ) -> LiveIntegratedSessionConfig:
     return LiveIntegratedSessionConfig(
         map_config=map_path or _write_valid_map(tmp_path / "map.json"),
@@ -563,10 +594,10 @@ def _config(
         overwrite_session=True,
         trial_id="trial_001",
         calibration_id=calibration_id,
-        sample_duration_seconds=1.02,
+        sample_duration_seconds=sample_duration_seconds,
         min_samples=2,
         min_line_length=min_line_length,
-        confirm_calibration=False,
+        confirm_calibration=confirm_calibration,
         allow_calibration_warnings=True,
         control_rate_hz=240.0,
         max_frames=max_frames,

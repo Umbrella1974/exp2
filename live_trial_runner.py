@@ -46,6 +46,7 @@ class LiveTrialRunnerConfig:
     index_node: int = 9
     tracker_index: int = 0
     skeleton_index: int = 0
+    pinch_position_mode: str = "tracker_plus_local"
     haptic_hardware_enabled: bool = False
 
 
@@ -143,6 +144,7 @@ class LiveTrialRunner:
             tracker_index=config.tracker_index,
             thumb_tip_node_id=config.thumb_node,
             index_tip_node_id=config.index_node,
+            pinch_position_mode=config.pinch_position_mode,
             timestamp_scale=config.timestamp_scale,
         )
         self.adapter = ManusViveExperimentAdapter(None, config=self.adapter_config)
@@ -312,6 +314,7 @@ class LiveTrialRunner:
                 "events_count": self._events_count,
                 "callback_error_count": self._callback_error_count,
                 "haptic_hardware_enabled": self.config.haptic_hardware_enabled,
+                "pinch_position_mode": self.config.pinch_position_mode,
                 "warnings": list(self.warnings),
             }
         )

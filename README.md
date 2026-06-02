@@ -632,11 +632,21 @@ python analyze_session.py --session-dir data\live_integrated_session\debug_01\se
 --gui                            debug display，在 trial running 阶段打开 GUI
 --gui-fps                        默认 30，GUI 轮询/刷新频率
 --anchor-current-pinch-debug     debug only，默认关闭
+--pinch-position-mode            nodes_world / tracker_plus_local，默认 nodes_world
 --stream-wait-timeout-seconds    默认 60，等不到任何 raw frame 会安全退出
 --valid-tracker-timeout-seconds  默认 60，等不到 tracker_valid=True 会安全退出
 --valid-pinch-timeout-seconds    默认 60，第一版只记录到 config/summary
 --no-frame-timeout-seconds       默认 5，trial running 中长时间无新帧会退出
 ```
+
+`--pinch-position-mode` 用来解释 MANUS skeleton node 的 `position`：
+
+```text
+nodes_world          node position 已经是 world 坐标，实机 MANUS/Vive live stream 默认用这个
+tracker_plus_local   旧假设：node position 是 tracker-local 小偏移，需要加 tracker world position
+```
+
+如果实机 GUI 里手/物块相对标定原点整体跑飞，优先检查这个字段。2026-06-02 的实机数据表明发送方给的 MANUS node position 是米级 world 坐标，因此 live integrated runner 默认使用 `nodes_world`。
 
 第一次实机测试建议显式加一个总时长和 text display，避免人还在调发送端时误以为程序卡死：
 
@@ -671,6 +681,8 @@ python run_live_integrated_session.py ^
 ```
 
 这个 GUI 是 debug display，不是正式实验 lifecycle GUI。它只在 trial running 阶段订阅 `DashboardSnapshot`，calibration / waiting 阶段不伪造 snapshot；窗口刚打开但还没有 trial snapshot 时只显示 waiting 文本。
+
+如果 calibration quality 出来后你在 `Continue with this calibration? [y/N]` 里选择 no 或直接回车，runner 会重新进入四段 calibration，而不是退出整个流程。只有 calibration 采集失败后，在 `Retry calibration? [y/N]` 里选择 no，才会停止本次 run。
 
 如果一直没有发送端连接，或连接后一直没有有效 tracker，runner 不会无限等待；它会写 `out_dir/summary.json` 后退出。常见停止原因：
 

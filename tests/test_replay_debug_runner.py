@@ -61,6 +61,24 @@ def test_replay_debug_runner_from_session_dir_discovers_files(tmp_path: Path) ->
     assert result.summary["session_dir"] == str(session_dir)
 
 
+def test_replay_debug_infers_nodes_world_for_legacy_live_integrated_session(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    _write_raw_jsonl(session_dir / "raw_frames.jsonl")
+    _write_task_calibration(session_dir / "calibration.json")
+    _write_trial_config(session_dir / "trial_config.json")
+    (session_dir / "session_meta.json").write_text(
+        json.dumps({"mode": "live_integrated_session", "trial_id": "live_trial"}),
+        encoding="utf-8",
+    )
+
+    result = run_replay_debug(ReplayDebugConfig(session_dir=session_dir, replay_timing="fast"))
+
+    assert result.summary["pinch_position_mode"] == "nodes_world"
+    assert result.last_snapshot is not None
+    assert result.last_snapshot.pinch_center_task[0] == pytest.approx(0.0)
+
+
 def test_replay_debug_runner_fails_clearly_when_inputs_missing(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="calibration_json"):
         run_replay_debug(

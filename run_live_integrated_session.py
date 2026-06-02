@@ -92,6 +92,7 @@ class LiveIntegratedSessionConfig:
     index_node: int = 9
     tracker_index: int = 0
     skeleton_index: int = 0
+    pinch_position_mode: str = "nodes_world"
     timestamp_scale: float = 0.001
     socket_timeout: float | None = None
     stream_wait_timeout_seconds: float = 60.0
@@ -226,6 +227,26 @@ def run_live_integrated_session(
             calibration_segment_time_mode = _calibration_segment_time_mode(calibration_result.segment_summaries)
             if calibration_result.calibration is not None and not calibration_result.errors:
                 calibration = _mark_integrated_calibration(calibration_result.calibration)
+                review_warnings = [*warnings, *calibration_result.warnings]
+                set_status(LiveSessionPhase.CALIBRATION_REVIEW, "Calibration completed; reviewing quality.")
+                _print_calibration_review(calibration, review_warnings, enabled=config.display_mode == "text")
+                if calibration.warnings and not config.allow_calibration_warnings:
+                    errors.extend(calibration.warnings)
+                    run_stop_reason = "calibration_failed"
+                    phase_at_stop = LiveSessionPhase.CALIBRATION_FAILED.name
+                    set_status(LiveSessionPhase.CALIBRATION_FAILED, "Calibration warnings are not allowed.")
+                    raise _SessionAbort
+                if config.confirm_calibration and not _ask_yes_no(
+                    input_fn,
+                    "Continue with this calibration? [y/N] ",
+                    default=False,
+                ):
+                    calibration = None
+                    set_status(
+                        LiveSessionPhase.READY_FOR_CALIBRATION,
+                        "Calibration rejected; restarting calibration.",
+                    )
+                    continue
                 warnings.extend(calibration_result.warnings)
                 break
 
@@ -248,19 +269,6 @@ def run_live_integrated_session(
                 raise _SessionAbort
 
         assert calibration is not None
-        set_status(LiveSessionPhase.CALIBRATION_REVIEW, "Calibration completed; reviewing quality.")
-        _print_calibration_review(calibration, warnings, enabled=config.display_mode == "text")
-        if calibration.warnings and not config.allow_calibration_warnings:
-            errors.extend(calibration.warnings)
-            run_stop_reason = "calibration_failed"
-            phase_at_stop = LiveSessionPhase.CALIBRATION_FAILED.name
-            set_status(LiveSessionPhase.CALIBRATION_FAILED, "Calibration warnings are not allowed.")
-            raise _SessionAbort
-        if config.confirm_calibration and not _ask_yes_no(input_fn, "Continue with this calibration? [y/N] ", default=False):
-            run_stop_reason = "calibration_rejected"
-            phase_at_stop = LiveSessionPhase.CALIBRATION_REVIEW.name
-            raise _SessionAbort
-
         save_calibration(calibration, calibration_out_path)
         task_system = build_task_coordinate_system_from_calibration(calibration)
         set_status(LiveSessionPhase.READY_FOR_TRIAL, "Loading map and preparing trial.")
@@ -499,6 +507,7 @@ def _run_integrated_calibration(
         index_node=config.index_node,
         tracker_index=config.tracker_index,
         skeleton_index=config.skeleton_index,
+        pinch_position_mode=config.pinch_position_mode,
         print_every=config.print_every,
     )
 
@@ -801,6 +810,7 @@ def _trial_config_payload(
             "control_rate_hz": config.control_rate_hz,
             "ignore_task_z": config.ignore_task_z,
             "task_z_half_extent": config.task_z_half_extent if config.ignore_task_z else None,
+            "pinch_position_mode": config.pinch_position_mode,
             "haptic_hardware_enabled": False,
             "warnings": list(warnings) + list(map_warnings),
         }
@@ -832,6 +842,7 @@ def _session_meta(
         "scene_type": "map_config",
         "map_anchor_mode": map_anchor["mode"],
         "haptic_hardware_enabled": False,
+        "pinch_position_mode": config.pinch_position_mode,
         "warnings": list(warnings),
     }
     if map_anchor["mode"] == "current_pinch_debug":
@@ -900,6 +911,7 @@ def _build_summary(
         "map_warnings": list(map_warnings),
         "map_anchor_mode": str(map_anchor.get("mode", "none")),
         "map_anchor": dict(map_anchor),
+        "pinch_position_mode": config.pinch_position_mode,
         "stream_wait_timeout_seconds": config.stream_wait_timeout_seconds,
         "valid_tracker_timeout_seconds": config.valid_tracker_timeout_seconds,
         "valid_pinch_timeout_seconds": config.valid_pinch_timeout_seconds,
@@ -1184,6 +1196,7 @@ def _adapter_config(config: LiveIntegratedSessionConfig) -> DeviceAdapterConfig:
         tracker_index=config.tracker_index,
         thumb_tip_node_id=config.thumb_node,
         index_tip_node_id=config.index_node,
+        pinch_position_mode=config.pinch_position_mode,
         timestamp_scale=config.timestamp_scale,
     )
 
@@ -1201,6 +1214,7 @@ def _live_trial_runner_config(config: LiveIntegratedSessionConfig) -> LiveTrialR
         index_node=config.index_node,
         tracker_index=config.tracker_index,
         skeleton_index=config.skeleton_index,
+        pinch_position_mode=config.pinch_position_mode,
         haptic_hardware_enabled=False,
     )
 
@@ -1357,6 +1371,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--index-node", default=9, type=int)
     parser.add_argument("--tracker-index", default=0, type=int)
     parser.add_argument("--skeleton-index", default=0, type=int)
+    parser.add_argument(
+        "--pinch-position-mode",
+        choices=("nodes_world", "tracker_plus_local"),
+        default="nodes_world",
+        help="How MANUS node positions are interpreted; live MANUS/Vive streams usually use nodes_world.",
+    )
     parser.add_argument("--timestamp-scale", default=0.001, type=float)
     parser.add_argument("--socket-timeout", default=None, type=float)
     parser.add_argument("--stream-wait-timeout-seconds", default=60.0, type=float)
@@ -1434,6 +1454,7 @@ def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
         index_node=args.index_node,
         tracker_index=args.tracker_index,
         skeleton_index=args.skeleton_index,
+        pinch_position_mode=args.pinch_position_mode,
         timestamp_scale=args.timestamp_scale,
         socket_timeout=args.socket_timeout,
         stream_wait_timeout_seconds=args.stream_wait_timeout_seconds,

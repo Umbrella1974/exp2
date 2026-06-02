@@ -11,9 +11,10 @@ from trial_controller import ExperimentInputSample
 class ManusViveExperimentAdapter:
     """Convert parsed device frames into ExperimentInputSample objects.
 
-    Stage 3 first uses a simplified spatial model:
+    The original Stage 3 spatial model treats MANUS node positions as tracker-local:
     pinch_center_world = tracker_position_world + local_offset + pinch_center_local * local_scale.
-    use_tracker_rotation is reserved for later calibration work and is not applied yet.
+    Real MANUS/Vive live streams can instead publish node positions already in world
+    coordinates; set DeviceAdapterConfig.pinch_position_mode="nodes_world" for that case.
     """
 
     def __init__(
@@ -50,11 +51,7 @@ class ManusViveExperimentAdapter:
                 metadata=_metadata(device_frame, feature.valid),
             )
 
-        pinch_center_world = (
-            device_frame.tracker.pose_world.position
-            + self.config.local_offset
-            + feature.pinch_center_local * self.config.local_scale
-        )
+        pinch_center_world = self._pinch_center_world(device_frame, feature.pinch_center_local)
         return ExperimentInputSample(
             time=device_frame.time,
             pinch_center_world=pinch_center_world,
@@ -64,6 +61,12 @@ class ManusViveExperimentAdapter:
             subject_end=_subject_end(device_frame),
             metadata=_metadata(device_frame, feature.valid),
         )
+
+    def _pinch_center_world(self, device_frame: DeviceFrame, pinch_center_node: object):
+        pinch_component = pinch_center_node * self.config.local_scale + self.config.local_offset
+        if self.config.pinch_position_mode == "nodes_world":
+            return pinch_component
+        return device_frame.tracker.pose_world.position + pinch_component
 
 
 def _subject_end(device_frame: DeviceFrame) -> bool:

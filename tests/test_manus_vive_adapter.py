@@ -54,6 +54,8 @@ def test_device_adapter_config_normalizes_offset_and_validates_scale() -> None:
         DeviceAdapterConfig(local_offset=[1.0, 2.0])
     with pytest.raises(ValueError):
         DeviceAdapterConfig(local_scale=float("inf"))
+    with pytest.raises(ValueError):
+        DeviceAdapterConfig(pinch_position_mode="bad")
 
 
 def test_valid_device_frame_outputs_world_sample() -> None:
@@ -67,6 +69,17 @@ def test_valid_device_frame_outputs_world_sample() -> None:
     assert np.allclose(sample.pinch_center_world, [1.12, 2.0, 3.0])
     assert sample.pinch_distance == pytest.approx(0.02)
     assert sample.subject_end is True
+
+
+def test_nodes_world_mode_uses_manus_nodes_without_adding_tracker_position() -> None:
+    adapter = ManusViveExperimentAdapter(
+        None,
+        config=DeviceAdapterConfig(pinch_position_mode="nodes_world"),
+    )
+    sample = adapter.to_experiment_input_sample(make_device_frame())
+
+    assert sample.tracker_valid is True
+    assert np.allclose(sample.pinch_center_world, [0.01, 0.0, 0.0])
 
 
 def test_tracker_invalid_outputs_invalid_sample() -> None:

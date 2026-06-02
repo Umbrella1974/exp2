@@ -37,6 +37,8 @@ def as_rotation4(value: object | None, *, field_name: str = "rotation") -> np.nd
 class DeviceAdapterConfig:
     """Configuration for Stage 3 parsing and simple device adaptation."""
 
+    PINCH_POSITION_MODES = ("tracker_plus_local", "nodes_world")
+
     skeleton_index: int = 0
     tracker_index: int = 0
     thumb_tip_node_id: int = 4
@@ -44,6 +46,7 @@ class DeviceAdapterConfig:
     local_offset: object = field(default_factory=lambda: np.zeros(3))
     local_scale: float = 1.0
     use_tracker_rotation: bool = False
+    pinch_position_mode: str = "tracker_plus_local"
     timestamp_scale: float = 1.0
 
     def __post_init__(self) -> None:
@@ -56,6 +59,12 @@ class DeviceAdapterConfig:
         if not isfinite(scale):
             raise ValueError("local_scale must be a finite float.")
         object.__setattr__(self, "local_scale", scale)
+
+        mode = str(self.pinch_position_mode)
+        if mode not in self.PINCH_POSITION_MODES:
+            allowed = ", ".join(self.PINCH_POSITION_MODES)
+            raise ValueError(f"pinch_position_mode must be one of: {allowed}.")
+        object.__setattr__(self, "pinch_position_mode", mode)
 
         timestamp_scale = float(self.timestamp_scale)
         if not isfinite(timestamp_scale):

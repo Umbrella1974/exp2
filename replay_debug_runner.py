@@ -142,6 +142,7 @@ def run_replay_debug(
             index_node=config.index_node,
             tracker_index=config.tracker_index,
             skeleton_index=config.skeleton_index,
+            pinch_position_mode=_pinch_position_mode_for_replay(inputs.trial_config, inputs.session_meta),
         ),
         map_id=str(inputs.trial_config.get("map_id", "")),
         calibration_id=str(inputs.calibration_payload.get("calibration_id", "")),
@@ -198,6 +199,16 @@ def run_replay_debug(
         last_snapshot=runner.last_snapshot,
         snapshot_count=replay_state["snapshots"],
     )
+
+
+def _pinch_position_mode_for_replay(trial_config: dict[str, Any], session_meta: dict[str, Any]) -> str:
+    explicit = trial_config.get("pinch_position_mode", session_meta.get("pinch_position_mode"))
+    if explicit is not None:
+        return str(explicit)
+    mode = str(trial_config.get("mode", session_meta.get("mode", "")))
+    if mode == "live_integrated_session":
+        return "nodes_world"
+    return "tracker_plus_local"
 
 
 def _resolve_input_paths(config: ReplayDebugConfig) -> tuple[Path, Path, Path, Path | None]:

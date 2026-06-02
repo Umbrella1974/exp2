@@ -71,6 +71,7 @@ class CalibrationLiveConfig:
     index_node: int = 9
     tracker_index: int = 0
     skeleton_index: int = 0
+    pinch_position_mode: str = "tracker_plus_local"
     print_every: int = 30
     queue_cleared_before_segment: bool = False
 
@@ -560,6 +561,7 @@ def _adapter_config(config: CalibrationLiveConfig) -> DeviceAdapterConfig:
         tracker_index=config.tracker_index,
         thumb_tip_node_id=config.thumb_node,
         index_tip_node_id=config.index_node,
+        pinch_position_mode=config.pinch_position_mode,
         timestamp_scale=config.timestamp_scale,
     )
 
