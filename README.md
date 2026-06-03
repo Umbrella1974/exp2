@@ -631,6 +631,7 @@ python analyze_session.py --session-dir data\live_integrated_session\debug_01\se
 --print-every                    默认 30
 --gui                            debug display，在 trial running 阶段打开 GUI
 --gui-fps                        默认 30，GUI 轮询/刷新频率
+--termination-config             可选，JSON/YAML 保护性 trial 终止配置
 --anchor-current-pinch-debug     debug only，默认关闭
 --pinch-position-mode            nodes_world / tracker_plus_local，默认 nodes_world
 --stream-wait-timeout-seconds    默认 60，等不到任何 raw frame 会安全退出
@@ -682,6 +683,44 @@ python run_live_integrated_session.py ^
 
 这个 GUI 是 debug display，不是正式实验 lifecycle GUI。它只在 trial running 阶段订阅 `DashboardSnapshot`，calibration / waiting 阶段不伪造 snapshot；窗口刚打开但还没有 trial snapshot 时只显示 waiting 文本。
 
+当前 trial 结束逻辑是人工完成，不做自动 target success。受试者认为物块到终点后，实验员在终端按 `e` 结束当前 trial；程序会记录手动结束时的 block / pinch / target 诊断状态，但不会因为 block center 进入 target 自动判成功。`q` 是 operator abort，会中止本次 run；GUI Close 仍然只关闭显示层，不停止 trial/session，也不会产生 `MANUAL_COMPLETED` 或 `ABORTED_BY_OPERATOR`。
+
+终端按键第一版只保证 Windows `msvcrt` 非阻塞读取。运行时会打印：
+
+```text
+Operator commands:
+  e = end current trial as MANUAL_COMPLETED
+  q = abort whole run
+  GUI close = close display only, does not stop trial
+```
+
+保护性自动停止由 termination config 控制，默认值是：
+
+```json
+{
+  "max_trial_duration_seconds": 600.0,
+  "max_detach_count": 20,
+  "manual_completion_enabled": true,
+  "timeout_enabled": true,
+  "detach_limit_enabled": true
+}
+```
+
+其中 `max_detach_count=20` 表示允许 20 次 detach/release，第 21 次触发 `FAILED_TOO_MANY_DETACHES`。`timeout_enabled=true` 时，trial 运行超过 `max_trial_duration_seconds` 会记录 `trial_outcome=FAILED_TIMEOUT`、`end_reason=trial_timeout`。`detach_limit_enabled=true` 时，`TrialController` 的 `total_detach_count > max_detach_count` 会记录 `trial_outcome=FAILED_TOO_MANY_DETACHES`、`end_reason=too_many_detaches`。slip 和 blocked 只是事件/诊断，不导致失败。
+
+可以把 termination config 写成 JSON 后传入：
+
+```powershell
+python run_live_integrated_session.py ^
+  --map-config maps\examples\xoy_turn.json ^
+  --host 127.0.0.1 ^
+  --port 8888 ^
+  --out-dir data\live_integrated_session\debug_termination ^
+  --termination-config config\termination_debug.json
+```
+
+也支持 `.yaml` / `.yml`，但会 lazy import `PyYAML`；如果没安装，会给出明确的安装提示。最终生效的配置会写入 `out_dir/session/termination_config.json`，并同时进入 `summary.json`、`session_meta.json`、`trial_config.json` 和 `trial_summary.json`。`--duration-seconds` 是 debug 外层运行时长上限，结果是 `DURATION_REACHED`；它和保护性 `max_trial_duration_seconds` 的 `FAILED_TIMEOUT` 严格分开。
+
 如果 calibration quality 出来后你在 `Continue with this calibration? [y/N]` 里选择 no 或直接回车，runner 会重新进入四段 calibration，而不是退出整个流程。只有 calibration 采集失败后，在 `Retry calibration? [y/N]` 里选择 no，才会停止本次 run。
 
 如果一直没有发送端连接，或连接后一直没有有效 tracker，runner 不会无限等待；它会写 `out_dir/summary.json` 后退出。常见停止原因：
@@ -723,6 +762,7 @@ out_dir/session/device_frames.jsonl
 out_dir/session/processed_frames.csv
 out_dir/session/events.csv
 out_dir/session/haptic.csv
+out_dir/session/termination_config.json
 out_dir/session/trial_summary.json
 out_dir/session/gui_diagnostics.csv       仅 --gui 时，优先写入这里
 ```
@@ -750,6 +790,44 @@ run_stop_reason = keyboard_interrupt
 phase_at_stop
 session_finalized
 ```
+
+trial outcome 相关字段会优先使用 runner-level `trial_outcome` / `end_reason`，而不是只依赖 `TrialController.state`。常见结果包括：
+
+```text
+MANUAL_COMPLETED             实验员按 e 手动完成 trial
+ABORTED_BY_OPERATOR          实验员按 q 中止 run
+FAILED_TIMEOUT               保护性 trial timeout
+FAILED_TOO_MANY_DETACHES     detach/release 次数超过阈值
+SOURCE_STOPPED               source 主动停止
+CLIENT_DISCONNECTED          live client 断开
+NO_NEW_FRAME_TIMEOUT         trial running 中长时间没有新帧
+DURATION_REACHED             --duration-seconds debug stop
+MAX_FRAMES_REACHED           --max-frames debug stop
+INTERRUPTED                  KeyboardInterrupt / GUI error 等中断
+```
+
+target 诊断只记录，不自动结束 trial。summary/trial summary 中会尽量写入：
+
+```text
+block_center_task_position_at_end
+pinch_task_position_at_end
+block_center_in_target_at_end
+distance_to_target_at_end
+contact_state_at_end
+block_motion_state_at_end
+stop_reason_at_end
+detach_state_at_end
+slip_active_at_end
+slip_reason_at_end
+blocked_force_active_at_end
+logical_haptic_label_at_end
+first_target_entry_time
+first_target_entry_frame_index
+last_snapshot_time
+last_frame_index
+```
+
+如果 `target_region` 缺失或无法识别，上述 target 诊断会写 `null`，并在 warnings 里记录 `target_region missing; target diagnostics are limited.`。
 
 ### Stage 5C LiveTrialRunner 结构
 
@@ -782,12 +860,38 @@ gui_snapshot_update_count
 gui_overwritten_snapshot_count
 gui_diagnostics_path
 gui_close_time
+trial_outcome
+end_reason
+operator_command
+operator_command_time
+manual_completed
+operator_aborted
+trial_start_time
+trial_end_time
+trial_duration_seconds
+detach_count
+block_center_task_position_at_end
+pinch_task_position_at_end
+block_center_in_target_at_end
+distance_to_target_at_end
+contact_state_at_end
+block_motion_state_at_end
+stop_reason_at_end
+detach_state_at_end
+slip_active_at_end
+slip_reason_at_end
+blocked_force_active_at_end
+logical_haptic_label_at_end
+first_target_entry_time
+first_target_entry_frame_index
+last_snapshot_time
+last_frame_index
 ```
 
 调试这层结构时可以只跑：
 
 ```powershell
-pytest -q tests/test_live_trial_runner.py tests/test_live_integrated_session.py
+pytest -q tests/test_termination_config.py tests/test_live_trial_runner.py tests/test_live_integrated_session.py
 ```
 
 ### Stage 5D Replay / Live Debug GUI Prototype
@@ -862,7 +966,7 @@ summary/session finalize 会等用户关闭 GUI 后继续
 
 live `--gui` 的 runtime stats 第一版显示已有且可靠的字段：snapshot age、GUI fps/render lag、overwritten snapshot count、raw dropped frames、parse errors。`receive_fps` 如果没有可靠来源，显示为 N/A，不硬造。
 
-已知风险：当前 live `--gui` 是 debug display，不是正式实验 lifecycle GUI。在 Windows/Qt 下，`Ctrl+C` 行为可能不如纯 CLI 模式直接；如果需要停止整个 run，仍依赖现有 runner 的 `KeyboardInterrupt` / `request_stop` / `stop_event` 机制。后续正式 GUI 阶段需要单独设计 Stop / Abort / Pause / Resume 和完整生命周期控制。
+已知风险：当前 live `--gui` 是 debug display，不是正式实验 lifecycle GUI。在 Windows/Qt 下，`Ctrl+C` 行为可能不如纯 CLI 模式直接；如果 Qt 窗口获得焦点，终端里的 `e/q` 读取也可能不如纯 CLI 稳定。如果需要停止整个 run，仍依赖现有 runner 的 `KeyboardInterrupt` / `request_stop` / `stop_event` 机制。后续正式 GUI 阶段需要单独设计 Stop / Abort / Pause / Resume 和完整生命周期控制。
 
 ## `analyze_session.py`
 

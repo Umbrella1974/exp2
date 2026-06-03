@@ -8,7 +8,7 @@ import math
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
@@ -41,6 +41,7 @@ from map_config import (
 )
 from raw_manus_vive_parser import parse_raw_manus_vive_frame
 from session_recorder import SessionRecorder
+from termination_config import TerminationConfig, default_termination_config, load_termination_config
 from trial_controller import ExperimentInputSample
 
 
@@ -86,6 +87,8 @@ class LiveIntegratedSessionConfig:
     print_every: int = 30
     gui: bool = False
     gui_fps: float = 30.0
+    termination_config: TerminationConfig = field(default_factory=default_termination_config)
+    termination_config_path: Path | None = None
     anchor_current_pinch_debug: bool = False
     anchor_timeout_seconds: float = 10.0
     thumb_node: int = 4
@@ -310,9 +313,11 @@ def run_live_integrated_session(
             calibration=calibration_to_dict(calibration),
             trial_config=trial_config,
         )
+        _write_json(session_dir / "termination_config.json", config.termination_config.to_dict())
         set_status(LiveSessionPhase.READY_FOR_TRIAL, "Press Enter to start trial.", map_id=map_config.map_id)
         _prompt(input_fn, "Press Enter to start trial...")
         set_status(LiveSessionPhase.TRIAL_RUNNING, "Trial running.", map_id=map_config.map_id)
+        _print_operator_commands(enabled=config.display_mode == "text", gui_enabled=config.gui)
         if config.gui:
             gui_snapshot_store = _make_latest_snapshot_store()
             gui_diagnostics_path = (
@@ -347,7 +352,7 @@ def run_live_integrated_session(
             snapshot_callback=gui_snapshot_store.publish if gui_snapshot_store is not None else None,
             source_stop_reason_getter=lambda: _source_stop_reason_from_pump(pump),
             source_stats_getter=lambda: pump.stats_snapshot(),
-            user_quit_checker=_user_requested_quit,
+            operator_command_checker=_read_operator_command,
         )
         if gui_snapshot_store is not None:
             live_trial_result = _run_live_trial_with_gui(
@@ -470,14 +475,24 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint."""
 
     args = _parse_args(argv)
-    config = _config_from_args(args)
+    try:
+        config = _config_from_args(args)
+    except Exception as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        return 2
     try:
         result = run_live_integrated_session(config)
     except LiveGuiDependencyError as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print(json.dumps(result.summary, indent=2, ensure_ascii=False, sort_keys=True))
-    if result.summary.get("run_stop_reason") in {"completed", "max_frames", "duration_reached", "user_quit"}:
+    if result.summary.get("run_stop_reason") in {
+        "completed",
+        "max_frames",
+        "duration_reached",
+        "operator_manual_complete",
+        "user_quit",
+    }:
         return 0
     if result.summary.get("run_stop_reason") == "keyboard_interrupt":
         return 130
@@ -758,6 +773,7 @@ def _translate_point(point: list[float], translation: list[float]) -> list[float
 
 def _engine_config(config: LiveIntegratedSessionConfig, block_size: Any) -> EngineConfig:
     defaults = EngineConfig()
+    termination = config.termination_config
     return EngineConfig(
         block_size_x=block_size.x,
         block_size_y=block_size.y,
@@ -777,8 +793,16 @@ def _engine_config(config: LiveIntegratedSessionConfig, block_size: Any) -> Engi
             if config.slip_motion_threshold is None
             else config.slip_motion_threshold
         ),
-        trial_timeout_seconds=1e9,
-        max_detach_count=1_000_000_000,
+        trial_timeout_seconds=(
+            termination.max_trial_duration_seconds
+            if termination.timeout_enabled
+            else 1e9
+        ),
+        max_detach_count=(
+            termination.max_detach_count
+            if termination.detach_limit_enabled
+            else 1_000_000_000
+        ),
     )
 
 
@@ -811,6 +835,10 @@ def _trial_config_payload(
             "ignore_task_z": config.ignore_task_z,
             "task_z_half_extent": config.task_z_half_extent if config.ignore_task_z else None,
             "pinch_position_mode": config.pinch_position_mode,
+            "termination_config": config.termination_config.to_dict(),
+            "termination_config_path": (
+                str(config.termination_config_path) if config.termination_config_path is not None else None
+            ),
             "haptic_hardware_enabled": False,
             "warnings": list(warnings) + list(map_warnings),
         }
@@ -843,6 +871,10 @@ def _session_meta(
         "map_anchor_mode": map_anchor["mode"],
         "haptic_hardware_enabled": False,
         "pinch_position_mode": config.pinch_position_mode,
+        "termination_config": config.termination_config.to_dict(),
+        "termination_config_path": (
+            str(config.termination_config_path) if config.termination_config_path is not None else None
+        ),
         "warnings": list(warnings),
     }
     if map_anchor["mode"] == "current_pinch_debug":
@@ -912,6 +944,15 @@ def _build_summary(
         "map_anchor_mode": str(map_anchor.get("mode", "none")),
         "map_anchor": dict(map_anchor),
         "pinch_position_mode": config.pinch_position_mode,
+        "termination_config": config.termination_config.to_dict(),
+        "termination_config_path": (
+            str(config.termination_config_path) if config.termination_config_path is not None else None
+        ),
+        "max_trial_duration_seconds": config.termination_config.max_trial_duration_seconds,
+        "max_detach_count": config.termination_config.max_detach_count,
+        "manual_completion_enabled": config.termination_config.manual_completion_enabled,
+        "timeout_enabled": config.termination_config.timeout_enabled,
+        "detach_limit_enabled": config.termination_config.detach_limit_enabled,
         "stream_wait_timeout_seconds": config.stream_wait_timeout_seconds,
         "valid_tracker_timeout_seconds": config.valid_tracker_timeout_seconds,
         "valid_pinch_timeout_seconds": config.valid_pinch_timeout_seconds,
@@ -1215,6 +1256,9 @@ def _live_trial_runner_config(config: LiveIntegratedSessionConfig) -> LiveTrialR
         tracker_index=config.tracker_index,
         skeleton_index=config.skeleton_index,
         pinch_position_mode=config.pinch_position_mode,
+        manual_completion_enabled=config.termination_config.manual_completion_enabled,
+        timeout_enabled=config.termination_config.timeout_enabled,
+        detach_limit_enabled=config.termination_config.detach_limit_enabled,
         haptic_hardware_enabled=False,
     )
 
@@ -1245,6 +1289,32 @@ def _merge_live_trial_runner_summary(
         "callback_error_count",
         "mean_callback_latency_ms",
         "max_callback_latency_ms",
+        "trial_outcome",
+        "end_reason",
+        "operator_command",
+        "operator_command_time",
+        "manual_completed",
+        "operator_aborted",
+        "trial_start_time",
+        "trial_end_time",
+        "trial_duration_seconds",
+        "detach_count",
+        "block_center_task_position_at_end",
+        "pinch_task_position_at_end",
+        "block_center_in_target_at_end",
+        "distance_to_target_at_end",
+        "contact_state_at_end",
+        "block_motion_state_at_end",
+        "stop_reason_at_end",
+        "detach_state_at_end",
+        "slip_active_at_end",
+        "slip_reason_at_end",
+        "blocked_force_active_at_end",
+        "logical_haptic_label_at_end",
+        "first_target_entry_time",
+        "first_target_entry_frame_index",
+        "last_snapshot_time",
+        "last_frame_index",
     )
     for key in legacy_keys:
         if key in runner_summary:
@@ -1317,16 +1387,31 @@ def _parse_vec3(value: str) -> list[float]:
     return [float(part) for part in parts]
 
 
-def _user_requested_quit() -> bool:
+def _print_operator_commands(*, enabled: bool, gui_enabled: bool) -> None:
+    if not enabled:
+        return
+    print("[OPERATOR] commands:")
+    print("  e = end current trial as MANUAL_COMPLETED")
+    print("  q = abort whole run")
+    if gui_enabled:
+        print("  GUI close = close display only, does not stop trial")
+
+
+def _read_operator_command() -> str | None:
     try:
         import msvcrt
 
         if msvcrt.kbhit():
             key = msvcrt.getwch()
-            return key.lower() == "q"
-        return False
+            value = key.lower()
+            return value if value in {"e", "q"} else None
+        return None
     except ImportError:
-        return False
+        return None
+
+
+def _user_requested_quit() -> bool:
+    return _read_operator_command() == "q"
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -1365,6 +1450,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--print-every", default=30, type=int)
     parser.add_argument("--gui", action="store_true", help="Open the debug display during trial running.")
     parser.add_argument("--gui-fps", default=30.0, type=float)
+    parser.add_argument("--termination-config", default=None, help="JSON/YAML protective termination config.")
     parser.add_argument("--anchor-current-pinch-debug", action="store_true")
     parser.add_argument("--anchor-timeout-seconds", default=10.0, type=float)
     parser.add_argument("--thumb-node", default=4, type=int)
@@ -1416,6 +1502,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
+    termination_path = Path(args.termination_config) if args.termination_config is not None else None
+    termination = load_termination_config(termination_path)
     return LiveIntegratedSessionConfig(
         map_config=Path(args.map_config),
         host=args.host,
@@ -1448,6 +1536,8 @@ def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
         print_every=args.print_every,
         gui=args.gui,
         gui_fps=args.gui_fps,
+        termination_config=termination,
+        termination_config_path=termination_path,
         anchor_current_pinch_debug=args.anchor_current_pinch_debug,
         anchor_timeout_seconds=args.anchor_timeout_seconds,
         thumb_node=args.thumb_node,

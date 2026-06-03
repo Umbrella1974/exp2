@@ -419,3 +419,15 @@ Operator commands:
 12. 哪些测试新增/更新。
 13. 测试结果。
 14. 当前已知风险。
+
+确认这些默认决策。
+
+补充要求：
+1. e/q 第一版只保证 Windows msvcrt，可以接受；--gui 下 Qt 窗口焦点导致终端按键不稳要写入 known risks。
+2. max_detach_count=20 表示允许 20 次，第 21 次触发失败，使用 total_detach_count > max_detach_count，不改。
+3. MANUAL_COMPLETED 不塞进 TrialState，放在 LiveTrialRunner/runner outcome 层记录。但 summary/trial summary 必须以 runner-level trial_outcome/end_reason 为准，不能只依赖 TrialController.state。
+4. q 可以保留 run_stop_reason=user_quit 兼容旧字段，但必须新增 trial_outcome=ABORTED_BY_OPERATOR、end_reason=operator_abort、operator_command=q。
+5. termination config 支持 JSON；yaml/yml 用 lazy PyYAML，缺依赖清晰报错。
+6. target_region 缺失时 target diagnostics 写 null，并记录 warning，不硬判。
+7. --duration-seconds 是 debug 外层 stop，写 DURATION_REACHED；termination timeout 是保护性失败，写 FAILED_TIMEOUT，二者严格分开。
+8. 建议在 event/metrics/summary 中记录 operator_manual_complete / operator_abort 事件及其时间，用于后处理。

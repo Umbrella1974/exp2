@@ -60,6 +60,9 @@ def test_integrated_session_completes_and_keeps_calibration_consistent(tmp_path:
     assert result.summary["calibration_segment_time_mode"] == "monotonic_live"
     assert result.summary["live_trial_runner_summary"]["trial_id"] == "trial_001"
     assert result.summary["live_trial_runner_summary"]["total_processed_frames"] == 3
+    assert result.summary["termination_config"]["max_trial_duration_seconds"] == pytest.approx(600.0)
+    assert result.summary["termination_config"]["max_detach_count"] == 20
+    assert _read_json(session_dir / "termination_config.json")["max_detach_count"] == 20
     assert result.summary["gui_enabled"] is False
     assert result.summary["gui_closed"] is False
     assert result.summary["gui_requested_stop"] is False
@@ -107,6 +110,67 @@ def test_rejecting_calibration_confirmation_restarts_calibration(tmp_path: Path)
     assert result.summary["run_stop_reason"] == "max_frames"
     assert result.summary["session_finalized"] is True
     assert any("restarting calibration" in status.message for status in result.statuses)
+
+
+def test_termination_config_json_is_loaded_and_written(tmp_path: Path) -> None:
+    source = FakeLiveSource()
+    termination_path = tmp_path / "termination.json"
+    termination_path.write_text(
+        json.dumps(
+            {
+                "max_trial_duration_seconds": 123.0,
+                "max_detach_count": 4,
+                "manual_completion_enabled": True,
+                "timeout_enabled": True,
+                "detach_limit_enabled": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = runner._parse_args(
+        [
+            "--map-config",
+            str(_write_valid_map(tmp_path / "map_for_cli.json")),
+            "--out-dir",
+            str(tmp_path / "out_cli"),
+            "--termination-config",
+            str(termination_path),
+        ]
+    )
+    cli_config = runner._config_from_args(args)
+    config = _config(
+        tmp_path,
+        calibration_id="cal_termination",
+        max_frames=1,
+        termination_config=cli_config.termination_config,
+        termination_config_path=cli_config.termination_config_path,
+    )
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    session_dir = Path(result.summary["session_dir"])
+    termination = _read_json(session_dir / "termination_config.json")
+    assert termination["max_trial_duration_seconds"] == pytest.approx(123.0)
+    assert termination["max_detach_count"] == 4
+    assert result.summary["termination_config_path"] == str(termination_path)
+    assert result.summary["max_trial_duration_seconds"] == pytest.approx(123.0)
+    assert result.summary["max_detach_count"] == 4
+
+
+def test_debug_duration_reached_is_not_protective_timeout(tmp_path: Path) -> None:
+    source = FakeLiveSource()
+    config = _config(
+        tmp_path,
+        calibration_id="cal_duration",
+        max_frames=None,
+        duration_seconds=0.02,
+    )
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    assert result.summary["run_stop_reason"] == "duration_reached"
+    assert result.summary["trial_outcome"] == "DURATION_REACHED"
+    assert result.summary["end_reason"] == "duration_reached"
 
 
 def test_live_gui_publishes_snapshots_and_close_does_not_stop_trial(
@@ -586,6 +650,9 @@ def _config(
     gui_fps: float = 30.0,
     sample_duration_seconds: float = 1.02,
     confirm_calibration: bool = False,
+    duration_seconds: float | None = None,
+    termination_config: Any | None = None,
+    termination_config_path: Path | None = None,
 ) -> LiveIntegratedSessionConfig:
     return LiveIntegratedSessionConfig(
         map_config=map_path or _write_valid_map(tmp_path / "map.json"),
@@ -601,10 +668,13 @@ def _config(
         allow_calibration_warnings=True,
         control_rate_hz=240.0,
         max_frames=max_frames,
+        duration_seconds=duration_seconds,
         display_mode=display_mode,
         print_every=print_every,
         gui=gui,
         gui_fps=gui_fps,
+        termination_config=termination_config or runner.default_termination_config(),
+        termination_config_path=termination_config_path,
         anchor_current_pinch_debug=anchor_current_pinch_debug,
         anchor_timeout_seconds=1.0,
         stream_wait_timeout_seconds=stream_wait_timeout_seconds,
@@ -628,6 +698,11 @@ def _write_valid_map(path: Path) -> Path:
                 "max": [0.6, 0.2, 0.2],
             }
         ],
+        "target_region": {
+            "id": "target",
+            "min": [-0.1, -0.1, -0.1],
+            "max": [0.1, 0.1, 0.1],
+        },
     }
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path

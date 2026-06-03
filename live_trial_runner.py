@@ -21,7 +21,7 @@ from data_models import Vec3
 from device_frame_models import DeviceAdapterConfig
 from manus_vive_adapter import ManusViveExperimentAdapter
 from raw_manus_vive_parser import parse_raw_manus_vive_frame
-from trial_controller import TrialController, TrialState
+from trial_controller import EventRecord, TrialController, TrialState
 
 
 SnapshotCallback = Callable[[DashboardSnapshot], None]
@@ -29,6 +29,7 @@ StatsCallback = Callable[["LiveTrialRunnerStats"], None]
 SourceStopReasonGetter = Callable[[], str | None]
 SourceStatsGetter = Callable[[], dict[str, Any]]
 UserQuitChecker = Callable[[], bool]
+OperatorCommandChecker = Callable[[], str | None]
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,9 @@ class LiveTrialRunnerConfig:
     tracker_index: int = 0
     skeleton_index: int = 0
     pinch_position_mode: str = "tracker_plus_local"
+    manual_completion_enabled: bool = True
+    timeout_enabled: bool = True
+    detach_limit_enabled: bool = True
     haptic_hardware_enabled: bool = False
 
 
@@ -110,6 +114,7 @@ class LiveTrialRunner:
         source_stop_reason_getter: SourceStopReasonGetter | None = None,
         source_stats_getter: SourceStatsGetter | None = None,
         user_quit_checker: UserQuitChecker | None = None,
+        operator_command_checker: OperatorCommandChecker | None = None,
     ) -> None:
         if config.control_rate_hz <= 0.0:
             raise ValueError("control_rate_hz must be > 0.")
@@ -138,6 +143,7 @@ class LiveTrialRunner:
         self.source_stop_reason_getter = source_stop_reason_getter
         self.source_stats_getter = source_stats_getter
         self.user_quit_checker = user_quit_checker
+        self.operator_command_checker = operator_command_checker
 
         self.adapter_config = DeviceAdapterConfig(
             skeleton_index=config.skeleton_index,
@@ -154,9 +160,22 @@ class LiveTrialRunner:
         self._run_stop_reason = "running"
         self._last_new_frame_time = time.monotonic()
         self._run_started_time: float | None = None
+        self._run_end_time: float | None = None
+        self._trial_start_sample_time: float | None = None
+        self._trial_start_monotonic: float | None = None
+        self._trial_end_monotonic: float | None = None
         self._last_snapshot: DashboardSnapshot | None = None
+        self._last_trial_result: Any | None = None
+        self._last_sample_time: float | None = None
         self._trial_started = False
         self._events_count = 0
+        self._operator_command: str | None = None
+        self._operator_command_time: float | None = None
+        self._trial_outcome: str | None = None
+        self._end_reason: str | None = None
+        self._first_target_entry_time: float | None = None
+        self._first_target_entry_frame_index: int | None = None
+        self._target_box = _target_box_from_trial_config(self.trial_config)
 
         self._total_processed_frames = 0
         self._parse_error_count = 0
@@ -174,6 +193,8 @@ class LiveTrialRunner:
         self._callback_latency_ms: list[float] = []
         self._callback_error_count = 0
         self.warnings: list[str] = []
+        if self._target_box is None:
+            self.warnings.append("target_region missing; target diagnostics are limited.")
 
     @property
     def trial_started(self) -> bool:
@@ -200,12 +221,27 @@ class LiveTrialRunner:
             return
         self.trial.start_trial(time_value, self.config.trial_id)
         self._trial_started = True
+        self._trial_start_sample_time = float(time_value)
+        self._trial_start_monotonic = time.monotonic()
 
-    def request_stop(self, reason: str = "stop_requested") -> None:
+    def request_stop(
+        self,
+        reason: str = "stop_requested",
+        *,
+        trial_outcome: str | None = None,
+        end_reason: str | None = None,
+        operator_command: str | None = None,
+    ) -> None:
         """Request the loop to stop at the next safe point."""
 
         self._stop_requested = True
         self._run_stop_reason = reason
+        self._run_end_time = time.monotonic()
+        self._trial_end_monotonic = self._run_end_time
+        if operator_command is not None:
+            self._operator_command = operator_command
+            self._operator_command_time = self._last_sample_time
+        self._set_outcome_for_stop(reason, trial_outcome=trial_outcome, end_reason=end_reason)
 
     def step_once(self) -> DashboardSnapshot | None:
         """Process the latest available frame once.
@@ -235,6 +271,7 @@ class LiveTrialRunner:
             return None
 
         sample = processed["sample"]
+        self._last_sample_time = float(sample.time)
         if not self._trial_started:
             self.start_trial(sample.time)
             self._record_events(live_frame.frame_index, sample.time, self.trial.event_history[-2:])
@@ -255,6 +292,8 @@ class LiveTrialRunner:
             hardware_haptic_active=self.config.haptic_hardware_enabled,
         )
         self._last_snapshot = snapshot
+        self._last_trial_result = result
+        self._update_target_entry(snapshot)
         self._update_snapshot_stats(snapshot)
         self._record_frame(live_frame, processed, sample, result, snapshot)
         self._emit_callbacks(snapshot)
@@ -264,7 +303,11 @@ class LiveTrialRunner:
             TrialState.FAILED_TIMEOUT,
             TrialState.FAILED_TOO_MANY_DETACHES,
         }:
-            self.request_stop(result.trial_state.name.lower())
+            self.request_stop(
+                result.trial_state.name.lower(),
+                trial_outcome=_trial_state_outcome(result.trial_state),
+                end_reason=_trial_state_end_reason(result.trial_state),
+            )
         return snapshot
 
     def run_until_done(self) -> LiveTrialRunnerResult:
@@ -275,13 +318,47 @@ class LiveTrialRunner:
         while not self._stop_requested:
             if self.config.duration_seconds is not None:
                 if time.monotonic() - self._run_started_time >= self.config.duration_seconds:
-                    self.request_stop("duration_reached")
+                    self.request_stop(
+                        "duration_reached",
+                        trial_outcome="DURATION_REACHED",
+                        end_reason="duration_reached",
+                    )
                     break
             if self.config.max_frames is not None and self._total_processed_frames >= self.config.max_frames:
-                self.request_stop("max_frames")
+                self.request_stop(
+                    "max_frames",
+                    trial_outcome="MAX_FRAMES_REACHED",
+                    end_reason="max_frames",
+                )
+                break
+            command = self._read_operator_command()
+            if command == "e":
+                if self.config.manual_completion_enabled:
+                    self._record_operator_event("operator_manual_complete", command)
+                    self.request_stop(
+                        "operator_manual_complete",
+                        trial_outcome="MANUAL_COMPLETED",
+                        end_reason="operator_manual_complete",
+                        operator_command=command,
+                    )
+                    break
+                self.warnings.append("operator manual completion command ignored; manual completion is disabled.")
+            elif command == "q":
+                self._record_operator_event("operator_abort", command)
+                self.request_stop(
+                    "user_quit",
+                    trial_outcome="ABORTED_BY_OPERATOR",
+                    end_reason="operator_abort",
+                    operator_command=command,
+                )
                 break
             if self.user_quit_checker is not None and self.user_quit_checker():
-                self.request_stop("user_quit")
+                self.request_stop(
+                    "user_quit",
+                    trial_outcome="ABORTED_BY_OPERATOR",
+                    end_reason="operator_abort",
+                    operator_command="q",
+                )
                 break
 
             now = time.monotonic()
@@ -293,6 +370,7 @@ class LiveTrialRunner:
 
         if self._run_stop_reason == "running":
             self._run_stop_reason = "completed"
+        self._set_outcome_for_stop(self._run_stop_reason)
         summary = self.build_summary()
         return LiveTrialRunnerResult(
             stats=self.stats_snapshot(),
@@ -315,6 +393,8 @@ class LiveTrialRunner:
                 "callback_error_count": self._callback_error_count,
                 "haptic_hardware_enabled": self.config.haptic_hardware_enabled,
                 "pinch_position_mode": self.config.pinch_position_mode,
+                **self._outcome_summary(),
+                **self._target_diagnostics_summary(),
                 "warnings": list(self.warnings),
             }
         )
@@ -465,11 +545,140 @@ class LiveTrialRunner:
         self._max_no_new_frame_gap_seconds = max(self._max_no_new_frame_gap_seconds, gap)
         source_stop_reason = self._source_stop_reason()
         if source_stop_reason == "client_disconnected":
-            self.request_stop("client_disconnected_during_trial")
+            self.request_stop(
+                "client_disconnected_during_trial",
+                trial_outcome="CLIENT_DISCONNECTED",
+                end_reason="client_disconnected",
+            )
         elif source_stop_reason in {"server_stopped", "socket_error", "eof", "source_stopped"}:
-            self.request_stop("source_stopped_during_trial")
+            self.request_stop(
+                "source_stopped_during_trial",
+                trial_outcome="SOURCE_STOPPED",
+                end_reason="source_stopped",
+            )
         elif gap >= self.config.no_frame_timeout_seconds:
-            self.request_stop("no_new_frame_timeout")
+            self.request_stop(
+                "no_new_frame_timeout",
+                trial_outcome="NO_NEW_FRAME_TIMEOUT",
+                end_reason="no_new_frame_timeout",
+            )
+
+    def _read_operator_command(self) -> str | None:
+        if self.operator_command_checker is None:
+            return None
+        try:
+            command = self.operator_command_checker()
+        except Exception as exc:
+            self.warnings.append(f"operator_command_checker failed: {exc}")
+            return None
+        if command is None:
+            return None
+        command = str(command).strip().lower()
+        if command in {"e", "q"}:
+            return command
+        if command:
+            self.warnings.append(f"unknown operator command ignored: {command}")
+        return None
+
+    def _record_operator_event(self, event_type: str, command: str) -> None:
+        event_time = self._last_sample_time if self._last_sample_time is not None else time.time()
+        self._operator_command = command
+        self._operator_command_time = event_time
+        event = EventRecord(
+            time=float(event_time),
+            trial_id=self.config.trial_id,
+            event_type=event_type,
+            state=self.trial.trial_state if self._trial_started else TrialState.WAITING,
+            value=command,
+            details={
+                "operator_command": command,
+                "trial_outcome": "MANUAL_COMPLETED" if command == "e" else "ABORTED_BY_OPERATOR",
+            },
+        )
+        frame_index = self._last_snapshot.frame_index if self._last_snapshot is not None else -1
+        self._record_events(frame_index, float(event_time), (event,))
+
+    def _set_outcome_for_stop(
+        self,
+        reason: str,
+        *,
+        trial_outcome: str | None = None,
+        end_reason: str | None = None,
+    ) -> None:
+        if trial_outcome is None or end_reason is None:
+            mapped_outcome, mapped_reason = _outcome_for_run_stop_reason(reason)
+            trial_outcome = trial_outcome or mapped_outcome
+            end_reason = end_reason or mapped_reason
+        if self._trial_outcome is None and trial_outcome is not None:
+            self._trial_outcome = trial_outcome
+        if self._end_reason is None and end_reason is not None:
+            self._end_reason = end_reason
+
+    def _update_target_entry(self, snapshot: DashboardSnapshot) -> None:
+        if self._target_box is None or snapshot.block_center_task is None:
+            return
+        block_center = _list_to_vec3(snapshot.block_center_task)
+        if _point_in_box(block_center, self._target_box) and self._first_target_entry_time is None:
+            self._first_target_entry_time = snapshot.time
+            self._first_target_entry_frame_index = snapshot.frame_index
+
+    def _outcome_summary(self) -> dict[str, Any]:
+        if self._trial_outcome is None:
+            self._set_outcome_for_stop(self._run_stop_reason)
+        trial_end_time = self._last_sample_time
+        duration = None
+        if self._trial_start_monotonic is not None:
+            end_monotonic = self._trial_end_monotonic or self._run_end_time or time.monotonic()
+            duration = max(0.0, end_monotonic - self._trial_start_monotonic)
+        elif self._trial_start_sample_time is not None and trial_end_time is not None:
+            duration = max(0.0, float(trial_end_time) - float(self._trial_start_sample_time))
+        detach_count = _detach_count_from_result(self._last_trial_result)
+        return {
+            "trial_outcome": self._trial_outcome,
+            "end_reason": self._end_reason,
+            "operator_command": self._operator_command,
+            "operator_command_time": self._operator_command_time,
+            "manual_completed": self._trial_outcome == "MANUAL_COMPLETED",
+            "operator_aborted": self._trial_outcome == "ABORTED_BY_OPERATOR",
+            "trial_start_time": self._trial_start_sample_time,
+            "trial_end_time": trial_end_time,
+            "trial_duration_seconds": duration,
+            "max_trial_duration_seconds": self.engine_config.trial_timeout_seconds,
+            "detach_count": detach_count,
+            "max_detach_count": self.engine_config.max_detach_count,
+            "manual_completion_enabled": self.config.manual_completion_enabled,
+            "timeout_enabled": self.config.timeout_enabled,
+            "detach_limit_enabled": self.config.detach_limit_enabled,
+            "last_snapshot_time": self._last_snapshot.time if self._last_snapshot is not None else None,
+            "last_frame_index": self._last_snapshot.frame_index if self._last_snapshot is not None else None,
+        }
+
+    def _target_diagnostics_summary(self) -> dict[str, Any]:
+        snapshot = self._last_snapshot
+        block = snapshot.block_center_task if snapshot is not None else None
+        pinch = snapshot.pinch_center_task if snapshot is not None else None
+        block_vec = _list_to_vec3(block) if block is not None else None
+        in_target = None
+        distance = None
+        if self._target_box is not None and block_vec is not None:
+            in_target = _point_in_box(block_vec, self._target_box)
+            distance = _distance_to_box(block_vec, self._target_box)
+        return {
+            "block_center_task_position_at_end": list(block) if block is not None else None,
+            "pinch_task_position_at_end": list(pinch) if pinch is not None else None,
+            "block_center_in_target_at_end": in_target,
+            "distance_to_target_at_end": distance,
+            "contact_state_at_end": snapshot.contact_state if snapshot is not None else None,
+            "block_motion_state_at_end": snapshot.block_motion_state if snapshot is not None else None,
+            "stop_reason_at_end": snapshot.stop_reason if snapshot is not None else None,
+            "detach_state_at_end": snapshot.detach_state if snapshot is not None else None,
+            "slip_active_at_end": snapshot.slip_active if snapshot is not None else None,
+            "slip_reason_at_end": snapshot.slip_reason if snapshot is not None else None,
+            "blocked_force_active_at_end": snapshot.blocked_force_active if snapshot is not None else None,
+            "logical_haptic_label_at_end": snapshot.logical_haptic_label if snapshot is not None else None,
+            "first_target_entry_time": self._first_target_entry_time,
+            "first_target_entry_frame_index": self._first_target_entry_frame_index,
+        }
 
     def _source_stop_reason(self) -> str | None:
         if self.source_stop_reason_getter is None:
@@ -517,3 +726,96 @@ def _to_vec3(value: Any) -> Vec3:
     if len(items) != 3:
         raise ValueError("expected a 3D vector.")
     return Vec3(float(items[0]), float(items[1]), float(items[2]))
+
+
+def _list_to_vec3(value: Any) -> Vec3:
+    return _to_vec3(value)
+
+
+def _target_box_from_trial_config(trial_config: dict[str, Any]) -> tuple[Vec3, Vec3] | None:
+    payload = trial_config.get("target_region")
+    if not isinstance(payload, dict):
+        return None
+    minimum = payload.get("min")
+    maximum = payload.get("max")
+    if minimum is None or maximum is None:
+        return None
+    try:
+        min_vec = _to_vec3(minimum)
+        max_vec = _to_vec3(maximum)
+    except Exception:
+        return None
+    return min_vec, max_vec
+
+
+def _point_in_box(point: Vec3, box: tuple[Vec3, Vec3]) -> bool:
+    minimum, maximum = box
+    return (
+        minimum.x <= point.x <= maximum.x
+        and minimum.y <= point.y <= maximum.y
+        and minimum.z <= point.z <= maximum.z
+    )
+
+
+def _distance_to_box(point: Vec3, box: tuple[Vec3, Vec3]) -> float:
+    minimum, maximum = box
+    dx = _axis_distance(point.x, minimum.x, maximum.x)
+    dy = _axis_distance(point.y, minimum.y, maximum.y)
+    dz = _axis_distance(point.z, minimum.z, maximum.z)
+    return Vec3(dx, dy, dz).norm()
+
+
+def _axis_distance(value: float, minimum: float, maximum: float) -> float:
+    if value < minimum:
+        return minimum - value
+    if value > maximum:
+        return value - maximum
+    return 0.0
+
+
+def _detach_count_from_result(result: Any | None) -> int:
+    if result is None:
+        return 0
+    counts = getattr(getattr(result, "frame_output", None), "detach_counts", None)
+    value = getattr(counts, "total_detach_count", 0)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _trial_state_outcome(state: TrialState) -> str | None:
+    if state == TrialState.ENDED_BY_SUBJECT:
+        return "MANUAL_COMPLETED"
+    if state == TrialState.FAILED_TIMEOUT:
+        return "FAILED_TIMEOUT"
+    if state == TrialState.FAILED_TOO_MANY_DETACHES:
+        return "FAILED_TOO_MANY_DETACHES"
+    return None
+
+
+def _trial_state_end_reason(state: TrialState) -> str | None:
+    if state == TrialState.ENDED_BY_SUBJECT:
+        return "subject_end"
+    if state == TrialState.FAILED_TIMEOUT:
+        return "trial_timeout"
+    if state == TrialState.FAILED_TOO_MANY_DETACHES:
+        return "too_many_detaches"
+    return None
+
+
+def _outcome_for_run_stop_reason(reason: str) -> tuple[str | None, str | None]:
+    mapping = {
+        "operator_manual_complete": ("MANUAL_COMPLETED", "operator_manual_complete"),
+        "user_quit": ("ABORTED_BY_OPERATOR", "operator_abort"),
+        "failed_timeout": ("FAILED_TIMEOUT", "trial_timeout"),
+        "failed_too_many_detaches": ("FAILED_TOO_MANY_DETACHES", "too_many_detaches"),
+        "client_disconnected_during_trial": ("CLIENT_DISCONNECTED", "client_disconnected"),
+        "source_stopped_during_trial": ("SOURCE_STOPPED", "source_stopped"),
+        "no_new_frame_timeout": ("NO_NEW_FRAME_TIMEOUT", "no_new_frame_timeout"),
+        "duration_reached": ("DURATION_REACHED", "duration_reached"),
+        "max_frames": ("MAX_FRAMES_REACHED", "max_frames"),
+        "keyboard_interrupt": ("INTERRUPTED", "keyboard_interrupt"),
+        "gui_error": ("INTERRUPTED", "gui_error"),
+    }
+    return mapping.get(str(reason), (None, str(reason) if reason else None))

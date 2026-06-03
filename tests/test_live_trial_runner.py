@@ -39,6 +39,8 @@ def test_run_until_done_stops_at_max_frames(tmp_path: Path) -> None:
     assert result.stats.run_stop_reason == "max_frames"
     assert result.stats.total_processed_frames == 1
     assert result.summary["trial_controller_started"] is True
+    assert result.summary["trial_outcome"] == "MAX_FRAMES_REACHED"
+    assert result.summary["end_reason"] == "max_frames"
 
 
 def test_parse_error_increments_stats_without_crashing(tmp_path: Path) -> None:
@@ -116,7 +118,135 @@ def test_snapshot_callback_exception_is_counted(tmp_path: Path) -> None:
 
     assert result.stats.run_stop_reason == "max_frames"
     assert result.stats.callback_error_count == 1
-    assert "snapshot_callback failed" in result.summary["warnings"][0]
+    assert any("snapshot_callback failed" in warning for warning in result.summary["warnings"])
+
+
+def test_operator_manual_complete_stops_runner_and_records_event(tmp_path: Path) -> None:
+    runner, _, _ = _make_runner(
+        tmp_path,
+        [_live_frame(0, 0.0), _live_frame(1, 0.0), _live_frame(2, 0.0)],
+        max_frames=None,
+        operator_command_checker=lambda: "e" if runner.last_snapshot is not None else None,
+    )
+
+    result = runner.run_until_done()
+
+    assert result.stats.run_stop_reason == "operator_manual_complete"
+    assert result.summary["trial_outcome"] == "MANUAL_COMPLETED"
+    assert result.summary["end_reason"] == "operator_manual_complete"
+    assert result.summary["operator_command"] == "e"
+    assert result.summary["manual_completed"] is True
+    events = (tmp_path / "session" / "events.csv").read_text(encoding="utf-8")
+    assert "operator_manual_complete" in events
+
+
+def test_operator_abort_keeps_user_quit_compatibility_and_records_outcome(tmp_path: Path) -> None:
+    runner, _, _ = _make_runner(
+        tmp_path,
+        [_live_frame(0, 0.0), _live_frame(1, 0.0)],
+        max_frames=None,
+        operator_command_checker=lambda: "q" if runner.last_snapshot is not None else None,
+    )
+
+    result = runner.run_until_done()
+
+    assert result.stats.run_stop_reason == "user_quit"
+    assert result.summary["trial_outcome"] == "ABORTED_BY_OPERATOR"
+    assert result.summary["end_reason"] == "operator_abort"
+    assert result.summary["operator_command"] == "q"
+    assert result.summary["operator_aborted"] is True
+    events = (tmp_path / "session" / "events.csv").read_text(encoding="utf-8")
+    assert "operator_abort" in events
+
+
+def test_protective_timeout_records_failed_timeout(tmp_path: Path) -> None:
+    runner, _, _ = _make_runner(
+        tmp_path,
+        [_live_frame(0, 0.0), _live_frame(1, 0.0)],
+        max_frames=None,
+        trial_timeout_seconds=0.001,
+    )
+
+    result = runner.run_until_done()
+
+    assert result.stats.run_stop_reason == "failed_timeout"
+    assert result.summary["trial_outcome"] == "FAILED_TIMEOUT"
+    assert result.summary["end_reason"] == "trial_timeout"
+
+
+def test_detach_limit_records_failed_too_many_detaches(tmp_path: Path) -> None:
+    runner, _, _ = _make_runner(
+        tmp_path,
+        [_live_frame(0, 0.0), _live_frame(1, 0.5)],
+        max_frames=None,
+        max_detach_count=0,
+    )
+
+    result = runner.run_until_done()
+
+    assert result.stats.run_stop_reason == "failed_too_many_detaches"
+    assert result.summary["trial_outcome"] == "FAILED_TOO_MANY_DETACHES"
+    assert result.summary["end_reason"] == "too_many_detaches"
+    assert result.summary["detach_count"] == 1
+
+
+def test_target_entry_is_diagnostic_not_auto_success(tmp_path: Path) -> None:
+    runner, _, _ = _make_runner(tmp_path, [_live_frame(0, 0.0)], max_frames=1)
+
+    result = runner.run_until_done()
+
+    assert result.stats.run_stop_reason == "max_frames"
+    assert result.summary["trial_outcome"] == "MAX_FRAMES_REACHED"
+    assert result.summary["block_center_in_target_at_end"] is True
+    assert result.summary["first_target_entry_time"] is not None
+    assert result.summary["contact_state_at_end"] == "INSIDE_BLOCK"
+    assert result.summary["detach_state_at_end"] == "NONE"
+
+
+def test_slip_event_does_not_cause_failure(tmp_path: Path) -> None:
+    runner, _, _ = _make_runner(
+        tmp_path,
+        [
+            _live_frame(0, 0.0),
+            _live_frame(1, 0.05, pinch_distance=0.2),
+        ],
+        max_frames=2,
+    )
+
+    result = runner.run_until_done()
+
+    assert result.stats.run_stop_reason == "max_frames"
+    assert result.summary["trial_outcome"] == "MAX_FRAMES_REACHED"
+    assert result.summary["slip_active_frame_count"] == 1
+    assert result.summary["slip_active_at_end"] is True
+    assert result.summary["slip_reason_at_end"] == "PINCH_INSUFFICIENT"
+
+
+def test_blocked_event_does_not_cause_failure(tmp_path: Path) -> None:
+    runner, _, _ = _make_runner(
+        tmp_path,
+        [_live_frame(0, 0.7), _live_frame(1, 1.1)],
+        max_frames=2,
+        block_initial_center_task=Vec3(0.7, 0.0, 0.0),
+        block_size=Vec3(1.0, 1.0, 1.0),
+        track_region=TrackRegion(
+            boxes=(
+                Box3D(
+                    center=Vec3(0.0, 0.0, 0.0),
+                    size=Vec3(2.0, 2.0, 2.0),
+                ),
+            )
+        ),
+        engine_overrides={"max_hand_delta_per_frame": 0.5},
+    )
+
+    result = runner.run_until_done()
+
+    assert result.stats.run_stop_reason == "max_frames"
+    assert result.summary["trial_outcome"] == "MAX_FRAMES_REACHED"
+    assert result.summary["blocked_frame_count"] == 1
+    assert result.summary["blocked_force_active_at_end"] is True
+    assert result.summary["stop_reason_at_end"] == "TRACK_BLOCKED"
 
 
 def test_logical_haptic_label_counts_are_reported(tmp_path: Path) -> None:
@@ -220,27 +350,42 @@ def _make_runner(
     control_rate_hz: float = 1000.0,
     no_frame_timeout_seconds: float = 0.05,
     max_frames: int | None = 1,
+    operator_command_checker: Any = None,
+    trial_timeout_seconds: float = 1e9,
+    max_detach_count: int = 1_000_000,
+    block_initial_center_task: Vec3 | None = None,
+    block_size: Vec3 | None = None,
+    track_region: TrackRegion | None = None,
+    engine_overrides: dict[str, Any] | None = None,
 ) -> tuple[LiveTrialRunner, SessionRecorder, _FakeLatestFrameBuffer]:
     buffer = _FakeLatestFrameBuffer(frames)
+    block_initial_center_task = block_initial_center_task or Vec3(0.0, 0.0, 0.0)
+    block_size = block_size or Vec3(0.2, 0.2, 0.2)
+    engine_kwargs = {
+        "block_size_x": block_size.x,
+        "block_size_y": block_size.y,
+        "block_size_z": block_size.z,
+        "trial_timeout_seconds": trial_timeout_seconds,
+        "max_detach_count": max_detach_count,
+    }
+    if engine_overrides is not None:
+        engine_kwargs.update(engine_overrides)
     recorder = SessionRecorder(tmp_path / "session", overwrite=True)
     recorder.start_session(
         session_meta={"mode": "test_live_trial_runner"},
         calibration=None,
-        trial_config={"mode": "test_live_trial_runner"},
+        trial_config={
+            "mode": "test_live_trial_runner",
+            "target_region": {"min": [-0.1, -0.1, -0.1], "max": [0.1, 0.1, 0.1]},
+        },
     )
     runner = LiveTrialRunner(
         latest_frame_buffer=buffer,
         task_coordinate_system=_task_system(),
-        track_region=_track_region(),
-        block_initial_center_task=Vec3(0.0, 0.0, 0.0),
-        block_size=Vec3(0.2, 0.2, 0.2),
-        engine_config=EngineConfig(
-            block_size_x=0.2,
-            block_size_y=0.2,
-            block_size_z=0.2,
-            trial_timeout_seconds=1e9,
-            max_detach_count=1_000_000,
-        ),
+        track_region=track_region or _track_region(),
+        block_initial_center_task=block_initial_center_task,
+        block_size=block_size,
+        engine_config=EngineConfig(**engine_kwargs),
         session_recorder=recorder,
         config=LiveTrialRunnerConfig(
             trial_id="trial_test",
@@ -250,10 +395,14 @@ def _make_runner(
         ),
         map_id="test_map",
         calibration_id="test_calibration",
-        trial_config={"mode": "test_live_trial_runner"},
+        trial_config={
+            "mode": "test_live_trial_runner",
+            "target_region": {"min": [-0.1, -0.1, -0.1], "max": [0.1, 0.1, 0.1]},
+        },
         snapshot_callback=snapshot_callback,
         source_stop_reason_getter=source_stop_reason_getter,
         source_stats_getter=source_stats_getter or (lambda: {"total_received_frames": buffer.put_count}),
+        operator_command_checker=operator_command_checker,
     )
     return runner, recorder, buffer
 
@@ -282,8 +431,13 @@ def _live_frame(
     x_position: float,
     *,
     raw_frame: Any | None = None,
+    pinch_distance: float = 0.01,
 ) -> LiveRawFrame:
-    raw = raw_frame if raw_frame is not None else _raw_frame(float(frame_index), [x_position, 0.0, 0.0])
+    raw = (
+        raw_frame
+        if raw_frame is not None
+        else _raw_frame(float(frame_index), [x_position, 0.0, 0.0], pinch_distance=pinch_distance)
+    )
     return LiveRawFrame(
         frame_index=frame_index,
         raw_frame=raw,
@@ -293,7 +447,8 @@ def _live_frame(
     )
 
 
-def _raw_frame(seconds: float, position: list[float]) -> dict[str, Any]:
+def _raw_frame(seconds: float, position: list[float], *, pinch_distance: float = 0.01) -> dict[str, Any]:
+    half_pinch = float(pinch_distance) / 2.0
     return {
         "timestamp": seconds * 1000.0,
         "frame": int(seconds),
@@ -302,8 +457,8 @@ def _raw_frame(seconds: float, position: list[float]) -> dict[str, Any]:
                 "gloveId": "glove-a",
                 "side": "left",
                 "nodes": [
-                    {"id": 4, "position": [-0.005, 0.0, 0.0]},
-                    {"id": 9, "position": [0.005, 0.0, 0.0]},
+                    {"id": 4, "position": [-half_pinch, 0.0, 0.0]},
+                    {"id": 9, "position": [half_pinch, 0.0, 0.0]},
                 ],
             }
         ],
