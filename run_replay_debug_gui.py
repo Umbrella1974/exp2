@@ -102,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         except Exception as exc:
             result_holder["error"] = exc
+            stop_event.set()
 
     def handle_replay_gui_closed() -> None:
         cue_runtime.handle_gui_closed()

@@ -340,6 +340,53 @@ def test_live_gui_publishes_snapshots_and_close_does_not_stop_trial(
     assert gui_calls[0]["has_render_callback"] is True
 
 
+def test_live_gui_closes_when_trial_worker_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FakeLiveSource()
+    config = _config(tmp_path, calibration_id="cal_gui_error", max_frames=None, gui=True)
+    trial_started = {"value": False}
+    gui_close_requested = {"value": False}
+    original_step_once = runner.LiveTrialRunner.step_once
+
+    def input_fn(message: str) -> str:
+        _set_mode_from_prompt(source, message)
+        if "start trial" in message:
+            trial_started["value"] = True
+        return ""
+
+    def raising_after_one_processed_frame(self: Any) -> Any:
+        snapshot = original_step_once(self)
+        if trial_started["value"] and self.stats_snapshot().total_processed_frames >= 1:
+            raise RuntimeError("synthetic gui trial failure")
+        return snapshot
+
+    def fake_debug_gui(**kwargs: Any) -> int:
+        close_when = kwargs.get("close_when")
+        assert callable(close_when)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if close_when():
+                gui_close_requested["value"] = True
+                kwargs["snapshot_store"].mark_gui_closed()
+                return 0
+            time.sleep(0.001)
+        raise AssertionError("GUI was not asked to close after live trial worker error")
+
+    monkeypatch.setattr(runner, "_preflight_live_gui_dependencies", lambda: None)
+    monkeypatch.setattr(runner.LiveTrialRunner, "step_once", raising_after_one_processed_frame)
+    monkeypatch.setattr(runner, "_run_live_debug_gui", fake_debug_gui)
+
+    result = runner.run_live_integrated_session(config, source=source, input_fn=input_fn)
+
+    assert gui_close_requested["value"] is True
+    assert result.summary["run_stop_reason"] == "error"
+    assert result.summary["gui_closed"] is True
+    assert result.summary["total_processed_frames"] == 1
+    assert "synthetic gui trial failure" in result.summary["errors"]
+
+
 def test_live_gui_dependency_failure_happens_before_live_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -450,6 +497,42 @@ def test_keyboard_interrupt_during_trial_finalizes_session(
     assert result.summary["run_stop_reason"] == "keyboard_interrupt"
     assert result.summary["session_finalized"] is True
     assert _read_json(session_dir / "trial_summary.json")["run_stop_reason"] == "keyboard_interrupt"
+
+
+def test_trial_exception_summary_keeps_processed_runner_stats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FakeLiveSource()
+    config = _config(tmp_path, calibration_id="cal_trial_error", max_frames=None)
+    trial_started = {"value": False}
+    original_step_once = runner.LiveTrialRunner.step_once
+
+    def input_fn(message: str) -> str:
+        _set_mode_from_prompt(source, message)
+        if "start trial" in message:
+            trial_started["value"] = True
+        return ""
+
+    def raising_after_one_processed_frame(self: Any) -> Any:
+        snapshot = original_step_once(self)
+        if trial_started["value"] and self.stats_snapshot().total_processed_frames >= 1:
+            raise RuntimeError("synthetic trial failure")
+        return snapshot
+
+    monkeypatch.setattr(runner.LiveTrialRunner, "step_once", raising_after_one_processed_frame)
+
+    result = runner.run_live_integrated_session(config, source=source, input_fn=input_fn)
+
+    session_dir = Path(result.summary["session_dir"])
+    trial_summary = _read_json(session_dir / "trial_summary.json")
+    assert result.summary["run_stop_reason"] == "error"
+    assert result.summary["session_finalized"] is True
+    assert result.summary["total_processed_frames"] == 1
+    assert result.summary["last_frame_index"] is not None
+    assert result.summary["live_trial_runner_summary"]["total_processed_frames"] == 1
+    assert "synthetic trial failure" in result.summary["errors"]
+    assert trial_summary["total_processed_frames"] == 1
 
 
 def test_calibration_error_stops_before_trial(tmp_path: Path) -> None:

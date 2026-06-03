@@ -463,6 +463,21 @@ def run_live_integrated_session(
         run_stop_reason = "error"
         errors.append(str(exc))
         phase_at_stop = phase.name
+        if live_trial_runner is not None:
+            live_trial_runner.request_stop("error")
+            trial_runner_summary = dict(live_trial_runner.build_summary())
+            trial_stats = live_trial_runner.stats_snapshot()
+            trial_controller_started = live_trial_runner.trial_started
+            processed_count = trial_stats.total_processed_frames
+            tracker_invalid_count = trial_stats.tracker_invalid_frame_count
+            hand_invalid_count = trial_stats.hand_invalid_frame_count
+            pinch_valid_count = trial_stats.pinch_valid_frame_count
+            slip_active_count = trial_stats.slip_active_frame_count
+            blocked_count = trial_stats.blocked_frame_count
+            no_new_frame_count = trial_stats.no_new_frame_count
+            max_no_new_frame_gap_seconds = trial_stats.max_no_new_frame_gap_seconds
+            logical_counts = Counter(trial_stats.logical_haptic_label_counts)
+            latency_ms = []
         set_status(LiveSessionPhase.ERROR, str(exc))
     finally:
         set_status(LiveSessionPhase.SAVING, "Saving outputs.")
@@ -1249,6 +1264,7 @@ def _run_live_trial_with_gui(
             render_callback=timing_diagnostics.record_gui_render,
             cue_store=cue_runtime.gui_cue_store,
             close_callback=cue_runtime.handle_gui_closed,
+            close_when=lambda: bool(result_holder),
             visual_settings=visual_settings,
         )
     except KeyboardInterrupt:
@@ -1282,6 +1298,7 @@ def _run_live_debug_gui(
     render_callback: Callable[[Any, float], None] | None = None,
     cue_store: Any | None = None,
     close_callback: Callable[[], None] | None = None,
+    close_when: Callable[[], bool] | None = None,
     visual_settings: Any | None = None,
 ) -> int:
     try:
@@ -1303,6 +1320,7 @@ def _run_live_debug_gui(
             render_callback=render_callback,
             cue_store=cue_store,
             close_callback=close_callback,
+            close_when=close_when,
             visual_profile=visual_settings.visual_profile,
             status_panel=visual_settings.status_panel,
             show_axes=visual_settings.show_axes,

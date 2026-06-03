@@ -6,6 +6,8 @@ from math import inf
 
 from data_models import BlockedInfo, Box3D, ClampResult, Surface, TrackRegion, Vec3
 
+ROUNDING_TOLERANCE = 1e-12
+
 
 def point_in_box(point: Vec3, box: Box3D, epsilon: float = 0.0) -> bool:
     """Return whether a point lies inside an axis-aligned box."""
@@ -67,7 +69,11 @@ def clamp_segment_to_track(
     """
 
     if not point_in_track(start, track_region, epsilon=epsilon):
-        raise ValueError("Segment start must already be inside the track.")
+        repaired_start = _repair_point_near_track(start, track_region, epsilon)
+        if repaired_start is not None:
+            start = repaired_start
+        else:
+            raise ValueError("Segment start must already be inside the track.")
 
     coverage_end = _continuous_coverage_end(start, end, track_region, epsilon)
     if coverage_end >= 1.0:
@@ -87,6 +93,14 @@ def clamp_segment_to_track(
             high = mid
 
     clamped_point = lerp_vec3(start, end, low)
+    if not point_in_track(clamped_point, track_region, epsilon=epsilon):
+        # Floating-point interpolation can land one ULP beyond the
+        # epsilon-expanded boundary, which would make the next frame fail its
+        # segment-start precondition.
+        repaired_point = _repair_point_near_track(clamped_point, track_region, epsilon)
+        if repaired_point is None:
+            raise ValueError("Clamped point fell outside the track.")
+        clamped_point = repaired_point
     blocked_info = _blocked_info_from_vector(end - clamped_point, surface_threshold)
     return ClampResult(
         clamped_point=clamped_point,
@@ -193,6 +207,14 @@ def _closest_point_in_track(point: Vec3, track_region: TrackRegion) -> Vec3:
 
     assert best_point is not None
     return best_point
+
+
+def _repair_point_near_track(point: Vec3, track_region: TrackRegion, epsilon: float) -> Vec3 | None:
+    closest_point = _closest_point_in_track(point, track_region)
+    allowed_distance = max(0.0, epsilon) + ROUNDING_TOLERANCE
+    if point.distance_to(closest_point) <= allowed_distance:
+        return closest_point
+    return None
 
 
 def _closest_point_on_box(point: Vec3, box: Box3D) -> Vec3:

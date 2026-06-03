@@ -278,6 +278,51 @@ def test_replay_gui_close_stops_remaining_replay_without_waiting(
     assert summary["run_stop_reason"] == "replay_stop_requested"
 
 
+def test_replay_worker_error_requests_gui_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    raw_path = _write_raw_jsonl(tmp_path / "raw_frames.jsonl")
+    calibration_path = _write_task_calibration(tmp_path / "calibration.json")
+    trial_config_path = _write_trial_config(tmp_path / "trial_config.json")
+    gui_closed = {"value": False}
+
+    monkeypatch.setattr(run_replay_debug_gui, "preflight_gui_dependencies", lambda: None)
+
+    def failing_replay(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise ValueError("worker failed")
+
+    def wait_for_worker_error(**kwargs: Any) -> int:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if kwargs["close_when"]():
+                gui_closed["value"] = True
+                return 0
+            time.sleep(0.001)
+        raise AssertionError("GUI was not asked to close after replay worker error")
+
+    monkeypatch.setattr(run_replay_debug_gui, "run_replay_debug", failing_replay)
+    monkeypatch.setattr(run_replay_debug_gui, "run_debug_gui", wait_for_worker_error)
+
+    exit_code = replay_gui_main(
+        [
+            "--raw-jsonl",
+            str(raw_path),
+            "--calibration-json",
+            str(calibration_path),
+            "--trial-config-json",
+            str(trial_config_path),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert gui_closed["value"] is True
+    assert "Replay failed: worker failed" in captured.err
+
+
 def test_replay_explicit_invalid_cue_config_exits_before_run(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

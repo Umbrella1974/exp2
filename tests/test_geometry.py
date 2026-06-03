@@ -56,6 +56,43 @@ def test_clamp_segment_to_track_returns_boundary_point_when_candidate_outside() 
     assert result.blocked_info.blocked_distance == pytest.approx(0.5, abs=1e-4)
 
 
+def test_clamp_segment_to_track_repairs_roundoff_beyond_epsilon_boundary() -> None:
+    track = TrackRegion(
+        boxes=(Box3D(center=Vec3(0.5, 0.0, 0.0), size=Vec3(1.0, 0.3, 0.2)),)
+    )
+    start = Vec3(
+        0.02256292805558857,
+        -0.011491414110070236,
+        -0.0663903242186911,
+    )
+    end = Vec3(
+        -1.4145210275913405,
+        -1.7641823226747584,
+        0.5364659769450415,
+    )
+
+    result = clamp_segment_to_track(start, end, track, epsilon=1e-6, iterations=24)
+
+    assert point_in_track(result.clamped_point, track, epsilon=1e-6)
+    clamp_segment_to_track(result.clamped_point, end, track, epsilon=1e-6, iterations=24)
+
+
+def test_clamp_segment_to_track_repairs_start_just_beyond_epsilon_boundary() -> None:
+    track = TrackRegion(
+        boxes=(Box3D(center=Vec3(0.5, 0.0, 0.0), size=Vec3(1.0, 0.3, 0.2)),)
+    )
+    start = Vec3(
+        -1.0000000000000243e-6,
+        0.003481417077180043,
+        0.012691967189171744,
+    )
+    end = Vec3(-0.01, 0.01, 0.02)
+
+    result = clamp_segment_to_track(start, end, track, epsilon=1e-6, iterations=24)
+
+    assert point_in_track(result.clamped_point, track, epsilon=1e-6)
+
+
 def test_clamp_segment_to_track_allows_continuous_face_touch_union() -> None:
     track = TrackRegion(
         boxes=(
