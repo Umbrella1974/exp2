@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 import threading
 from pathlib import Path
@@ -88,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     result_holder: dict[str, Any] = {}
+    stop_event = threading.Event()
 
     def replay_worker() -> None:
         try:
@@ -96,18 +98,29 @@ def main(argv: list[str] | None = None) -> int:
                 snapshot_store=store,
                 timing_diagnostics=timing_diagnostics,
                 cue_runtime=cue_runtime,
+                stop_event=stop_event,
             )
         except Exception as exc:
             result_holder["error"] = exc
 
+    def handle_replay_gui_closed() -> None:
+        cue_runtime.handle_gui_closed()
+        stop_event.set()
+
     thread = threading.Thread(target=replay_worker, name="ReplayDebugRunner", daemon=False)
     thread.start()
+    previous_sigint_handler: Any | None = None
+    sigint_handler_installed = False
     try:
+        if threading.current_thread() is threading.main_thread():
+            previous_sigint_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, lambda _signum, _frame: stop_event.set())
+            sigint_handler_installed = True
         exit_code = run_debug_gui(
             snapshot_store=store,
             scene=inputs.scene,
             mode="replay",
-            gui_fps=args.gui_fps,
+            gui_fps=config.gui_fps,
             title="Exp2 Replay Debug GUI",
             log_path=(Path(args.out_dir) / "gui_diagnostics.csv") if args.out_dir else None,
             runtime_stats_getter=lambda: {
@@ -117,21 +130,34 @@ def main(argv: list[str] | None = None) -> int:
             },
             render_callback=timing_diagnostics.record_gui_render,
             cue_store=cue_runtime.gui_cue_store,
-            close_callback=cue_runtime.handle_gui_closed,
+            close_callback=handle_replay_gui_closed,
+            close_when=stop_event.is_set,
             visual_profile=visual_settings.visual_profile,
             status_panel=visual_settings.status_panel,
             show_axes=visual_settings.show_axes,
             show_grid=visual_settings.show_grid,
         )
     except GuiDependencyError:
+        stop_event.set()
         cue_runtime.end_session()
         print(INSTALL_GUI_DEPS_MESSAGE, file=sys.stderr)
         thread.join(timeout=1.0)
         return 1
     except KeyboardInterrupt:
+        stop_event.set()
         store.mark_gui_closed()
         thread.join()
         return 130
+    except Exception as exc:
+        stop_event.set()
+        store.mark_gui_closed()
+        thread.join()
+        cue_runtime.end_session()
+        print(f"GUI failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if sigint_handler_installed:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
 
     thread.join()
     if "error" in result_holder:
@@ -164,7 +190,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--index-node", default=9, type=int)
     parser.add_argument("--tracker-index", default=0, type=int)
     parser.add_argument("--skeleton-index", default=0, type=int)
-    parser.add_argument("--headless", action="store_true", help="Run replay without opening the GUI.")
+    display_group = parser.add_mutually_exclusive_group()
+    display_group.add_argument(
+        "--gui",
+        action="store_true",
+        help="Open the GUI. This is already the default and is accepted for live CLI symmetry.",
+    )
+    display_group.add_argument("--headless", action="store_true", help="Run replay without opening the GUI.")
     parser.add_argument("--cue-sink", choices=CUE_SINK_CHOICES, default="logging")
     parser.add_argument("--cue-config", default=None, help="JSON/YAML cue generation config.")
     parser.add_argument("--visual-profile", choices=VISUAL_PROFILE_CHOICES, default="debug_all")
@@ -198,6 +230,7 @@ def _config_from_args(args: argparse.Namespace) -> ReplayDebugConfig:
         replay_timing=args.replay_timing,
         replay_fps=args.replay_fps,
         replay_speed=args.replay_speed,
+        gui_fps=args.gui_fps,
         timestamp_scale=args.timestamp_scale,
         thumb_node=args.thumb_node,
         index_node=args.index_node,

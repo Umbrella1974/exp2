@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +78,35 @@ def test_replay_debug_runner_from_session_dir_discovers_files(tmp_path: Path) ->
     assert result.summary["session_dir"] == str(session_dir)
     assert not (session_dir / "timing_diagnostics.csv").exists()
     assert not (session_dir / "cue_log.csv").exists()
+
+
+def test_replay_debug_session_dir_allows_explicit_trial_config_override(tmp_path: Path) -> None:
+    session_dir = tmp_path / "legacy_session"
+    session_dir.mkdir()
+    _write_raw_jsonl(session_dir / "raw_frames.jsonl")
+    _write_task_calibration(session_dir / "calibration.json")
+    override_path = _write_trial_config(tmp_path / "original_map_config.json")
+
+    result = run_replay_debug(
+        ReplayDebugConfig(
+            session_dir=session_dir,
+            trial_config_json=override_path,
+            replay_timing="fast",
+        )
+    )
+
+    assert result.snapshot_count == 2
+    assert result.summary["trial_config_json"] == str(override_path)
+
+
+def test_replay_debug_legacy_session_missing_trial_config_has_actionable_error(tmp_path: Path) -> None:
+    session_dir = tmp_path / "legacy_session"
+    session_dir.mkdir()
+    _write_raw_jsonl(session_dir / "raw_frames.jsonl")
+    _write_task_calibration(session_dir / "calibration.json")
+
+    with pytest.raises(FileNotFoundError, match="--trial-config-json"):
+        load_replay_debug_inputs(ReplayDebugConfig(session_dir=session_dir))
 
 
 def test_replay_debug_infers_nodes_world_for_legacy_live_integrated_session(tmp_path: Path) -> None:
@@ -193,6 +223,59 @@ def test_replay_headless_rejects_gui_text_sink(tmp_path: Path, capsys: pytest.Ca
     captured = capsys.readouterr()
     assert exit_code == 2
     assert "gui_text" in captured.err
+
+
+def test_replay_gui_flag_and_gui_fps_are_accepted() -> None:
+    args = run_replay_debug_gui._parse_args(["--gui", "--gui-fps", "12.5"])
+    config = run_replay_debug_gui._config_from_args(args)
+
+    assert args.gui is True
+    assert args.headless is False
+    assert config.gui_fps == pytest.approx(12.5)
+
+
+def test_replay_gui_close_stops_remaining_replay_without_waiting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_path = _write_raw_jsonl(tmp_path / "raw_frames.jsonl")
+    calibration_path = _write_task_calibration(tmp_path / "calibration.json")
+    trial_config_path = _write_trial_config(tmp_path / "trial_config.json")
+    out_dir = tmp_path / "out"
+
+    monkeypatch.setattr(run_replay_debug_gui, "preflight_gui_dependencies", lambda: None)
+
+    def close_immediately(**kwargs: Any) -> int:
+        kwargs["close_callback"]()
+        return 0
+
+    monkeypatch.setattr(run_replay_debug_gui, "run_debug_gui", close_immediately)
+    started = time.monotonic()
+    exit_code = replay_gui_main(
+        [
+            "--raw-jsonl",
+            str(raw_path),
+            "--calibration-json",
+            str(calibration_path),
+            "--trial-config-json",
+            str(trial_config_path),
+            "--out-dir",
+            str(out_dir),
+            "--replay-timing",
+            "fixed",
+            "--replay-fps",
+            "0.01",
+            "--cue-sink",
+            "gui_text",
+            "--gui",
+        ]
+    )
+    elapsed = time.monotonic() - started
+
+    summary = json.loads((out_dir / "replay_debug_summary.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert elapsed < 2.0
+    assert summary["run_stop_reason"] == "replay_stop_requested"
 
 
 def test_replay_explicit_invalid_cue_config_exits_before_run(

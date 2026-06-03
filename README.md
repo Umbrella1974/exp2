@@ -1,15 +1,15 @@
 # Exp2 Constrained Block Experiment Engine
 
-这个仓库实现的是一个“受约束物块交互实验”的核心引擎与离线调试工具链。当前重点不是 GUI 或真实硬件闭环，而是：
+这个仓库实现的是一个“受约束物块交互实验”的核心引擎、离线分析工具链和第一版 live 调试流程。当前已经可以：
 
-- 读取 MANUS/Vive raw JSONL 数据
-- 通过 parser / adapter 转成实验输入帧
-- 运行 TrialController 和 BlockController
-- 输出逐帧 CSV、事件、触觉状态和 summary
-- 对离线 session 做可视化分析
-- 提供 MapConfig / MapGenerator 作为正式实验地图配置基础层
+- 读取 MANUS/Vive raw JSONL，或接收 `manus_vive_com` 发送的 newline-delimited combined JSON 实时流
+- 通过 parser / adapter 生成实验输入帧，并运行 `TrialController` / `BlockController`
+- 使用正式桌面三线标定、MapConfig 地图和 integrated live session 连续完成单次 trial
+- 输出标准 session、逐帧状态、事件、逻辑 haptic、timing diagnostics 和 summary
+- 对 session 做离线可视化、批量 replay、输出校验和 block end / slip 诊断
+- 使用 replay/live debug GUI、visual profile 和非硬件 cue sink 调试视觉与提示语义
 
-核心实时数据流大致是：
+离线数据流大致是：
 
 ```text
 raw JSONL
@@ -22,7 +22,18 @@ raw JSONL
   -> frames / events / haptic state
 ```
 
-当前还没有正式 GUI、真实 socket live loop、MANUS SDK、Vive SDK 或触觉硬件控制。`ManusSocketRawFrameSource` 现在只是 receiver 适配壳。
+live integrated 数据流大致是：
+
+```text
+manus_vive_com combined JSON stream
+  -> LiveRawStreamServer
+  -> LatestFrameBuffer
+  -> live calibration / LiveTrialRunner
+  -> TrialController / BlockController
+  -> SessionRecorder + DashboardSnapshot + CueRuntime
+```
+
+当前定位仍是研究开发和实机调试系统，不是正式实验产品：还没有正式 experiment lifecycle GUI、真实触觉硬件控制、完整实验序列，也不直接依赖 MANUS/Vive SDK。`ManusSocketRawFrameSource` 仍只是 receiver 适配壳；当前真实 TCP 接收流程使用 `LiveRawStreamServer`。
 
 ## 环境
 
@@ -38,6 +49,12 @@ cd D:\research_history\first_one\research_code\exp2
 pip install numpy pytest
 ```
 
+如果要读取 YAML cue / termination config：
+
+```powershell
+pip install PyYAML
+```
+
 如果要生成 PNG 图：
 
 ```powershell
@@ -45,6 +62,12 @@ pip install matplotlib
 ```
 
 没有 `matplotlib` 时，核心 CSV/JSON 输出仍然可用；绘图会跳过并写入 warning。
+
+如果要打开 replay/live debug GUI：
+
+```powershell
+pip install PySide6 pyqtgraph
+```
 
 ## 测试
 
@@ -71,12 +94,15 @@ pytest -q tests/test_calibration_geometry.py tests/test_calibration_io.py tests/
 pytest -q tests/test_calibrate_from_raw_jsonl_table.py tests/test_offline_replay_formal_calibrated.py
 pytest -q tests/test_live_raw_stream.py tests/test_run_live_raw_preview.py
 pytest -q tests/test_latest_frame_buffer.py tests/test_live_trial_runner.py tests/test_live_integrated_session.py
+pytest -q tests/test_latest_snapshot_store.py tests/test_debug_view_model.py tests/test_replay_debug_runner.py
+pytest -q tests/test_cue_config.py tests/test_cue_feedback.py
+pytest -q tests/test_timing_diagnostics.py tests/test_analyze_timing.py tests/test_validate_session_outputs.py
 pytest -q tests/test_trial_controller.py tests/test_block_controller.py
 ```
 
 ## 最常用流程
 
-如果你现在拿到一包离线 JSONL 数据，建议按这个顺序跑：
+### 离线 JSONL 回归
 
 1. 先用 `offline_replay_autocalibrated.py` 跑一组单样本，看 pipeline 能不能完整跑通。
 2. 加 `--write-session` 生成标准 session 目录。
@@ -94,6 +120,34 @@ python offline_replay_autocalibrated.py --raw-jsonl D:\download_edge\dataansys\r
 ```powershell
 python analyze_session.py --session-dir data\offline_replay\experiment_14_block060\session --overwrite
 ```
+
+### 实机 integrated trial
+
+实机调试时，优先使用同一个进程内连续完成标定和 trial 的 integrated runner，避免重新连接或重新加载标定带来的坐标系不一致：
+
+```powershell
+python run_live_integrated_session.py ^
+  --map-config maps\examples\xoy_turn.json ^
+  --host 127.0.0.1 ^
+  --port 8888 ^
+  --out-dir data\live_integrated_session\debug_01 ^
+  --subject-id S001 ^
+  --trial-id trial_001
+```
+
+然后启动 `manus_vive_com` 发送端连接 `127.0.0.1:8888`。如果要观察 task view，增加 `--gui`；如果要调试非硬件提示，使用 `--cue-sink logging|console|gui_text`。
+
+### Session 复盘与校验
+
+live integrated session 生成后，推荐依次运行：
+
+```powershell
+python validate_session_outputs.py --session-dir data\live_integrated_session\debug_01\session
+python analyze_session.py --session-dir data\live_integrated_session\debug_01\session --overwrite
+python analyze_timing.py --session-dir data\live_integrated_session\debug_01\session
+```
+
+offline session 通常只需要运行 `analyze_session.py`。`validate_session_outputs.py` 主要用于 live integrated session 一致性校验；`analyze_timing.py` 只适用于存在 `timing_diagnostics.csv` 的 session。
 
 ## `offline_replay_autocalibrated.py`
 
@@ -574,7 +628,7 @@ metadata.collection_mode = raw_jsonl_simulated_live / live_stream
 
 `run_live_integrated_session.py` 是第一版“同一个 live session 内完成 calibration + trial”的命令行 runner。它和 `live_calibrate_table.py` 的区别是：`live_calibrate_table.py` 只生成 calibration 文件；integrated runner 会在采完四段桌面标定后，直接使用内存中的同一个 `FormalCalibration` 对象创建 `TaskCoordinateSystem` 并进入 trial，不要求用户先退出程序再加载 `calibration.json`。
 
-推荐正式开发优先用这个连续流程，避免“先保存 calibration 文件、再启动实验程序”造成现场坐标系和 trial 坐标系不一致。当前它仍然标记为 `is_formal_experiment=false`，因为还没有正式 GUI、haptic hardware 和完整实验序列。
+推荐正式开发优先用这个连续流程，避免“先保存 calibration 文件、再启动实验程序”造成现场坐标系和 trial 坐标系不一致。当前它仍然标记为 `is_formal_experiment=false`，因为现有 GUI 只是 debug display，尚没有正式 experiment lifecycle GUI、haptic hardware 和完整实验序列。
 
 运行示例：
 
@@ -740,7 +794,31 @@ console    worker 线程异步打印一次性文本提示
 gui_text   GUI 中显示居中文本 overlay；GUI 关闭后的新 cue fallback 到 console
 ```
 
-`gui_text` 必须和 live `--gui` 一起使用；replay 中不能和 `--headless` 一起使用。GUI Close 仍然只关闭显示层，不停止 trial/session。
+`gui_text` 必须和 live `--gui` 一起使用；replay 默认就会打开 GUI，因此不能和 `--headless` 一起使用。live GUI Close 仍然只关闭显示层，不停止 trial/session；replay GUI Close 会停止剩余回放。
+
+live 中用 GUI 文本 cue 和实验可见性 profile 调试：
+
+```powershell
+python run_live_integrated_session.py ^
+  --map-config maps\examples\xoy_turn.json ^
+  --host 127.0.0.1 ^
+  --port 8888 ^
+  --out-dir data\live_integrated_session\cue_gui_01 ^
+  --gui ^
+  --cue-sink gui_text ^
+  --visual-profile experiment_visibility_feedback
+```
+
+已有 session 可以先用 replay 验证 cue 触发和显示，不需要连接实机：
+
+```powershell
+python run_replay_debug_gui.py ^
+  --session-dir data\live_integrated_session\debug_01\session ^
+  --out-dir data\debug_gui\cue_replay_01 ^
+  --replay-timing fixed ^
+  --cue-sink gui_text ^
+  --visual-profile experiment_visibility_feedback
+```
 
 第一版 cue 类型：
 
@@ -912,7 +990,7 @@ LatestFrameBuffer
 
 `LiveTrialRunner` 不做 calibration、不验证地图、不画 GUI、不发送真实 haptic hardware。它只接收已经准备好的 `TaskCoordinateSystem`、`TrackRegion`、`EngineConfig`、`SessionRecorder` 和 latest-frame buffer，然后按固定频率推进现有 `TrialController`。这次重构不改 `BlockController` / `TrialController` 的 contact、slip、blocked 语义。
 
-GUI 后续可以订阅 `snapshot_callback(snapshot)`，显示层不需要直接调用 `TrialController`。如果 callback 抛异常，runner 会继续运行，并在 summary 中记录 `callback_error_count`、`mean_callback_latency_ms`、`max_callback_latency_ms` 和 warning。真实 haptic hardware 以后应通过独立 sink 接入；当前 integrated session 仍写逻辑 haptic 状态，但 `haptic_hardware_enabled=false`。
+replay/live debug GUI 已经通过 `snapshot_callback(snapshot)` 订阅这层输出，显示层不需要直接调用 `TrialController`。如果 callback 抛异常，runner 会继续运行，并在 summary 中记录 `callback_error_count`、`mean_callback_latency_ms`、`max_callback_latency_ms` 和 warning。真实 haptic hardware 以后应通过独立 sink 接入；当前 integrated session 仍写逻辑 haptic 状态，但 `haptic_hardware_enabled=false`。
 
 `run_live_integrated_session.py` 的输出仍保持旧字段为主，同时会额外写：
 
@@ -1023,6 +1101,8 @@ pip install PySide6 pyqtgraph
 python run_replay_debug_gui.py --session-dir data\offline_replay\exp13_map_xoy_turn\session --replay-timing fixed --replay-fps 60 --out-dir data\debug_gui\exp13
 ```
 
+replay 默认打开 GUI，不需要传 `--gui`；为了和 live CLI 使用习惯一致，显式传 `--gui` 也可以。`--gui-fps` 控制 GUI 刷新频率，`--replay-fps` 控制 fixed replay 的数据回放频率，两者不是同一个参数。
+
 如果只想验证 replay 链路、不打开 GUI：
 
 ```powershell
@@ -1039,6 +1119,19 @@ python run_replay_debug_gui.py ^
   --replay-timing fixed ^
   --replay-fps 60
 ```
+
+旧 session 如果没有 `trial_config.json`，replay 不会猜测原始地图、物块尺寸或阈值。可以在保留 `--session-dir` 的同时，用原始 `trial_config.json` 或原始 MapConfig JSON 显式补充：
+
+```powershell
+python run_replay_debug_gui.py ^
+  --session-dir path\to\legacy_session ^
+  --trial-config-json maps\examples\xoy_turn.json ^
+  --out-dir data\debug_gui\legacy_replay ^
+  --replay-timing fixed ^
+  --cue-sink gui_text
+```
+
+`--raw-jsonl` 和 `--calibration-json` 也可以在 `--session-dir` 基础上显式覆盖。使用 MapConfig JSON 作为 `--trial-config-json` 时，地图几何会正确读取，但其中没有保存的 trial 阈值会回退到 replay 默认值；要精确复现原 trial，优先使用原始 `trial_config.json`。
 
 `--replay-timing` 可选：
 
@@ -1069,7 +1162,14 @@ experiment_blank
 
 旧名称 `experiment_markers_when_hidden` 仍可作为 deprecated alias 使用，内部和落盘的 effective profile 会规范化为 `experiment_visibility_feedback`。实验 profile 使用隐藏的 scene/map bounds 固定视图范围，不会随着 marker 移动自动缩放。第一版 “hand marker” 实际只指 pinch center marker，不新增 wrist/tracker/skeleton marker。
 
-GUI 是 x-y task view，z 方向第一版以数值显示。GUI Close 只关闭显示层，不直接修改 `TrialController` / `BlockController`，也不接真实 haptic hardware。缺少 `PySide6` / `pyqtgraph` 时，入口会提示安装命令；非 GUI 测试不依赖这两个包。
+GUI 是 x-y task view，z 方向第一版以数值显示。GUI 不直接修改 `TrialController` / `BlockController`，也不接真实 haptic hardware。缺少 `PySide6` / `pyqtgraph` 时，入口会提示安装命令；非 GUI 测试不依赖这两个包。
+
+replay GUI 的退出语义：
+
+```text
+关闭窗口、按 Q / Esc，或在终端按 Ctrl+C，会停止剩余 replay
+run_replay_debug_gui.py 会等待 replay worker 安全收尾并写出已有 summary / cue / timing 输出
+```
 
 live `--gui` 的线程模型是：Qt GUI event loop 在主线程运行；`LiveTrialRunner.run_until_done()` 在 worker 线程运行；`snapshot_callback` 只做轻量 `LatestSnapshotStore.publish(snapshot)`。如果 GUI 刷新慢，store 只保留最新 snapshot，不排队旧帧，避免显示延迟越积越大。
 
@@ -1394,7 +1494,7 @@ python run_live_preview.py --raw-jsonl D:\download_edge\dataansys\raw_frames_15_
 
 ## Session 输出
 
-`offline_replay_autocalibrated.py --write-session` 会生成：
+`offline_replay_autocalibrated.py --write-session`、`offline_replay_formal_calibrated.py --write-session` 和 `run_live_integrated_session.py` 都会生成兼容的标准 session 核心文件：
 
 ```text
 session_meta.json
@@ -1406,8 +1506,19 @@ processed_frames.csv
 events.csv
 haptic.csv
 trial_summary.json
-plots/
 ```
+
+live integrated session 还会根据运行配置生成：
+
+```text
+termination_config.json
+cue_config.json                 新 live session 始终写入
+cue_log.csv                    cue sink 非 none 时写入
+timing_diagnostics.csv         live integrated 默认始终写入
+gui_diagnostics.csv            仅 --gui 时写入
+```
+
+运行 `analyze_session.py` 后会额外生成 `analysis_summary.json` 和 `plots/`。replay debug runner 只有传入 `--out-dir` 时才写自己的 cue/timing 输出，并且不会修改输入 session。
 
 `raw_frames.jsonl` 保存原始 raw dict，不额外写 `frame_index`，不改字段。
 
@@ -1450,6 +1561,8 @@ large_delta
 
 离线 replay 中如果前几帧在 trial start time 之前，`trial_time` 可能为负数。这通常表示 pre-roll 数据，不是状态机错误。
 
+`haptic.csv` 记录现有状态机产生的逐帧逻辑 haptic 状态，不代表真实硬件已经发送或被受试者感知。`cue_log.csv` 记录通过 cue 配置和限流后进入 sink 的命令级提示；它适合检查 contact/slip/blocked 提示语义，但当前也不能直接当作 behavioral RT 结果。
+
 ## 怎么看结果
 
 优先看 `summary.json` 或 `analysis_summary.json`：
@@ -1484,6 +1597,8 @@ warnings
 当前字段可以区分“逻辑上的 pinch insufficient slip”和“逻辑上的 track blocked slip”：看 `slip_active=True` 帧里的 `slip_reason`。`PINCH_INSUFFICIENT` 表示 pinch 距离不足导致的逻辑 slip；`TRACK_BLOCKED` 表示轨道约束阻挡导致的逻辑 slip。`blocked_force_active=True` 只对应 track blocked 的逻辑反馈。限制是：当前字段能说明状态机给出的逻辑原因，但没有记录连续的 boundary distance，所以不能单靠字段证明“离边界几厘米”。
 
 `haptic_active_frame_count` / `hardware_haptic_active_frame_count` 表示命令或硬件层 active，不等于逻辑 slip。离线 replay 中常见情况是 `logical_slip_feedback_frame_count` 大于 0，但没有真实硬件发送记录。`slip_active`、`slip_reason`、`blocked_force_active` 是逻辑反馈状态；`haptic_state`、`haptic_reason`、`command_type` 更接近 haptic 命令/记录层。
+
+如果运行启用了 cue，先看 summary 中的 `cue_count`、`cue_type_counts`、`suppressed_cue_count` 和 `suppressed_cue_type_counts`，再用 `cue_log.csv` 检查每条 command 的 `cue_type`、`direction`、`trigger_reason`、`display_status` 和时间戳。`success=true` 只表示 sink 接受 command，不表示受试者看见提示或完成任务。
 
 MapConfig replay 额外看：
 
@@ -1798,17 +1913,13 @@ pinch_release_threshold = 0.12
 
 ## 当前限制
 
-```text
-没有正式 GUI
-没有触觉硬件控制
-没有自动读取 YAML 配置
-没有完整 MANUS/Vive rotation fusion
-没有正式在线 calibration GUI；当前只有命令行版 live table-line calibration / integrated runner
-run_live_integrated_session.py 是 Stage 5C 第一版 CLI 连续流程，仍标记 is_formal_experiment=false
-offline_replay_autocalibrated.py 的 MapConfig replay 仍使用 post-hoc auto calibration，不能标记成正式实验
-offline_replay_formal_calibrated.py 使用 formal calibration，但仍是 offline replay，不是 live formal trial
-run_live_raw_preview.py 只是实时 raw stream smoke test，不启动正式 trial
-MapTemplate replay 是旧数据诊断/探索工具，不是正式实验地图
-```
+- 现有 GUI 是 replay/live debug display，不是正式 experiment lifecycle GUI；实验员和受试者仍共用一个窗口，也没有 Stop / Abort / Pause / Resume 的完整界面控制。
+- 当前没有真实触觉硬件控制。`haptic.csv` 是逻辑状态，`cue_log.csv` 是非硬件 cue command 记录；还没有硬件 acknowledgement 或 behavioral RT analyzer。
+- `run_live_integrated_session.py` 是单次 trial 的连续标定 + trial 调试流程，仍标记 `is_formal_experiment=false`；target 进入只做诊断，trial 主要由实验员按 `e` 完成。
+- 当前不直接依赖 MANUS/Vive SDK，而是接收 `manus_vive_com` 发送的 combined JSON；也没有完整 MANUS/Vive rotation fusion。
+- 没有正式在线 calibration GUI；当前只有命令行版 live table-line calibration 和 integrated runner。
+- 没有全局自动 YAML 配置。cue / termination config 可以单独读取 JSON/YAML，地图和标定仍使用各自 JSON。
+- `offline_replay_autocalibrated.py` 的 MapConfig replay 仍使用 post-hoc auto calibration，不能标记成正式实验；`offline_replay_formal_calibrated.py` 使用 formal calibration，但仍是 offline replay。
+- `run_live_raw_preview.py` 只是实时 raw stream smoke test，不启动正式 trial；MapTemplate replay 也是旧数据诊断/探索工具，不是正式实验地图。
 
-比较自然的下一步是：把 integrated runner 发展成正式 GUI/实验序列，并接入真实 haptic hardware。
+比较自然的下一步是：把 integrated runner 发展成正式实验员/受试者 GUI 和完整实验序列，接入真实 haptic hardware，并在 cue、timing 和行为响应之间建立可验证的 RT 分析链路。

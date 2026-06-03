@@ -7,6 +7,7 @@ and reuses LiveTrialRunner so parser/adapter/controller semantics stay shared.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -48,6 +49,7 @@ class ReplayDebugConfig:
     replay_timing: str = "raw"
     replay_fps: float = 60.0
     replay_speed: float = 1.0
+    gui_fps: float = 30.0
     timestamp_scale: float = 0.001
     thumb_node: int = 4
     index_node: int = 9
@@ -126,6 +128,7 @@ def run_replay_debug(
     snapshot_callback: SnapshotCallback | None = None,
     timing_diagnostics: TimingDiagnostics | None = None,
     cue_runtime: CueRuntime | None = None,
+    stop_event: threading.Event | None = None,
 ) -> ReplayDebugResult:
     """Replay raw frames through LiveTrialRunner and publish snapshots."""
 
@@ -205,13 +208,24 @@ def run_replay_debug(
     )
 
     previous_raw_time: float | None = None
+    replay_stop_requested = False
     source = JsonlRawFrameSource(inputs.raw_jsonl)
     try:
         for raw_index, raw in enumerate(source):
+            if stop_event is not None and stop_event.is_set():
+                replay_stop_requested = True
+                break
             if config.max_frames is not None and raw_index >= config.max_frames:
                 break
             current_raw_time = _raw_time_seconds(raw, config.timestamp_scale)
-            _sleep_for_replay_timing(config, previous_raw_time, current_raw_time)
+            if _sleep_for_replay_timing(
+                config,
+                previous_raw_time,
+                current_raw_time,
+                stop_event=stop_event,
+            ):
+                replay_stop_requested = True
+                break
             previous_raw_time = current_raw_time
             replay_state["raw_seen"] += 1
             latest_buffer.put(_live_frame_from_raw(raw_index, raw))
@@ -221,10 +235,10 @@ def run_replay_debug(
     finally:
         source.close()
 
-    if replay_state["raw_seen"] == 0:
+    if replay_state["raw_seen"] == 0 and not replay_stop_requested:
         raise ValueError(f"raw_jsonl did not contain any frames: {inputs.raw_jsonl}")
     if runner.stats_snapshot().run_stop_reason == "running":
-        runner.request_stop("eof")
+        runner.request_stop("replay_stop_requested" if replay_stop_requested else "eof")
     cue_runtime.end_trial()
     summary = runner.build_summary()
     summary.update(
@@ -237,6 +251,7 @@ def run_replay_debug(
             "replay_timing": config.replay_timing,
             "replay_fps": config.replay_fps if config.replay_timing == "fixed" else None,
             "replay_speed": config.replay_speed,
+            "gui_fps": config.gui_fps,
             "snapshot_count": replay_state["snapshots"],
             "gui_scene": inputs.scene.to_dict(),
             "requested_cue_config_path": (
@@ -313,9 +328,17 @@ def _resolve_replay_cue_config(config: ReplayDebugConfig) -> tuple[CueConfig, Pa
 def _resolve_input_paths(config: ReplayDebugConfig) -> tuple[Path, Path, Path, Path | None]:
     if config.session_dir is not None:
         session_dir = Path(config.session_dir)
-        raw = session_dir / "raw_frames.jsonl"
-        calibration = session_dir / "calibration.json"
-        trial_config = session_dir / "trial_config.json"
+        raw = Path(config.raw_jsonl) if config.raw_jsonl is not None else session_dir / "raw_frames.jsonl"
+        calibration = (
+            Path(config.calibration_json)
+            if config.calibration_json is not None
+            else session_dir / "calibration.json"
+        )
+        trial_config = (
+            Path(config.trial_config_json)
+            if config.trial_config_json is not None
+            else session_dir / "trial_config.json"
+        )
         meta = session_dir / "session_meta.json"
     else:
         raw = Path(config.raw_jsonl) if config.raw_jsonl is not None else None
@@ -333,7 +356,13 @@ def _resolve_input_paths(config: ReplayDebugConfig) -> tuple[Path, Path, Path, P
         elif not path.exists():
             missing.append(f"{label} not found: {path}")
     if missing:
-        raise FileNotFoundError("Missing replay input: " + "; ".join(missing))
+        message = "Missing replay input: " + "; ".join(missing)
+        if any(item.startswith("trial_config_json") for item in missing):
+            message += (
+                ". Older sessions without trial_config.json must provide the original "
+                "trial config or MapConfig JSON with --trial-config-json."
+            )
+        raise FileNotFoundError(message)
     assert raw is not None and calibration is not None and trial_config is not None
     if meta is not None and not meta.exists():
         meta = None
@@ -341,10 +370,6 @@ def _resolve_input_paths(config: ReplayDebugConfig) -> tuple[Path, Path, Path, P
 
 
 def _validate_config(config: ReplayDebugConfig) -> None:
-    if config.session_dir is not None and any(
-        value is not None for value in (config.raw_jsonl, config.calibration_json, config.trial_config_json)
-    ):
-        raise ValueError("--session-dir cannot be combined with explicit replay input files.")
     if config.session_dir is None:
         if config.raw_jsonl is None or config.calibration_json is None or config.trial_config_json is None:
             raise ValueError("raw_jsonl, calibration_json, and trial_config_json are required without session_dir.")
@@ -354,6 +379,8 @@ def _validate_config(config: ReplayDebugConfig) -> None:
         raise ValueError("replay_fps must be > 0.")
     if config.replay_speed <= 0.0:
         raise ValueError("replay_speed must be > 0.")
+    if config.gui_fps <= 0.0:
+        raise ValueError("gui_fps must be > 0.")
     if config.cue_sink not in CUE_SINK_CHOICES:
         raise ValueError("cue_sink must be one of: " + ", ".join(CUE_SINK_CHOICES))
     resolve_visual_profile(
@@ -468,17 +495,26 @@ def _sleep_for_replay_timing(
     config: ReplayDebugConfig,
     previous_raw_time: float | None,
     current_raw_time: float | None,
-) -> None:
+    *,
+    stop_event: threading.Event | None = None,
+) -> bool:
     if config.replay_timing == "fast":
-        return
+        return bool(stop_event is not None and stop_event.is_set())
     if config.replay_timing == "fixed":
-        time.sleep(1.0 / config.replay_fps)
-        return
+        return _interruptible_sleep(1.0 / config.replay_fps, stop_event)
     if previous_raw_time is None or current_raw_time is None:
-        return
+        return bool(stop_event is not None and stop_event.is_set())
     delay = max(0.0, current_raw_time - previous_raw_time) / config.replay_speed
-    if delay > 0.0:
+    return _interruptible_sleep(delay, stop_event)
+
+
+def _interruptible_sleep(delay: float, stop_event: threading.Event | None) -> bool:
+    if delay <= 0.0:
+        return bool(stop_event is not None and stop_event.is_set())
+    if stop_event is None:
         time.sleep(delay)
+        return False
+    return stop_event.wait(delay)
 
 
 def _live_frame_from_raw(frame_index: int, raw: dict[str, Any]) -> LiveRawFrame:

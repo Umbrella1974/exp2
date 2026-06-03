@@ -27,6 +27,7 @@ class GuiDependencyError(RuntimeError):
 RuntimeStatsGetter = Callable[[], dict[str, Any]]
 RenderCallback = Callable[[Any, float], None]
 CloseCallback = Callable[[], None]
+CloseWhen = Callable[[], bool]
 
 
 def preflight_gui_dependencies() -> None:
@@ -47,6 +48,7 @@ def run_debug_gui(
     render_callback: RenderCallback | None = None,
     cue_store: LatestCueStore | None = None,
     close_callback: CloseCallback | None = None,
+    close_when: CloseWhen | None = None,
     visual_profile: str = DEBUG_ALL,
     status_panel: str = "auto",
     show_axes: str = "auto",
@@ -74,6 +76,7 @@ def run_debug_gui(
         render_callback=render_callback,
         cue_store=cue_store,
         close_callback=close_callback,
+        close_when=close_when,
         visual_profile=visual_profile,
         status_panel=status_panel,
         show_axes=show_axes,
@@ -112,6 +115,7 @@ class _DebugGuiWindow:
         render_callback: RenderCallback | None,
         cue_store: LatestCueStore | None,
         close_callback: CloseCallback | None,
+        close_when: CloseWhen | None,
         visual_profile: str,
         status_panel: str,
         show_axes: str,
@@ -130,6 +134,7 @@ class _DebugGuiWindow:
         self.render_callback = render_callback
         self.cue_store = cue_store
         self.close_callback = close_callback
+        self.close_when = close_when
         self.visual_profile = visual_profile
         self.status_panel = status_panel
         self.show_axes = show_axes
@@ -158,6 +163,12 @@ class _DebugGuiWindow:
         layout.addWidget(self.status_label, stretch=1)
         self.window.setCentralWidget(central)
         self.window.resize(1200, 760)
+        self._close_shortcuts: list[Any] = []
+        if self.mode == "replay":
+            for key in ("Q", "Escape"):
+                shortcut = QtGui.QShortcut(QtGui.QKeySequence(key), self.window)
+                shortcut.activated.connect(self.window.close)
+                self._close_shortcuts.append(shortcut)
 
         self.timer = QtCore.QTimer(self.window)
         self.timer.timeout.connect(self._refresh)
@@ -177,6 +188,13 @@ class _DebugGuiWindow:
         event.accept()
 
     def _refresh(self) -> None:
+        if self.close_when is not None:
+            try:
+                if self.close_when():
+                    self.window.close()
+                    return
+            except Exception:
+                pass
         started = time.monotonic()
         if self._last_refresh_time is not None:
             elapsed = max(1e-9, started - self._last_refresh_time)
@@ -184,10 +202,15 @@ class _DebugGuiWindow:
         self._last_refresh_time = started
         snapshot = self.snapshot_store.get_latest()
         if snapshot is None:
+            close_message = (
+                "Close window / Q / Esc stops replay."
+                if self.mode == "replay"
+                else "Close window closes display only."
+            )
             self.status_label.setText(
                 "Waiting for trial snapshot...\n"
                 "Calibration / waiting stages do not create fake DashboardSnapshot.\n"
-                "Close window closes display only."
+                + close_message
             )
             return
 
