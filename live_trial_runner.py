@@ -21,6 +21,7 @@ from data_models import Vec3
 from device_frame_models import DeviceAdapterConfig
 from manus_vive_adapter import ManusViveExperimentAdapter
 from raw_manus_vive_parser import parse_raw_manus_vive_frame
+from timing_diagnostics import TimingDiagnostics
 from trial_controller import EventRecord, TrialController, TrialState
 
 
@@ -52,6 +53,7 @@ class LiveTrialRunnerConfig:
     timeout_enabled: bool = True
     detach_limit_enabled: bool = True
     haptic_hardware_enabled: bool = False
+    timing_phase: str = "TRIAL_RUNNING"
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,7 @@ class LiveTrialRunner:
         source_stats_getter: SourceStatsGetter | None = None,
         user_quit_checker: UserQuitChecker | None = None,
         operator_command_checker: OperatorCommandChecker | None = None,
+        timing_diagnostics: TimingDiagnostics | None = None,
     ) -> None:
         if config.control_rate_hz <= 0.0:
             raise ValueError("control_rate_hz must be > 0.")
@@ -144,6 +147,7 @@ class LiveTrialRunner:
         self.source_stats_getter = source_stats_getter
         self.user_quit_checker = user_quit_checker
         self.operator_command_checker = operator_command_checker
+        self.timing_diagnostics = timing_diagnostics
 
         self.adapter_config = DeviceAdapterConfig(
             skeleton_index=config.skeleton_index,
@@ -165,12 +169,14 @@ class LiveTrialRunner:
         self._trial_start_monotonic: float | None = None
         self._trial_end_monotonic: float | None = None
         self._last_snapshot: DashboardSnapshot | None = None
+        self._last_timing_frame_index: int | None = None
         self._last_trial_result: Any | None = None
         self._last_sample_time: float | None = None
         self._trial_started = False
         self._events_count = 0
         self._operator_command: str | None = None
         self._operator_command_time: float | None = None
+        self._operator_command_monotonic_ms: float | None = None
         self._trial_outcome: str | None = None
         self._end_reason: str | None = None
         self._first_target_entry_time: float | None = None
@@ -238,6 +244,12 @@ class LiveTrialRunner:
         self._run_stop_reason = reason
         self._run_end_time = time.monotonic()
         self._trial_end_monotonic = self._run_end_time
+        if self.timing_diagnostics is not None:
+            self.timing_diagnostics.record_trial_end(
+                frame_index=self._timing_frame_index(),
+                phase=self.config.timing_phase,
+                monotonic_time=self._run_end_time,
+            )
         if operator_command is not None:
             self._operator_command = operator_command
             self._operator_command_time = self._last_sample_time
@@ -261,6 +273,7 @@ class LiveTrialRunner:
             self._handle_no_new_frame(now)
             return None
 
+        self._last_timing_frame_index = int(live_frame.frame_index)
         self._last_new_frame_time = now
         start_process = time.monotonic()
         processed = self._parse_and_adapt(live_frame)
@@ -276,7 +289,15 @@ class LiveTrialRunner:
             self.start_trial(sample.time)
             self._record_events(live_frame.frame_index, sample.time, self.trial.event_history[-2:])
 
+        trial_update_start = time.monotonic()
         result = self.trial.update(sample)
+        trial_update_end = time.monotonic()
+        if self.timing_diagnostics is not None:
+            self.timing_diagnostics.record_trial_update(
+                live_frame.frame_index,
+                start_monotonic=trial_update_start,
+                end_monotonic=trial_update_end,
+            )
         processing_latency = (time.monotonic() - start_process) * 1000.0
         self._processing_latency_ms.append(processing_latency)
         self._total_processed_frames += 1
@@ -291,11 +312,23 @@ class LiveTrialRunner:
             processing_latency_ms=processing_latency,
             hardware_haptic_active=self.config.haptic_hardware_enabled,
         )
+        snapshot_created = time.monotonic()
+        if self.timing_diagnostics is not None:
+            self.timing_diagnostics.record_snapshot_created(
+                live_frame.frame_index,
+                monotonic_time=snapshot_created,
+            )
+            self.timing_diagnostics.record_frame_processed(live_frame.frame_index)
         self._last_snapshot = snapshot
         self._last_trial_result = result
         self._update_target_entry(snapshot)
         self._update_snapshot_stats(snapshot)
         self._record_frame(live_frame, processed, sample, result, snapshot)
+        if self.timing_diagnostics is not None:
+            self.timing_diagnostics.record_snapshot_published(
+                live_frame.frame_index,
+                monotonic_time=time.monotonic(),
+            )
         self._emit_callbacks(snapshot)
 
         if result.trial_state in {
@@ -334,6 +367,7 @@ class LiveTrialRunner:
             command = self._read_operator_command()
             if command == "e":
                 if self.config.manual_completion_enabled:
+                    self._record_operator_command_timing(command)
                     self._record_operator_event("operator_manual_complete", command)
                     self.request_stop(
                         "operator_manual_complete",
@@ -344,6 +378,7 @@ class LiveTrialRunner:
                     break
                 self.warnings.append("operator manual completion command ignored; manual completion is disabled.")
             elif command == "q":
+                self._record_operator_command_timing(command)
                 self._record_operator_event("operator_abort", command)
                 self.request_stop(
                     "user_quit",
@@ -353,6 +388,7 @@ class LiveTrialRunner:
                 )
                 break
             if self.user_quit_checker is not None and self.user_quit_checker():
+                self._record_operator_command_timing("q")
                 self.request_stop(
                     "user_quit",
                     trial_outcome="ABORTED_BY_OPERATOR",
@@ -388,6 +424,8 @@ class LiveTrialRunner:
         payload.update(
             {
                 "trial_id": self.config.trial_id,
+                "map_id": self.map_id,
+                "calibration_id": self.calibration_id,
                 "trial_controller_started": self._trial_started,
                 "events_count": self._events_count,
                 "callback_error_count": self._callback_error_count,
@@ -435,11 +473,19 @@ class LiveTrialRunner:
         parse_ok = False
         adapter_ok = False
         hand_valid = False
+        parse_start = time.monotonic()
         try:
             device_frame = parse_raw_manus_vive_frame(live_frame.raw_frame, self.adapter_config)
             parse_ok = True
         except Exception:
+            parse_end = time.monotonic()
             self._parse_error_count += 1
+            if self.timing_diagnostics is not None:
+                self.timing_diagnostics.record_parse(
+                    live_frame.frame_index,
+                    start_monotonic=parse_start,
+                    end_monotonic=parse_end,
+                )
             return {
                 "parse_ok": False,
                 "adapter_ok": False,
@@ -447,14 +493,29 @@ class LiveTrialRunner:
                 "sample": None,
                 "hand_valid": False,
             }
+        parse_end = time.monotonic()
+        if self.timing_diagnostics is not None:
+            self.timing_diagnostics.record_parse(
+                live_frame.frame_index,
+                start_monotonic=parse_start,
+                end_monotonic=parse_end,
+            )
 
         hand = getattr(device_frame, "hand", None)
         hand_valid = bool(getattr(hand, "valid", False))
+        adapter_start = time.monotonic()
         try:
             sample = self.adapter.to_experiment_input_sample(device_frame)
             adapter_ok = True
         except Exception:
             self._adapter_error_count += 1
+        adapter_end = time.monotonic()
+        if self.timing_diagnostics is not None:
+            self.timing_diagnostics.record_adapter(
+                live_frame.frame_index,
+                start_monotonic=adapter_start,
+                end_monotonic=adapter_end,
+            )
         return {
             "parse_ok": parse_ok,
             "adapter_ok": adapter_ok,
@@ -462,6 +523,20 @@ class LiveTrialRunner:
             "sample": sample,
             "hand_valid": hand_valid,
         }
+
+    def _record_operator_command_timing(self, command: str) -> None:
+        command_monotonic = time.monotonic()
+        self._operator_command_monotonic_ms = command_monotonic * 1000.0
+        if self.timing_diagnostics is not None:
+            self.timing_diagnostics.record_operator_command(
+                command,
+                frame_index=self._timing_frame_index(),
+                phase=self.config.timing_phase,
+                monotonic_time=command_monotonic,
+            )
+
+    def _timing_frame_index(self) -> int | None:
+        return self._last_timing_frame_index
 
     def _record_frame(
         self,
@@ -638,6 +713,16 @@ class LiveTrialRunner:
             "end_reason": self._end_reason,
             "operator_command": self._operator_command,
             "operator_command_time": self._operator_command_time,
+            "operator_command_monotonic_ms": self._operator_command_monotonic_ms,
+            "trial_end_monotonic_ms": (
+                self._trial_end_monotonic * 1000.0
+                if self._trial_end_monotonic is not None
+                else None
+            ),
+            "operator_command_to_trial_stop_latency_ms": _difference_ms(
+                self._trial_end_monotonic * 1000.0 if self._trial_end_monotonic is not None else None,
+                self._operator_command_monotonic_ms,
+            ),
             "manual_completed": self._end_reason == "operator_manual_complete",
             "operator_aborted": self._trial_outcome == "ABORTED_BY_OPERATOR",
             "trial_start_time": self._trial_start_sample_time,
@@ -771,6 +856,12 @@ def _axis_distance(value: float, minimum: float, maximum: float) -> float:
     if value > maximum:
         return value - maximum
     return 0.0
+
+
+def _difference_ms(end_ms: float | None, start_ms: float | None) -> float | None:
+    if end_ms is None or start_ms is None:
+        return None
+    return end_ms - start_ms
 
 
 def _detach_count_from_result(result: Any | None) -> int:

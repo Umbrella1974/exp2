@@ -24,7 +24,12 @@ class LatestFrameBufferStats:
 class LatestFrameBuffer:
     """Keep only the most recent frame and consume each frame at most once."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        frame_published_callback: Callable[[Any, float, Any | None], None] | None = None,
+        frame_consumed_callback: Callable[[Any, float], None] | None = None,
+    ) -> None:
         self._condition = threading.Condition()
         self._latest_frame: Any | None = None
         self._latest_token = 0
@@ -34,19 +39,30 @@ class LatestFrameBuffer:
         self._overwritten_frame_count = 0
         self._last_frame_index: int | None = None
         self._last_receive_time: float | None = None
+        self.frame_published_callback = frame_published_callback
+        self.frame_consumed_callback = frame_consumed_callback
 
     def put(self, frame: Any) -> None:
         """Store a new frame, overwriting any unconsumed older frame."""
 
+        overwritten_frame = None
         with self._condition:
             if self._latest_frame is not None and self._latest_token != self._last_consumed_token:
                 self._overwritten_frame_count += 1
+                overwritten_frame = self._latest_frame
             self._latest_frame = frame
             self._latest_token += 1
             self._put_count += 1
             self._last_frame_index = _frame_index(frame)
             self._last_receive_time = _receive_time(frame)
+            published_monotonic = time.monotonic()
             self._condition.notify_all()
+        _safe_callback(
+            self.frame_published_callback,
+            frame,
+            published_monotonic,
+            overwritten_frame,
+        )
 
     def get_latest(
         self,
@@ -56,6 +72,8 @@ class LatestFrameBuffer:
     ) -> Any | None:
         """Return the latest frame, or None if no unconsumed frame is available."""
 
+        consumed_frame = None
+        consumed_monotonic = None
         with self._condition:
             if self._latest_frame is None:
                 return None
@@ -65,7 +83,11 @@ class LatestFrameBuffer:
             if consume and self._latest_token != self._last_consumed_token:
                 self._last_consumed_token = self._latest_token
                 self._consumed_count += 1
-            return frame
+                consumed_frame = frame
+                consumed_monotonic = time.monotonic()
+        if consumed_frame is not None:
+            _safe_callback(self.frame_consumed_callback, consumed_frame, consumed_monotonic)
+        return frame
 
     def get_frame(self, timeout: float | None = None) -> Any | None:
         """Compatibility wrapper used by calibration collectors."""
@@ -85,7 +107,9 @@ class LatestFrameBuffer:
             frame = self._latest_frame
             self._last_consumed_token = self._latest_token
             self._consumed_count += 1
-            return frame
+            consumed_monotonic = time.monotonic()
+        _safe_callback(self.frame_consumed_callback, frame, consumed_monotonic)
+        return frame
 
     def stats_snapshot(self) -> LatestFrameBufferStats:
         """Return a thread-safe immutable stats snapshot."""
@@ -239,3 +263,13 @@ def _source_is_stopped(source: Any) -> bool:
     if hasattr(source, "stop_event"):
         return bool(source.stop_event.is_set())
     return bool(getattr(source, "stopped", False))
+
+
+def _safe_callback(callback: Callable[..., None] | None, *args: Any) -> None:
+    if callback is None:
+        return
+    try:
+        callback(*args)
+    except Exception:
+        # Diagnostics must never interrupt the realtime frame path.
+        return

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import threading
 import time
@@ -17,6 +18,7 @@ from run_live_integrated_session import (
     LiveIntegratedSessionConfig,
     run_live_integrated_session,
 )
+from validate_session_outputs import validate_session_outputs
 
 
 def test_integrated_session_completes_and_keeps_calibration_consistent(tmp_path: Path) -> None:
@@ -66,6 +68,19 @@ def test_integrated_session_completes_and_keeps_calibration_consistent(tmp_path:
     assert result.summary["gui_enabled"] is False
     assert result.summary["gui_closed"] is False
     assert result.summary["gui_requested_stop"] is False
+    assert result.summary["timing_enabled"] is True
+    assert result.summary["timing_is_live_latency"] is True
+    assert result.summary["published_frame_count"] >= result.summary["processed_frame_count"] == 3
+    timing_path = Path(result.summary["timing_diagnostics_path"])
+    assert timing_path == session_dir / "timing_diagnostics.csv"
+    with timing_path.open("r", newline="", encoding="utf-8") as handle:
+        timing_rows = list(csv.DictReader(handle))
+    assert timing_rows
+    assert any(row["phase"] == "CALIBRATING_ORIGIN" for row in timing_rows)
+    assert any(row["phase"] == "TRIAL_RUNNING" for row in timing_rows)
+    assert all(row["mode"] == "live" for row in timing_rows)
+    assert all(row["is_live_latency"] == "true" for row in timing_rows)
+    assert validate_session_outputs(session_dir)["status"] == "PASS"
 
 
 def test_no_gui_does_not_preflight_gui_dependencies(
@@ -231,6 +246,7 @@ def test_live_gui_publishes_snapshots_and_close_does_not_stop_trial(
                 "log_path": kwargs["log_path"],
                 "runtime": kwargs["runtime_stats_getter"](),
                 "updates_before_close": store.stats_snapshot().update_count,
+                "has_render_callback": callable(kwargs.get("render_callback")),
             }
         )
         store.mark_gui_closed()
@@ -256,6 +272,7 @@ def test_live_gui_publishes_snapshots_and_close_does_not_stop_trial(
     assert gui_calls[0]["runtime"]["mode"] == "live"
     assert gui_calls[0]["runtime"]["raw_dropped_frame_count"] == 0
     assert gui_calls[0]["updates_before_close"] >= 1
+    assert gui_calls[0]["has_render_callback"] is True
 
 
 def test_live_gui_dependency_failure_happens_before_live_state(

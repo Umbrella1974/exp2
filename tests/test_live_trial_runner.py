@@ -14,6 +14,7 @@ from live_raw_stream import LiveRawFrame
 from live_trial_runner import LiveTrialRunner, LiveTrialRunnerConfig
 from session_recorder import SessionRecorder
 from task_coordinate_system import TaskCoordinateSystem
+from timing_diagnostics import TimingDiagnostics
 
 
 def test_step_once_processes_one_frame_and_builds_snapshot(tmp_path: Path) -> None:
@@ -119,6 +120,45 @@ def test_snapshot_callback_exception_is_counted(tmp_path: Path) -> None:
     assert result.stats.run_stop_reason == "max_frames"
     assert result.stats.callback_error_count == 1
     assert any("snapshot_callback failed" in warning for warning in result.summary["warnings"])
+
+
+def test_timing_instrumentation_records_processing_without_gui_latency(tmp_path: Path) -> None:
+    diagnostics = TimingDiagnostics(mode="live", is_live_latency=True)
+    runner, _, _ = _make_runner(
+        tmp_path,
+        [_live_frame(0, 0.0)],
+        timing_diagnostics=diagnostics,
+    )
+
+    result = runner.run_until_done()
+    row = diagnostics.rows_snapshot()[0]
+
+    assert result.summary["trial_outcome"] == "MAX_FRAMES_REACHED"
+    assert row["parse_duration_ms"] is not None
+    assert row["adapter_duration_ms"] is not None
+    assert row["trial_update_duration_ms"] is not None
+    assert row["snapshot_published_monotonic_ms"] is not None
+    assert row["gui_render_monotonic_ms"] is None
+    assert row["snapshot_publish_to_gui_render_latency_ms"] is None
+
+
+def test_operator_command_timing_uses_last_consumed_frame_without_snapshot(tmp_path: Path) -> None:
+    diagnostics = TimingDiagnostics(mode="live", is_live_latency=True)
+    runner, _, _ = _make_runner(
+        tmp_path,
+        [_live_frame(0, 0.0, raw_frame="bad")],
+        max_frames=None,
+        operator_command_checker=lambda: "q" if runner.stats_snapshot().parse_error_count else None,
+        timing_diagnostics=diagnostics,
+    )
+
+    result = runner.run_until_done()
+    row = diagnostics.rows_snapshot()[0]
+
+    assert result.summary["trial_outcome"] == "ABORTED_BY_OPERATOR"
+    assert row["frame_index"] == 0
+    assert row["event_type"] == "operator_command"
+    assert row["operator_command_to_trial_stop_latency_ms"] is not None
 
 
 def test_operator_manual_complete_stops_runner_and_records_event(tmp_path: Path) -> None:
@@ -373,6 +413,7 @@ def _make_runner(
     block_size: Vec3 | None = None,
     track_region: TrackRegion | None = None,
     engine_overrides: dict[str, Any] | None = None,
+    timing_diagnostics: TimingDiagnostics | None = None,
 ) -> tuple[LiveTrialRunner, SessionRecorder, _FakeLatestFrameBuffer]:
     buffer = _FakeLatestFrameBuffer(frames)
     block_initial_center_task = block_initial_center_task or Vec3(0.0, 0.0, 0.0)
@@ -419,6 +460,7 @@ def _make_runner(
         source_stop_reason_getter=source_stop_reason_getter,
         source_stats_getter=source_stats_getter or (lambda: {"total_received_frames": buffer.put_count}),
         operator_command_checker=operator_command_checker,
+        timing_diagnostics=timing_diagnostics,
     )
     return runner, recorder, buffer
 

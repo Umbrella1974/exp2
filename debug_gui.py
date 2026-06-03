@@ -23,6 +23,7 @@ class GuiDependencyError(RuntimeError):
 
 
 RuntimeStatsGetter = Callable[[], dict[str, Any]]
+RenderCallback = Callable[[Any, float], None]
 
 
 def preflight_gui_dependencies() -> None:
@@ -40,6 +41,7 @@ def run_debug_gui(
     title: str = "Exp2 Debug GUI",
     runtime_stats_getter: RuntimeStatsGetter | None = None,
     log_path: str | Path | None = None,
+    render_callback: RenderCallback | None = None,
 ) -> int:
     """Run the debug GUI event loop."""
 
@@ -60,6 +62,7 @@ def run_debug_gui(
         title=title,
         runtime_stats_getter=runtime_stats_getter,
         log_path=Path(log_path) if log_path is not None else None,
+        render_callback=render_callback,
     )
     window.show()
     if owns_app:
@@ -91,6 +94,7 @@ class _DebugGuiWindow:
         title: str,
         runtime_stats_getter: RuntimeStatsGetter | None,
         log_path: Path | None,
+        render_callback: RenderCallback | None,
     ) -> None:
         self.QtCore = QtCore
         self.QtGui = QtGui
@@ -102,6 +106,7 @@ class _DebugGuiWindow:
         self.gui_fps = float(gui_fps)
         self.runtime_stats_getter = runtime_stats_getter
         self.log_path = log_path
+        self.render_callback = render_callback
         self._last_refresh_time: float | None = None
         self._last_gui_fps: float | None = None
         self._last_log_time = 0.0
@@ -174,8 +179,18 @@ class _DebugGuiWindow:
         )
         view_model = snapshot_to_debug_view_model(snapshot, scene=self.scene, runtime=runtime)
         self._draw(view_model)
-        render_lag_ms = (time.monotonic() - started) * 1000.0
+        rendered = time.monotonic()
+        self._safe_render_callback(snapshot, rendered)
+        render_lag_ms = (rendered - started) * 1000.0
         self._log(view_model, render_lag_ms)
+
+    def _safe_render_callback(self, snapshot: Any, rendered_monotonic: float) -> None:
+        if self.render_callback is None:
+            return
+        try:
+            self.render_callback(snapshot, rendered_monotonic)
+        except Exception:
+            return
 
     def _draw(self, view_model: Any) -> None:
         self.plot.clear()

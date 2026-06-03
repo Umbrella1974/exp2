@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,15 @@ def test_replay_debug_runner_from_explicit_files_produces_snapshots(tmp_path: Pa
     assert result.summary["run_stop_reason"] == "eof"
     assert store.get_latest().frame_index == 1
     assert (tmp_path / "out" / "replay_debug_summary.json").exists()
+    timing_path = tmp_path / "out" / "timing_diagnostics.csv"
+    assert timing_path.exists()
+    assert result.summary["timing_mode"] == "replay"
+    assert result.summary["timing_is_live_latency"] is False
+    with timing_path.open("r", newline="", encoding="utf-8") as handle:
+        timing_rows = list(csv.DictReader(handle))
+    assert timing_rows
+    assert all(row["mode"] == "replay" for row in timing_rows)
+    assert all(row["is_live_latency"] == "false" for row in timing_rows)
 
 
 def test_replay_debug_runner_from_session_dir_discovers_files(tmp_path: Path) -> None:
@@ -59,6 +69,7 @@ def test_replay_debug_runner_from_session_dir_discovers_files(tmp_path: Path) ->
     assert inputs.scene.map_id == "debug_map"
     assert result.snapshot_count == 1
     assert result.summary["session_dir"] == str(session_dir)
+    assert not (session_dir / "timing_diagnostics.csv").exists()
 
 
 def test_replay_debug_infers_nodes_world_for_legacy_live_integrated_session(tmp_path: Path) -> None:

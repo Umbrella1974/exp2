@@ -21,6 +21,7 @@ from debug_gui import (
 )
 from latest_snapshot_store import LatestSnapshotStore
 from replay_debug_runner import ReplayDebugConfig, load_replay_debug_inputs, run_replay_debug
+from timing_diagnostics import TimingDiagnostics
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -33,9 +34,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     store = LatestSnapshotStore()
+    timing_diagnostics = TimingDiagnostics(mode="replay", is_live_latency=False)
     if args.headless:
         try:
-            result = run_replay_debug(config, snapshot_store=store)
+            result = run_replay_debug(
+                config,
+                snapshot_store=store,
+                timing_diagnostics=timing_diagnostics,
+            )
         except Exception as exc:
             print(f"Replay failed: {exc}", file=sys.stderr)
             return 1
@@ -52,7 +58,11 @@ def main(argv: list[str] | None = None) -> int:
 
     def replay_worker() -> None:
         try:
-            result_holder["result"] = run_replay_debug(config, snapshot_store=store)
+            result_holder["result"] = run_replay_debug(
+                config,
+                snapshot_store=store,
+                timing_diagnostics=timing_diagnostics,
+            )
         except Exception as exc:
             result_holder["error"] = exc
 
@@ -71,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
                 "total_received_frames": store.stats_snapshot().update_count,
                 "overwritten_snapshot_count": store.stats_snapshot().overwritten_snapshot_count,
             },
+            render_callback=timing_diagnostics.record_gui_render,
         )
     except GuiDependencyError:
         print(INSTALL_GUI_DEPS_MESSAGE, file=sys.stderr)
@@ -87,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     result = result_holder.get("result")
     if result is not None:
+        if config.out_dir is not None:
+            timing_diagnostics.write_csv(config.out_dir / "timing_diagnostics.csv")
         print(json.dumps(result.summary, indent=2, ensure_ascii=False, sort_keys=True))
     return int(exit_code)
 

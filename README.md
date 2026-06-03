@@ -719,7 +719,7 @@ python run_live_integrated_session.py ^
   --termination-config config\termination_debug.json
 ```
 
-也支持 `.yaml` / `.yml`，但会 lazy import `PyYAML`；如果没安装，会给出明确的安装提示。最终生效的配置会写入 `out_dir/session/termination_config.json`，并同时进入 `summary.json`、`session_meta.json`、`trial_config.json` 和 `trial_summary.json`。`--duration-seconds` 是 debug 外层运行时长上限，结果是 `DURATION_REACHED`；它和保护性 `max_trial_duration_seconds` 的 `FAILED_TIMEOUT` 严格分开。
+也支持 `.yaml` / `.yml`，但会 lazy import `PyYAML`；如果没安装，会给出明确的安装提示。最终生效的配置会写入 `out_dir/session/termination_config.json`，并同时进入 `summary.json`、`session_meta.json`、`trial_config.json` 和 `trial_summary.json`。`--duration-seconds` 是 debug 外层运行时长上限，结果是 `trial_outcome=DURATION_REACHED`、`end_reason=duration_reached`；它和保护性 `max_trial_duration_seconds` 的 `trial_outcome=FAILED_TIMEOUT`、`end_reason=trial_timeout` 严格分开。
 
 如果 calibration quality 出来后你在 `Continue with this calibration? [y/N]` 里选择 no 或直接回车，runner 会重新进入四段 calibration，而不是退出整个流程。只有 calibration 采集失败后，在 `Retry calibration? [y/N]` 里选择 no，才会停止本次 run。
 
@@ -764,6 +764,7 @@ out_dir/session/events.csv
 out_dir/session/haptic.csv
 out_dir/session/termination_config.json
 out_dir/session/trial_summary.json
+out_dir/session/timing_diagnostics.csv      live integrated 默认始终写入
 out_dir/session/gui_diagnostics.csv       仅 --gui 时，优先写入这里
 ```
 
@@ -862,10 +863,22 @@ gui_snapshot_update_count
 gui_overwritten_snapshot_count
 gui_diagnostics_path
 gui_close_time
+timing_enabled
+timing_diagnostics_path
+timing_mode
+timing_is_live_latency
+timing_record_count
+published_frame_count
+consumed_frame_count
+processed_frame_count
+overwritten_before_consume_count
 trial_outcome
 end_reason
 operator_command
 operator_command_time
+operator_command_monotonic_ms
+trial_end_monotonic_ms
+operator_command_to_trial_stop_latency_ms
 manual_completed
 operator_aborted
 trial_start_time
@@ -953,6 +966,8 @@ fixed    固定 --replay-fps 回放，适合调 GUI
 fast     不等待，适合测试或快速 smoke
 ```
 
+replay 只有传入 `--out-dir` 时才会写 `timing_diagnostics.csv`，并且只写到 replay 输出目录，不修改输入 session。replay timing 行会标记 `mode=replay`、`is_live_latency=false`；parser / adapter / trial update duration 可用于性能比较，但 replay 的等待时间和 GUI latency 不能解释为真实 live latency。
+
 当前 GUI 显示 x-y task view：track boxes、target、block start footprint、当前 block、当前 pinch，以及右侧状态面板。z 方向第一版以数值显示。GUI Close 只关闭显示层，不直接修改 `TrialController` / `BlockController`，也不接 haptic hardware。缺少 `PySide6` / `pyqtgraph` 时，入口会提示安装命令；非 GUI 测试不依赖这两个包。
 
 live `--gui` 的线程模型是：Qt GUI event loop 在主线程运行；`LiveTrialRunner.run_until_done()` 在 worker 线程运行；`snapshot_callback` 只做轻量 `LatestSnapshotStore.publish(snapshot)`。如果 GUI 刷新慢，store 只保留最新 snapshot，不排队旧帧，避免显示延迟越积越大。
@@ -969,6 +984,69 @@ summary/session finalize 会等用户关闭 GUI 后继续
 live `--gui` 的 runtime stats 第一版显示已有且可靠的字段：snapshot age、GUI fps/render lag、overwritten snapshot count、raw dropped frames、parse errors。`receive_fps` 如果没有可靠来源，显示为 N/A，不硬造。
 
 已知风险：当前 live `--gui` 是 debug display，不是正式实验 lifecycle GUI。在 Windows/Qt 下，`Ctrl+C` 行为可能不如纯 CLI 模式直接；如果 Qt 窗口获得焦点，终端里的 `e/q` 读取也可能不如纯 CLI 稳定。如果需要停止整个 run，仍依赖现有 runner 的 `KeyboardInterrupt` / `request_stop` / `stop_event` 机制。后续正式 GUI 阶段需要单独设计 Stop / Abort / Pause / Resume 和完整生命周期控制。
+
+## Session 输出校验
+
+`validate_session_outputs.py` 只读 session 和外层 summary，不移动、不复制、不重写任何文件。默认读取 `session_dir.parent / summary.json`：
+
+```powershell
+python validate_session_outputs.py --session-dir data\live_integrated_session\debug_01\session
+```
+
+如果 summary 在其他位置：
+
+```powershell
+python validate_session_outputs.py --session-dir data\live_integrated_session\debug_01\session --summary-json path\to\summary.json
+```
+
+validator 会检查当前 live integrated 单 trial 的必需 artifact、`trial_outcome`、`end_reason`、effective termination config、末帧 block / pinch / target 诊断，以及 summary / trial summary / termination config / calibration / map / trial id 的一致性。`--gui` 启用但缺少 `gui_diagnostics.csv`，或 live integrated 中 `timing_enabled=true` 但缺少 `timing_diagnostics.csv`，会报告 ERROR。raw 为空、末帧诊断为 null、GUI 行数很少、timing 可选字段为空等情况会报告 WARNING；默认 WARNING 不让校验失败，可用 `--strict` 将 WARNING 视为失败。
+
+## Timing Diagnostics
+
+live integrated 从等待 stream、calibration 到 trial 全程使用内存 collector 记录 `session/timing_diagnostics.csv`。所有进入 `LatestFrameBuffer.put()` 的 frame 都有 timing 行；被覆盖或没有被 runner 消费的 frame 会保留部分字段为空，并通过以下字段区分：
+
+```text
+phase
+frame_published
+frame_consumed
+frame_processed
+overwritten_before_consume
+```
+
+常用时间点和延迟字段：
+
+```text
+raw_receive_monotonic_ms
+frame_published_monotonic_ms
+frame_consumed_monotonic_ms
+parse_start_monotonic_ms / parse_end_monotonic_ms / parse_duration_ms
+adapter_start_monotonic_ms / adapter_end_monotonic_ms / adapter_duration_ms
+trial_update_start_monotonic_ms / trial_update_end_monotonic_ms / trial_update_duration_ms
+snapshot_created_monotonic_ms
+snapshot_published_monotonic_ms
+gui_render_monotonic_ms
+raw_to_frame_publish_latency_ms
+frame_wait_age_ms
+raw_to_trial_update_latency_ms
+frame_to_trial_update_latency_ms
+trial_update_to_snapshot_latency_ms
+snapshot_publish_to_gui_render_latency_ms
+operator_command_to_trial_stop_latency_ms
+```
+
+`snapshot_published_monotonic_ms` 表示 `LiveTrialRunner` 将 snapshot 发布给订阅者的时刻；没有 GUI 时它仍然存在，只有 GUI render 相关字段为空。GUI 重复绘制最后一帧时只记录该 frame 的首次 render。operator command 会写入最后一个已知 frame；trial 尚无 frame 时会创建 `event_type=operator_command`、`frame_index=null` 的 session-level 行。
+
+发送方字段 `combined_monotonic_ms`、`skeleton_receive_monotonic_ms`、`tracker_receive_monotonic_ms` 只属于发送方时钟域，只能在发送方字段之间比较，例如 `skeleton_tracker_sync_delta_ms`。绝对不要用它们减 Python `time.monotonic()` 字段。Python latency 只由 Python monotonic 字段相减。
+
+运行 timing 后处理：
+
+```powershell
+python analyze_timing.py --session-dir data\live_integrated_session\debug_01\session
+```
+
+默认输出 `session/timing_analysis_summary.json` 并向终端打印 JSON。已有输出不会被覆盖，除非传 `--overwrite`；也可以用 `--out` 指定其他路径。summary 包含 median / p95 / max 延迟、各 phase transport 统计、published / consumed / processed / overwritten 计数、`max_no_frame_gap_ms` 和 operator command 到 stop 的延迟。
+
+timing collector 在控制 loop 和 GUI render 中只更新线程安全内存，不做逐帧文件 I/O，run 结束后一次写 CSV。代价是进程硬崩溃时 timing log 可能丢失。本阶段只做 system timing diagnostics，不计算 haptic cue 或受试者 behavioral reaction time；这些应在真实 haptic 和行为 marker 定义稳定后单独做离线分析。
 
 ## `analyze_session.py`
 

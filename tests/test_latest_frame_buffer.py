@@ -45,3 +45,24 @@ def test_overwritten_count_tracks_unconsumed_frames() -> None:
     stats = buffer.stats_snapshot()
     assert stats.overwritten_frame_count == 2
     assert stats.dropped_old_frame_count == 2
+
+
+def test_publish_consume_callbacks_receive_overwritten_frame() -> None:
+    published = []
+    consumed = []
+    buffer = LatestFrameBuffer(
+        frame_published_callback=lambda frame, at, overwritten: published.append(
+            (frame.frame_index, at, None if overwritten is None else overwritten.frame_index)
+        ),
+        frame_consumed_callback=lambda frame, at: consumed.append((frame.frame_index, at)),
+    )
+
+    buffer.put(FakeFrame(1, 1.0))
+    buffer.put(FakeFrame(2, 2.0))
+    assert buffer.get_latest().frame_index == 2
+
+    assert published[0][0] == 1
+    assert published[0][2] is None
+    assert published[1][0] == 2
+    assert published[1][2] == 1
+    assert consumed[0][0] == 2

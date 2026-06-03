@@ -42,6 +42,7 @@ from map_config import (
 from raw_manus_vive_parser import parse_raw_manus_vive_frame
 from session_recorder import SessionRecorder
 from termination_config import TerminationConfig, default_termination_config, load_termination_config
+from timing_diagnostics import TimingDiagnostics
 from trial_controller import ExperimentInputSample
 
 
@@ -131,10 +132,25 @@ def run_live_integrated_session(
     summary_path = out_dir / "summary.json"
     calibration_out_path = out_dir / "calibration.json"
     session_dir = config.session_dir or _default_session_dir(out_dir)
+    timing_diagnostics_path = session_dir / "timing_diagnostics.csv"
 
     stop_event = Event()
     raw_handle = raw_log_path.open("w", encoding="utf-8")
-    latest_buffer = LatestFrameBuffer()
+    phase = LiveSessionPhase.WAITING_FOR_STREAM
+    timing_diagnostics = TimingDiagnostics(mode="live", is_live_latency=True)
+    latest_buffer = LatestFrameBuffer(
+        frame_published_callback=lambda frame, published, overwritten: timing_diagnostics.record_frame_published(
+            frame,
+            phase=phase.name,
+            monotonic_time=published,
+            overwritten_frame=overwritten,
+        ),
+        frame_consumed_callback=lambda frame, consumed: timing_diagnostics.record_frame_consumed(
+            frame,
+            phase=phase.name,
+            monotonic_time=consumed,
+        ),
+    )
     live_source = source or LiveRawStreamServer(
         host=config.host,
         port=config.port,
@@ -153,7 +169,6 @@ def run_live_integrated_session(
     calibration: FormalCalibration | None = None
     session_recorder: SessionRecorder | None = None
     run_stop_reason = "completed"
-    phase = LiveSessionPhase.WAITING_FOR_STREAM
     phase_at_stop = phase.name
     session_finalized = False
     trial_controller_started = False
@@ -353,6 +368,7 @@ def run_live_integrated_session(
             source_stop_reason_getter=lambda: _source_stop_reason_from_pump(pump),
             source_stats_getter=lambda: pump.stats_snapshot(),
             operator_command_checker=_read_operator_command,
+            timing_diagnostics=timing_diagnostics,
         )
         if gui_snapshot_store is not None:
             live_trial_result = _run_live_trial_with_gui(
@@ -366,6 +382,7 @@ def run_live_integrated_session(
                     live_trial_runner=live_trial_runner,
                     pump=pump,
                 ),
+                timing_diagnostics=timing_diagnostics,
             )
         else:
             live_trial_result = live_trial_runner.run_until_done()
@@ -414,6 +431,12 @@ def run_live_integrated_session(
         pump.stop(run_stop_reason)
         pump.join(timeout=1.0)
         raw_handle.close()
+        timing_path_written: Path | None = None
+        if session_recorder is not None:
+            try:
+                timing_path_written = timing_diagnostics.write_csv(timing_diagnostics_path)
+            except Exception as exc:
+                errors.append(f"timing diagnostics write failed: {exc}")
         summary = _build_summary(
             config,
             pump,
@@ -445,6 +468,10 @@ def run_live_integrated_session(
             gui_snapshot_store=gui_snapshot_store,
             gui_diagnostics_path=gui_diagnostics_path,
             gui_requested_stop=gui_requested_stop,
+        )
+        summary.update(timing_diagnostics.summary())
+        summary["timing_diagnostics_path"] = (
+            str(timing_path_written) if timing_path_written is not None else None
         )
         if trial_runner_summary:
             _merge_live_trial_runner_summary(summary, trial_runner_summary)
@@ -821,6 +848,7 @@ def _trial_config_payload(
             "mode": "live_integrated_session",
             "scene_type": "map_config",
             "map_config_path": str(config.map_config),
+            "trial_id": config.trial_id,
             "calibration_id": calibration.calibration_id,
             "calibration_type": calibration.calibration_type,
             "task_coordinate_system": calibration_to_dict(calibration)["task_coordinate_system"],
@@ -839,6 +867,9 @@ def _trial_config_payload(
             "termination_config_path": (
                 str(config.termination_config_path) if config.termination_config_path is not None else None
             ),
+            "timing_enabled": True,
+            "timing_mode": "live",
+            "timing_is_live_latency": True,
             "haptic_hardware_enabled": False,
             "warnings": list(warnings) + list(map_warnings),
         }
@@ -875,6 +906,9 @@ def _session_meta(
         "termination_config_path": (
             str(config.termination_config_path) if config.termination_config_path is not None else None
         ),
+        "timing_enabled": True,
+        "timing_mode": "live",
+        "timing_is_live_latency": True,
         "warnings": list(warnings),
     }
     if map_anchor["mode"] == "current_pinch_debug":
@@ -1095,6 +1129,7 @@ def _run_live_trial_with_gui(
     gui_fps: float,
     log_path: Path | None,
     runtime_stats_getter: Callable[[], dict[str, Any]],
+    timing_diagnostics: TimingDiagnostics,
 ) -> Any:
     result_holder: dict[str, Any] = {}
 
@@ -1113,6 +1148,7 @@ def _run_live_trial_with_gui(
             gui_fps=gui_fps,
             log_path=log_path,
             runtime_stats_getter=runtime_stats_getter,
+            render_callback=timing_diagnostics.record_gui_render,
         )
     except KeyboardInterrupt:
         snapshot_store.mark_gui_closed()
@@ -1142,6 +1178,7 @@ def _run_live_debug_gui(
     gui_fps: float,
     log_path: Path | None,
     runtime_stats_getter: Callable[[], dict[str, Any]],
+    render_callback: Callable[[Any, float], None] | None = None,
 ) -> int:
     try:
         from debug_gui import GuiDependencyError, run_debug_gui
@@ -1158,6 +1195,7 @@ def _run_live_debug_gui(
             title="Exp2 Live Debug GUI",
             runtime_stats_getter=runtime_stats_getter,
             log_path=log_path,
+            render_callback=render_callback,
         )
     except GuiDependencyError as exc:
         raise LiveGuiDependencyError(str(exc)) from exc
@@ -1291,8 +1329,13 @@ def _merge_live_trial_runner_summary(
         "max_callback_latency_ms",
         "trial_outcome",
         "end_reason",
+        "map_id",
+        "calibration_id",
         "operator_command",
         "operator_command_time",
+        "operator_command_monotonic_ms",
+        "trial_end_monotonic_ms",
+        "operator_command_to_trial_stop_latency_ms",
         "manual_completed",
         "operator_aborted",
         "trial_start_time",

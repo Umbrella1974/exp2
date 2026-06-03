@@ -26,6 +26,7 @@ from live_raw_stream import LiveRawFrame
 from live_trial_runner import LiveTrialRunner, LiveTrialRunnerConfig
 from raw_frame_source import JsonlRawFrameSource
 from task_coordinate_system import TaskCoordinateSystem
+from timing_diagnostics import TimingDiagnostics
 
 
 SnapshotCallback = Callable[[Any], None]
@@ -73,6 +74,7 @@ class ReplayDebugResult:
     scene: DebugSceneView
     last_snapshot: Any | None
     snapshot_count: int
+    timing_diagnostics: TimingDiagnostics
 
 
 def load_replay_debug_inputs(config: ReplayDebugConfig) -> ReplayDebugInputs:
@@ -105,6 +107,7 @@ def run_replay_debug(
     *,
     snapshot_store: LatestSnapshotStore | None = None,
     snapshot_callback: SnapshotCallback | None = None,
+    timing_diagnostics: TimingDiagnostics | None = None,
 ) -> ReplayDebugResult:
     """Replay raw frames through LiveTrialRunner and publish snapshots."""
 
@@ -115,7 +118,20 @@ def run_replay_debug(
     block_center = _block_center_from_trial_config(inputs.trial_config)
     block_size = _block_size_from_trial_config(inputs.trial_config)
     engine_config = _engine_config_from_trial_config(inputs.trial_config, block_size, inputs.session_meta)
-    latest_buffer = LatestFrameBuffer()
+    timing_diagnostics = timing_diagnostics or TimingDiagnostics(mode="replay", is_live_latency=False)
+    latest_buffer = LatestFrameBuffer(
+        frame_published_callback=lambda frame, published, overwritten: timing_diagnostics.record_frame_published(
+            frame,
+            phase="REPLAY",
+            monotonic_time=published,
+            overwritten_frame=overwritten,
+        ),
+        frame_consumed_callback=lambda frame, consumed: timing_diagnostics.record_frame_consumed(
+            frame,
+            phase="REPLAY",
+            monotonic_time=consumed,
+        ),
+    )
     replay_state = {"raw_seen": 0, "snapshots": 0}
 
     def on_snapshot(snapshot: Any) -> None:
@@ -143,12 +159,14 @@ def run_replay_debug(
             tracker_index=config.tracker_index,
             skeleton_index=config.skeleton_index,
             pinch_position_mode=_pinch_position_mode_for_replay(inputs.trial_config, inputs.session_meta),
+            timing_phase="REPLAY",
         ),
         map_id=str(inputs.trial_config.get("map_id", "")),
         calibration_id=str(inputs.calibration_payload.get("calibration_id", "")),
         trial_config={"mode": "replay_debug_gui", **inputs.trial_config},
         snapshot_callback=on_snapshot,
         source_stats_getter=lambda: {"total_received_frames": replay_state["raw_seen"]},
+        timing_diagnostics=timing_diagnostics,
     )
 
     previous_raw_time: float | None = None
@@ -187,17 +205,24 @@ def run_replay_debug(
             "gui_scene": inputs.scene.to_dict(),
         }
     )
+    summary.update(timing_diagnostics.summary())
+    timing_path: Path | None = None
     if config.out_dir is not None:
         config.out_dir.mkdir(parents=True, exist_ok=True)
+        timing_path = timing_diagnostics.write_csv(config.out_dir / "timing_diagnostics.csv")
+        summary["timing_diagnostics_path"] = str(timing_path)
         (config.out_dir / "replay_debug_summary.json").write_text(
             json.dumps(_json_safe(summary), indent=2, ensure_ascii=False, sort_keys=True),
             encoding="utf-8",
         )
+    else:
+        summary["timing_diagnostics_path"] = None
     return ReplayDebugResult(
         summary=summary,
         scene=inputs.scene,
         last_snapshot=runner.last_snapshot,
         snapshot_count=replay_state["snapshots"],
+        timing_diagnostics=timing_diagnostics,
     )
 
 
