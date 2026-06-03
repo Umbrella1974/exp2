@@ -638,7 +638,7 @@ class LiveTrialRunner:
             "end_reason": self._end_reason,
             "operator_command": self._operator_command,
             "operator_command_time": self._operator_command_time,
-            "manual_completed": self._trial_outcome == "MANUAL_COMPLETED",
+            "manual_completed": self._end_reason == "operator_manual_complete",
             "operator_aborted": self._trial_outcome == "ABORTED_BY_OPERATOR",
             "trial_start_time": self._trial_start_sample_time,
             "trial_end_time": trial_end_time,

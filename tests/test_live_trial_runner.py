@@ -140,6 +140,22 @@ def test_operator_manual_complete_stops_runner_and_records_event(tmp_path: Path)
     assert "operator_manual_complete" in events
 
 
+def test_subject_end_is_completed_but_not_operator_manual_complete(tmp_path: Path) -> None:
+    runner, _, _ = _make_runner(
+        tmp_path,
+        [_live_frame(0, 0.0, subject_end=True)],
+        max_frames=None,
+    )
+
+    result = runner.run_until_done()
+
+    assert result.stats.run_stop_reason == "ended_by_subject"
+    assert result.summary["trial_outcome"] == "MANUAL_COMPLETED"
+    assert result.summary["end_reason"] == "subject_end"
+    assert result.summary["operator_command"] is None
+    assert result.summary["manual_completed"] is False
+
+
 def test_operator_abort_keeps_user_quit_compatibility_and_records_outcome(tmp_path: Path) -> None:
     runner, _, _ = _make_runner(
         tmp_path,
@@ -432,11 +448,17 @@ def _live_frame(
     *,
     raw_frame: Any | None = None,
     pinch_distance: float = 0.01,
+    subject_end: bool = False,
 ) -> LiveRawFrame:
     raw = (
         raw_frame
         if raw_frame is not None
-        else _raw_frame(float(frame_index), [x_position, 0.0, 0.0], pinch_distance=pinch_distance)
+        else _raw_frame(
+            float(frame_index),
+            [x_position, 0.0, 0.0],
+            pinch_distance=pinch_distance,
+            subject_end=subject_end,
+        )
     )
     return LiveRawFrame(
         frame_index=frame_index,
@@ -447,11 +469,18 @@ def _live_frame(
     )
 
 
-def _raw_frame(seconds: float, position: list[float], *, pinch_distance: float = 0.01) -> dict[str, Any]:
+def _raw_frame(
+    seconds: float,
+    position: list[float],
+    *,
+    pinch_distance: float = 0.01,
+    subject_end: bool = False,
+) -> dict[str, Any]:
     half_pinch = float(pinch_distance) / 2.0
     return {
         "timestamp": seconds * 1000.0,
         "frame": int(seconds),
+        "subject_end": subject_end,
         "skeletons": [
             {
                 "gloveId": "glove-a",

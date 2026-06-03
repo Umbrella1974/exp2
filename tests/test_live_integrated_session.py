@@ -173,6 +173,42 @@ def test_debug_duration_reached_is_not_protective_timeout(tmp_path: Path) -> Non
     assert result.summary["end_reason"] == "duration_reached"
 
 
+def test_operator_manual_complete_is_written_to_out_and_trial_summaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FakeLiveSource()
+    config = _config(
+        tmp_path,
+        calibration_id="cal_operator_manual_complete",
+        max_frames=None,
+    )
+    command_checks = 0
+
+    def operator_command() -> str | None:
+        nonlocal command_checks
+        command_checks += 1
+        return "e" if command_checks >= 2 else None
+
+    monkeypatch.setattr(runner, "_read_operator_command", operator_command)
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    out_summary = _read_json(tmp_path / "out" / "summary.json")
+    session_dir = Path(result.summary["session_dir"])
+    trial_summary = _read_json(session_dir / "trial_summary.json")
+    expected = {
+        "trial_outcome": "MANUAL_COMPLETED",
+        "end_reason": "operator_manual_complete",
+        "operator_command": "e",
+        "manual_completed": True,
+        "operator_aborted": False,
+    }
+    for summary in (result.summary, out_summary, trial_summary):
+        for key, value in expected.items():
+            assert summary[key] == value
+
+
 def test_live_gui_publishes_snapshots_and_close_does_not_stop_trial(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

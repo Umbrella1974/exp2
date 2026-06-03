@@ -794,7 +794,7 @@ session_finalized
 trial outcome 相关字段会优先使用 runner-level `trial_outcome` / `end_reason`，而不是只依赖 `TrialController.state`。常见结果包括：
 
 ```text
-MANUAL_COMPLETED             实验员按 e 手动完成 trial
+MANUAL_COMPLETED             实验员按 e，或兼容保留的 subject_end 完成 trial
 ABORTED_BY_OPERATOR          实验员按 q 中止 run
 FAILED_TIMEOUT               保护性 trial timeout
 FAILED_TOO_MANY_DETACHES     detach/release 次数超过阈值
@@ -805,6 +805,8 @@ DURATION_REACHED             --duration-seconds debug stop
 MAX_FRAMES_REACHED           --max-frames debug stop
 INTERRUPTED                  KeyboardInterrupt / GUI error 等中断
 ```
+
+后处理时不要只看 `trial_outcome=MANUAL_COMPLETED`：实验员按 `e` 会写 `end_reason=operator_manual_complete`、`operator_command=e`、`manual_completed=true`；兼容保留的 `subject_end` 会写 `end_reason=subject_end`、`operator_command=null`、`manual_completed=false`。
 
 target 诊断只记录，不自动结束 trial。summary/trial summary 中会尽量写入：
 
