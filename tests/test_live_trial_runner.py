@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from config import EngineConfig
+from cue_feedback import CueRuntime, CueSinkConfig
 from data_models import Box3D, TrackRegion, Vec3
 from latest_frame_buffer import LatestFrameBufferStats
 from live_raw_stream import LiveRawFrame
@@ -313,6 +314,24 @@ def test_logical_haptic_label_counts_are_reported(tmp_path: Path) -> None:
     assert result.stats.logical_haptic_label_counts["NONE"] == 1
 
 
+def test_max_frames_terminal_frame_does_not_create_new_cue(tmp_path: Path) -> None:
+    cue_runtime = CueRuntime(
+        trial_id="trial_test",
+        sink_config=CueSinkConfig(cue_sink="logging", mode="live", is_live_cue_timing=True),
+    )
+    runner, _, _ = _make_runner(
+        tmp_path,
+        [_live_frame(0, 0.0)],
+        max_frames=1,
+        cue_runtime=cue_runtime,
+    )
+
+    result = runner.run_until_done()
+
+    assert result.summary["trial_outcome"] == "MAX_FRAMES_REACHED"
+    assert result.summary["cue_count"] == 0
+
+
 def test_session_recorder_can_finalize_runner_summary(tmp_path: Path) -> None:
     runner, recorder, _ = _make_runner(tmp_path, [_live_frame(0, 0.0)])
 
@@ -414,6 +433,7 @@ def _make_runner(
     track_region: TrackRegion | None = None,
     engine_overrides: dict[str, Any] | None = None,
     timing_diagnostics: TimingDiagnostics | None = None,
+    cue_runtime: CueRuntime | None = None,
 ) -> tuple[LiveTrialRunner, SessionRecorder, _FakeLatestFrameBuffer]:
     buffer = _FakeLatestFrameBuffer(frames)
     block_initial_center_task = block_initial_center_task or Vec3(0.0, 0.0, 0.0)
@@ -461,6 +481,7 @@ def _make_runner(
         source_stats_getter=source_stats_getter or (lambda: {"total_received_frames": buffer.put_count}),
         operator_command_checker=operator_command_checker,
         timing_diagnostics=timing_diagnostics,
+        cue_runtime=cue_runtime,
     )
     return runner, recorder, buffer
 

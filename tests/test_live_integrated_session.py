@@ -70,6 +70,13 @@ def test_integrated_session_completes_and_keeps_calibration_consistent(tmp_path:
     assert result.summary["gui_requested_stop"] is False
     assert result.summary["timing_enabled"] is True
     assert result.summary["timing_is_live_latency"] is True
+    assert result.summary["cue_enabled"] is True
+    assert result.summary["cue_sink"] == "logging"
+    assert result.summary["cue_mode"] == "live"
+    assert result.summary["effective_cue_config"]["repeat_policy"] == "edge_only"
+    assert result.summary["visual_profile"] == "debug_all"
+    assert _read_json(session_dir / "cue_config.json") == result.summary["effective_cue_config"]
+    assert (session_dir / "cue_log.csv").exists()
     assert result.summary["published_frame_count"] >= result.summary["processed_frame_count"] == 3
     timing_path = Path(result.summary["timing_diagnostics_path"])
     assert timing_path == session_dir / "timing_diagnostics.csv"
@@ -81,6 +88,39 @@ def test_integrated_session_completes_and_keeps_calibration_consistent(tmp_path:
     assert all(row["mode"] == "live" for row in timing_rows)
     assert all(row["is_live_latency"] == "true" for row in timing_rows)
     assert validate_session_outputs(session_dir)["status"] == "PASS"
+
+
+def test_cue_sink_none_writes_config_but_not_cue_log(tmp_path: Path) -> None:
+    source = FakeLiveSource()
+    config = _config(tmp_path, calibration_id="cal_cue_none", max_frames=1, cue_sink="none")
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    session_dir = Path(result.summary["session_dir"])
+    assert result.summary["cue_enabled"] is False
+    assert result.summary["cue_count"] == 0
+    assert (session_dir / "cue_config.json").exists()
+    assert not (session_dir / "cue_log.csv").exists()
+    assert validate_session_outputs(session_dir)["status"] == "PASS"
+
+
+def test_visual_profile_alias_is_normalized_in_saved_outputs(tmp_path: Path) -> None:
+    source = FakeLiveSource()
+    config = _config(
+        tmp_path,
+        calibration_id="cal_visual_alias",
+        max_frames=1,
+        visual_profile="experiment_markers_when_hidden",
+    )
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    session_dir = Path(result.summary["session_dir"])
+    meta = _read_json(session_dir / "session_meta.json")
+    assert result.summary["requested_visual_profile"] == "experiment_markers_when_hidden"
+    assert result.summary["visual_profile"] == "experiment_visibility_feedback"
+    assert meta["effective_visual_profile"] == "experiment_visibility_feedback"
+    assert meta["effective_status_panel_visible"] is False
 
 
 def test_no_gui_does_not_preflight_gui_dependencies(
@@ -170,6 +210,31 @@ def test_termination_config_json_is_loaded_and_written(tmp_path: Path) -> None:
     assert result.summary["termination_config_path"] == str(termination_path)
     assert result.summary["max_trial_duration_seconds"] == pytest.approx(123.0)
     assert result.summary["max_detach_count"] == 4
+
+
+def test_invalid_cue_config_exits_before_run_without_summary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cue_path = tmp_path / "bad_cue.json"
+    cue_path.write_text(json.dumps({"unknown_cue_key": True}), encoding="utf-8")
+    out_dir = tmp_path / "out_bad_cue"
+
+    exit_code = runner.main(
+        [
+            "--map-config",
+            str(_write_valid_map(tmp_path / "map_bad_cue.json")),
+            "--out-dir",
+            str(out_dir),
+            "--cue-config",
+            str(cue_path),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "Config error" in captured.err
+    assert not (out_dir / "summary.json").exists()
 
 
 def test_debug_duration_reached_is_not_protective_timeout(tmp_path: Path) -> None:
@@ -706,6 +771,8 @@ def _config(
     duration_seconds: float | None = None,
     termination_config: Any | None = None,
     termination_config_path: Path | None = None,
+    cue_sink: str = "logging",
+    visual_profile: str = "debug_all",
 ) -> LiveIntegratedSessionConfig:
     return LiveIntegratedSessionConfig(
         map_config=map_path or _write_valid_map(tmp_path / "map.json"),
@@ -726,6 +793,8 @@ def _config(
         print_every=print_every,
         gui=gui,
         gui_fps=gui_fps,
+        cue_sink=cue_sink,
+        visual_profile=visual_profile,
         termination_config=termination_config or runner.default_termination_config(),
         termination_config_path=termination_config_path,
         anchor_current_pinch_debug=anchor_current_pinch_debug,

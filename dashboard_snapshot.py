@@ -27,6 +27,7 @@ class DashboardSnapshot:
     block_size: list[float] | None
     contact_state: str
     block_motion_state: str
+    block_visible: bool
     stop_reason: str
     track_state: str
     pinch_state: str
@@ -133,6 +134,7 @@ def build_dashboard_snapshot(
         block_size=_vec_to_list(block_state.size),
         contact_state=contact_state,
         block_motion_state=block_motion_state,
+        block_visible=bool(block_state.visible),
         stop_reason=stop_reason,
         track_state=track_state,
         pinch_state=pinch_state,

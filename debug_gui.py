@@ -11,8 +11,10 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from cue_feedback import LatestCueStore
 from debug_view_model import DebugRuntimeStats, DebugSceneView, snapshot_to_debug_view_model
 from latest_snapshot_store import LatestSnapshotStore
+from visual_profile import DEBUG_ALL
 
 
 INSTALL_GUI_DEPS_MESSAGE = "Missing GUI dependencies. Install with: pip install PySide6 pyqtgraph"
@@ -24,6 +26,7 @@ class GuiDependencyError(RuntimeError):
 
 RuntimeStatsGetter = Callable[[], dict[str, Any]]
 RenderCallback = Callable[[Any, float], None]
+CloseCallback = Callable[[], None]
 
 
 def preflight_gui_dependencies() -> None:
@@ -42,6 +45,12 @@ def run_debug_gui(
     runtime_stats_getter: RuntimeStatsGetter | None = None,
     log_path: str | Path | None = None,
     render_callback: RenderCallback | None = None,
+    cue_store: LatestCueStore | None = None,
+    close_callback: CloseCallback | None = None,
+    visual_profile: str = DEBUG_ALL,
+    status_panel: str = "auto",
+    show_axes: str = "auto",
+    show_grid: str = "auto",
 ) -> int:
     """Run the debug GUI event loop."""
 
@@ -63,6 +72,12 @@ def run_debug_gui(
         runtime_stats_getter=runtime_stats_getter,
         log_path=Path(log_path) if log_path is not None else None,
         render_callback=render_callback,
+        cue_store=cue_store,
+        close_callback=close_callback,
+        visual_profile=visual_profile,
+        status_panel=status_panel,
+        show_axes=show_axes,
+        show_grid=show_grid,
     )
     window.show()
     if owns_app:
@@ -95,6 +110,12 @@ class _DebugGuiWindow:
         runtime_stats_getter: RuntimeStatsGetter | None,
         log_path: Path | None,
         render_callback: RenderCallback | None,
+        cue_store: LatestCueStore | None,
+        close_callback: CloseCallback | None,
+        visual_profile: str,
+        status_panel: str,
+        show_axes: str,
+        show_grid: str,
     ) -> None:
         self.QtCore = QtCore
         self.QtGui = QtGui
@@ -107,6 +128,12 @@ class _DebugGuiWindow:
         self.runtime_stats_getter = runtime_stats_getter
         self.log_path = log_path
         self.render_callback = render_callback
+        self.cue_store = cue_store
+        self.close_callback = close_callback
+        self.visual_profile = visual_profile
+        self.status_panel = status_panel
+        self.show_axes = show_axes
+        self.show_grid = show_grid
         self._last_refresh_time: float | None = None
         self._last_gui_fps: float | None = None
         self._last_log_time = 0.0
@@ -142,6 +169,11 @@ class _DebugGuiWindow:
 
     def _close_event(self, event: Any) -> None:
         self.snapshot_store.mark_gui_closed()
+        if self.close_callback is not None:
+            try:
+                self.close_callback()
+            except Exception:
+                pass
         event.accept()
 
     def _refresh(self) -> None:
@@ -177,9 +209,24 @@ class _DebugGuiWindow:
             receive_fps=_optional_float(runtime_payload.get("receive_fps")),
             warnings=tuple(runtime_payload.get("warnings", ()) or ()),
         )
-        view_model = snapshot_to_debug_view_model(snapshot, scene=self.scene, runtime=runtime)
-        self._draw(view_model)
+        view_model = snapshot_to_debug_view_model(
+            snapshot,
+            scene=self.scene,
+            runtime=runtime,
+            visual_profile=self.visual_profile,
+            status_panel=self.status_panel,
+            show_axes=self.show_axes,
+            show_grid=self.show_grid,
+        )
+        cue_display = self.cue_store.get_active() if self.cue_store is not None else None
+        self._draw(view_model, cue_display=cue_display)
         rendered = time.monotonic()
+        if cue_display is not None and self.cue_store is not None:
+            self.cue_store.mark_rendered(
+                cue_display.cue_id,
+                frame_index=view_model.frame_index,
+                monotonic_ms=rendered * 1000.0,
+            )
         self._safe_render_callback(snapshot, rendered)
         render_lag_ms = (rendered - started) * 1000.0
         self._log(view_model, render_lag_ms)
@@ -192,14 +239,19 @@ class _DebugGuiWindow:
         except Exception:
             return
 
-    def _draw(self, view_model: Any) -> None:
+    def _draw(self, view_model: Any, *, cue_display: Any | None = None) -> None:
         self.plot.clear()
         if view_model.scene is not None:
-            for box in view_model.scene.track_boxes:
-                self._plot_box(box, color=(100, 150, 220), width=2)
-            if view_model.scene.target_region is not None:
+            if view_model.show_track:
+                for box in view_model.scene.track_boxes:
+                    self._plot_box(box, color=(100, 150, 220), width=2)
+            if view_model.show_target and view_model.scene.target_region is not None:
                 self._plot_box(view_model.scene.target_region, color=(80, 190, 120), width=2, style="dash")
-            if view_model.scene.block_initial_center_task and view_model.scene.block_size:
+            if (
+                view_model.show_initial_block
+                and view_model.scene.block_initial_center_task
+                and view_model.scene.block_size
+            ):
                 self._plot_center_box(
                     view_model.scene.block_initial_center_task,
                     view_model.scene.block_size,
@@ -207,9 +259,9 @@ class _DebugGuiWindow:
                     width=1,
                     style="dot",
                 )
-        if view_model.block_center_task and view_model.block_size:
+        if view_model.show_block and view_model.block_center_task and view_model.block_size:
             self._plot_center_box(view_model.block_center_task, view_model.block_size, color=(240, 150, 40), width=3)
-        if view_model.pinch_center_task:
+        if view_model.show_pinch and view_model.pinch_center_task:
             self.plot.plot(
                 [view_model.pinch_center_task[0]],
                 [view_model.pinch_center_task[1]],
@@ -219,7 +271,11 @@ class _DebugGuiWindow:
                 symbolBrush=self.pg.mkBrush(40, 220, 240),
                 symbolPen=self.pg.mkPen(10, 90, 100),
             )
-        if view_model.pinch_center_task and view_model.block_center_task:
+        if (
+            view_model.show_block_pinch_line
+            and view_model.pinch_center_task
+            and view_model.block_center_task
+        ):
             self.plot.plot(
                 [view_model.block_center_task[0], view_model.pinch_center_task[0]],
                 [view_model.block_center_task[1], view_model.pinch_center_task[1]],
@@ -228,7 +284,29 @@ class _DebugGuiWindow:
         view_range = view_model.view_range
         self.plot.setXRange(view_range.x_min, view_range.x_max, padding=0.0)
         self.plot.setYRange(view_range.y_min, view_range.y_max, padding=0.0)
+        self.plot.showAxis("bottom", view_model.axes_visible)
+        self.plot.showAxis("left", view_model.axes_visible)
+        self.plot.showGrid(
+            x=view_model.grid_visible,
+            y=view_model.grid_visible,
+            alpha=0.25 if view_model.grid_visible else 0.0,
+        )
+        self.status_label.setVisible(view_model.status_panel_visible)
         self.status_label.setText("\n".join(view_model.status_lines))
+        if cue_display is not None:
+            cue_text = self.pg.TextItem(
+                text=cue_display.message,
+                color=(255, 245, 210),
+                anchor=(0.5, 0.5),
+            )
+            cue_font = self.QtGui.QFont("Segoe UI", 22)
+            cue_font.setBold(True)
+            cue_text.setFont(cue_font)
+            cue_text.setPos(
+                (view_range.x_min + view_range.x_max) * 0.5,
+                (view_range.y_min + view_range.y_max) * 0.5,
+            )
+            self.plot.addItem(cue_text)
 
     def _plot_box(self, box: Any, *, color: tuple[int, int, int], width: int, style: str = "solid") -> None:
         pen = self._pen(color=color, width=width, style=style)

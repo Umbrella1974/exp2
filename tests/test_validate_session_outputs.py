@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from cue_feedback import CUE_CSV_FIELDS
 from timing_diagnostics import TIMING_CSV_FIELDS
 from validate_session_outputs import validate_session_outputs
 
@@ -110,7 +111,32 @@ def test_validator_detects_obvious_identifier_mismatch(tmp_path: Path) -> None:
     assert any("map_id is inconsistent" in error for error in report["errors"])
 
 
-def _write_valid_live_session(tmp_path: Path, *, gui_enabled: bool = False) -> Path:
+def test_validator_checks_cue_config_and_log_consistency(tmp_path: Path) -> None:
+    session_dir = _write_valid_live_session(tmp_path, cue_aware=True)
+    (session_dir / "cue_log.csv").unlink()
+
+    report = validate_session_outputs(session_dir)
+
+    assert report["status"] == "FAIL"
+    assert any("cue_log.csv is missing" in error for error in report["errors"])
+
+
+def test_validator_accepts_header_only_cue_log_when_count_is_zero(tmp_path: Path) -> None:
+    session_dir = _write_valid_live_session(tmp_path, cue_aware=True, cue_count=0)
+
+    report = validate_session_outputs(session_dir)
+
+    assert report["status"] == "PASS"
+    assert not any("cue_log" in warning for warning in report["warnings"])
+
+
+def _write_valid_live_session(
+    tmp_path: Path,
+    *,
+    gui_enabled: bool = False,
+    cue_aware: bool = False,
+    cue_count: int = 1,
+) -> Path:
     session_dir = tmp_path / "session"
     session_dir.mkdir()
     termination = {
@@ -135,30 +161,65 @@ def _write_valid_live_session(tmp_path: Path, *, gui_enabled: bool = False) -> P
         "gui_enabled": gui_enabled,
         "timing_enabled": True,
     }
+    cue_config = {
+        "enable_contact_cue": True,
+        "enable_contact_exit_cue": True,
+        "enable_slip_cue": True,
+        "enable_blocked_directional_cue": True,
+        "min_cue_interval_ms": 0.0,
+        "repeat_policy": "edge_only",
+        "message_language": "en",
+    }
+    if cue_aware:
+        summary.update(
+            {
+                "cue_enabled": True,
+                "cue_sink": "logging",
+                "cue_mode": "live",
+                "cue_count": cue_count,
+                "cue_type_counts": {"contact_enter": cue_count} if cue_count else {},
+                "effective_cue_config": cue_config,
+            }
+        )
     _write_json(tmp_path / "summary.json", summary)
     _write_json(session_dir / "trial_summary.json", summary)
-    _write_json(
-        session_dir / "session_meta.json",
-        {
-            "mode": "live_integrated_session",
-            "trial_id": "trial_001",
-            "map_id": "map_001",
-            "calibration_id": "cal_001",
-        },
-    )
+    meta = {
+        "mode": "live_integrated_session",
+        "trial_id": "trial_001",
+        "map_id": "map_001",
+        "calibration_id": "cal_001",
+    }
+    if cue_aware:
+        meta.update(
+            {
+                "cue_enabled": True,
+                "cue_sink": "logging",
+                "effective_cue_config": cue_config,
+            }
+        )
+    _write_json(session_dir / "session_meta.json", meta)
     _write_json(session_dir / "calibration.json", {"calibration_id": "cal_001"})
-    _write_json(
-        session_dir / "trial_config.json",
-        {
-            "trial_id": "trial_001",
-            "map_id": "map_001",
-            "calibration_id": "cal_001",
-            "target_region": {"min": [-1.0, -1.0, -1.0], "max": [1.0, 1.0, 1.0]},
-        },
-    )
+    trial_config = {
+        "trial_id": "trial_001",
+        "map_id": "map_001",
+        "calibration_id": "cal_001",
+        "target_region": {"min": [-1.0, -1.0, -1.0], "max": [1.0, 1.0, 1.0]},
+    }
+    if cue_aware:
+        trial_config.update(
+            {
+                "cue_enabled": True,
+                "cue_sink": "logging",
+                "effective_cue_config": cue_config,
+            }
+        )
+    _write_json(session_dir / "trial_config.json", trial_config)
     _write_json(session_dir / "termination_config.json", termination)
     (session_dir / "raw_frames.jsonl").write_text('{"frame": 0}\n', encoding="utf-8")
     _write_timing_csv(session_dir / "timing_diagnostics.csv")
+    if cue_aware:
+        _write_json(session_dir / "cue_config.json", cue_config)
+        _write_cue_csv(session_dir / "cue_log.csv", cue_count)
     return session_dir
 
 
@@ -183,6 +244,32 @@ def _write_timing_csv(path: Path) -> None:
         writer = csv.DictWriter(handle, fieldnames=TIMING_CSV_FIELDS)
         writer.writeheader()
         writer.writerow(row)
+
+
+def _write_cue_csv(path: Path, count: int) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CUE_CSV_FIELDS)
+        writer.writeheader()
+        for index in range(count):
+            row = {field: "" for field in CUE_CSV_FIELDS}
+            row.update(
+                {
+                    "cue_sequence_index": index,
+                    "cue_id": f"trial_001:cue:{index:06d}",
+                    "trial_id": "trial_001",
+                    "cue_type": "contact_enter",
+                    "cue_modality": "logging",
+                    "requested_cue_sink": "logging",
+                    "mode": "live",
+                    "is_live_cue_timing": "true",
+                    "source_state": "INSIDE_BLOCK",
+                    "success": "true",
+                    "display_status": "not_applicable",
+                    "is_hardware_haptic": "false",
+                    "details_json": "{}",
+                }
+            )
+            writer.writerow(row)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

@@ -631,6 +631,12 @@ python analyze_session.py --session-dir data\live_integrated_session\debug_01\se
 --print-every                    默认 30
 --gui                            debug display，在 trial running 阶段打开 GUI
 --gui-fps                        默认 30，GUI 轮询/刷新频率
+--cue-sink                       none / logging / console / gui_text，默认 logging
+--cue-config                     可选，JSON/YAML cue 生成配置
+--visual-profile                 debug_all / experiment_visibility_feedback / experiment_blank
+--status-panel                   auto / show / hide，默认 auto
+--show-axes                      auto / show / hide，默认 auto
+--show-grid                      auto / show / hide，默认 auto
 --termination-config             可选，JSON/YAML 保护性 trial 终止配置
 --anchor-current-pinch-debug     debug only，默认关闭
 --pinch-position-mode            nodes_world / tracker_plus_local，默认 nodes_world
@@ -721,6 +727,62 @@ python run_live_integrated_session.py ^
 
 也支持 `.yaml` / `.yml`，但会 lazy import `PyYAML`；如果没安装，会给出明确的安装提示。最终生效的配置会写入 `out_dir/session/termination_config.json`，并同时进入 `summary.json`、`session_meta.json`、`trial_config.json` 和 `trial_summary.json`。`--duration-seconds` 是 debug 外层运行时长上限，结果是 `trial_outcome=DURATION_REACHED`、`end_reason=duration_reached`；它和保护性 `max_trial_duration_seconds` 的 `trial_outcome=FAILED_TIMEOUT`、`end_reason=trial_timeout` 严格分开。
 
+### Cue / Haptic Abstraction
+
+当前 cue 层只做非硬件提示，不接 ESP32、DRV2605、serial、UDP 或其他真实 haptic hardware。它观察现有 `TrialController` / `BlockController` 输出，不修改 contact、slip、blocked、detach 或 trial outcome 逻辑。
+
+支持的 sink：
+
+```text
+none       不生成 cue command，不写 cue_log.csv
+logging    只记录 cue command，不向受试者显示，默认
+console    worker 线程异步打印一次性文本提示
+gui_text   GUI 中显示居中文本 overlay；GUI 关闭后的新 cue fallback 到 console
+```
+
+`gui_text` 必须和 live `--gui` 一起使用；replay 中不能和 `--headless` 一起使用。GUI Close 仍然只关闭显示层，不停止 trial/session。
+
+第一版 cue 类型：
+
+```text
+contact_enter
+contact_exit
+slip_pinch_insufficient
+slip_track_blocked
+blocked_directional
+```
+
+当 `TRACK_BLOCKED` 同时有 slip 和明确方向时，只生成 `blocked_directional`，避免同一状态产生两个 RT 起点。`primary_blocked_surface` 表示撞到的 task 边界，例如 `X_POS`；`direction` 表示建议修正方向，例如 `X_NEG`。第一版保留 `Z_POS / Z_NEG`，不翻译成 left/right/up/down。
+
+cue config 示例：
+
+```json
+{
+  "enable_contact_cue": true,
+  "enable_contact_exit_cue": true,
+  "enable_slip_cue": true,
+  "enable_blocked_directional_cue": true,
+  "min_cue_interval_ms": 0,
+  "repeat_policy": "edge_only",
+  "message_language": "en"
+}
+```
+
+JSON/YAML 未知字段、非法类型和非 `edge_only` repeat policy 会清晰失败，不会静默回退。最终生效配置始终写入新 live session 的 `session/cue_config.json`，即使 `--cue-sink none`；`cue_sink` 是运行时输出方式，不写进 cue config。
+
+所有非 `none` sink 在 run 结束后写 `session/cue_log.csv`。`cue_count` 表示通过配置与限流、进入 sink 的 command 数量；被配置或 rate limit 抑制的候选只进入 summary 的 suppressed 统计，不作为 RT 起点。`success=true` 只表示 sink 接受 command，不表示受试者看到提示，也不表示任务成功；实际显示状态看 `display_status`、`displayed_monotonic_ms` 和 `not_displayed_reason`。
+
+```text
+created_monotonic_ms     从 frame result 生成 command 的时间
+issued_monotonic_ms      sink 接受 command 的时间
+displayed_monotonic_ms   console 实际打印或 GUI 首次 render 文本的时间
+ack_monotonic_ms         第一版始终为空，没有硬件 acknowledgement
+```
+
+GUI 的 `displayed_monotonic_ms` 表示一次 GUI refresh 已应用文本，受 `gui_fps` 量化影响；它不是物理屏幕扫描时间，也不证明受试者真正看到。当前不在线计算 behavioral RT。后续 RT analyzer 应联合 `cue_log.csv`、逐帧状态、events 和 timing diagnostics 离线计算。
+
+`experiment_visibility_feedback` 中物块消失/重现本身是视觉刺激，但 Stage 1 不把它写入 `cue_log.csv`，也不把它当作 behavioral RT 起点。如果以后需要分析 block visibility visual RT，应新增独立 visual-state render diagnostics，不要混入 cue command log。
+
 如果 calibration quality 出来后你在 `Continue with this calibration? [y/N]` 里选择 no 或直接回车，runner 会重新进入四段 calibration，而不是退出整个流程。只有 calibration 采集失败后，在 `Retry calibration? [y/N]` 里选择 no，才会停止本次 run。
 
 如果一直没有发送端连接，或连接后一直没有有效 tracker，runner 不会无限等待；它会写 `out_dir/summary.json` 后退出。常见停止原因：
@@ -763,6 +825,8 @@ out_dir/session/processed_frames.csv
 out_dir/session/events.csv
 out_dir/session/haptic.csv
 out_dir/session/termination_config.json
+out_dir/session/cue_config.json              新 live session 始终写入
+out_dir/session/cue_log.csv                 仅 cue sink 非 none 时写入
 out_dir/session/trial_summary.json
 out_dir/session/timing_diagnostics.csv      live integrated 默认始终写入
 out_dir/session/gui_diagnostics.csv       仅 --gui 时，优先写入这里
@@ -841,6 +905,7 @@ LatestFrameBuffer
   -> parse_raw_manus_vive_frame()
   -> ManusViveExperimentAdapter
   -> TrialController.update()
+  -> CueRuntime observation
   -> SessionRecorder
   -> DashboardSnapshot callback
 ```
@@ -872,6 +937,23 @@ published_frame_count
 consumed_frame_count
 processed_frame_count
 overwritten_before_consume_count
+cue_enabled
+cue_sink
+cue_mode
+is_live_cue_timing
+cue_log_path
+cue_count
+cue_type_counts
+suppressed_cue_count
+suppressed_cue_type_counts
+effective_cue_config
+requested_visual_profile
+visual_profile
+effective_visual_profile
+status_panel
+effective_status_panel_visible
+show_axes / effective_axes_visible
+show_grid / effective_grid_visible
 trial_outcome
 end_reason
 operator_command
@@ -968,7 +1050,26 @@ fast     不等待，适合测试或快速 smoke
 
 replay 只有传入 `--out-dir` 时才会写 `timing_diagnostics.csv`，并且只写到 replay 输出目录，不修改输入 session。replay timing 行会标记 `mode=replay`、`is_live_latency=false`；parser / adapter / trial update duration 可用于性能比较，但 replay 的等待时间和 GUI latency 不能解释为真实 live latency。
 
-当前 GUI 显示 x-y task view：track boxes、target、block start footprint、当前 block、当前 pinch，以及右侧状态面板。z 方向第一版以数值显示。GUI Close 只关闭显示层，不直接修改 `TrialController` / `BlockController`，也不接 haptic hardware。缺少 `PySide6` / `pyqtgraph` 时，入口会提示安装命令；非 GUI 测试不依赖这两个包。
+replay 默认 `--cue-sink logging`。使用 `--session-dir` 时，cue config 优先级是：显式 `--cue-config`、输入 `session/cue_config.json`、默认配置。只有传 `--out-dir` 时才写 `out_dir/cue_log.csv` 和 `out_dir/cue_config.json`，绝不修改输入 session。replay cue 行和 summary 标记 `cue_mode=replay`、`is_live_cue_timing=false`，只能用于调试 cue 触发与日志结构，不能解释为真实受试者 RT。
+
+当前 GUI 支持：
+
+```text
+debug_all
+  显示 track、target、initial block、当前 block、pinch、block-pinch line、状态面板、坐标轴和网格
+
+experiment_visibility_feedback
+  block_visible=false 时不显示任何 task marker
+  block_visible=true 时显示完整 block geometry + pinch marker
+  不显示 track、target、initial block、block-pinch line；默认隐藏状态面板、坐标轴和网格
+
+experiment_blank
+  不显示 task geometry 或 marker，只保留 cue overlay 或空白画面
+```
+
+旧名称 `experiment_markers_when_hidden` 仍可作为 deprecated alias 使用，内部和落盘的 effective profile 会规范化为 `experiment_visibility_feedback`。实验 profile 使用隐藏的 scene/map bounds 固定视图范围，不会随着 marker 移动自动缩放。第一版 “hand marker” 实际只指 pinch center marker，不新增 wrist/tracker/skeleton marker。
+
+GUI 是 x-y task view，z 方向第一版以数值显示。GUI Close 只关闭显示层，不直接修改 `TrialController` / `BlockController`，也不接真实 haptic hardware。缺少 `PySide6` / `pyqtgraph` 时，入口会提示安装命令；非 GUI 测试不依赖这两个包。
 
 live `--gui` 的线程模型是：Qt GUI event loop 在主线程运行；`LiveTrialRunner.run_until_done()` 在 worker 线程运行；`snapshot_callback` 只做轻量 `LatestSnapshotStore.publish(snapshot)`。如果 GUI 刷新慢，store 只保留最新 snapshot，不排队旧帧，避免显示延迟越积越大。
 
@@ -983,7 +1084,7 @@ summary/session finalize 会等用户关闭 GUI 后继续
 
 live `--gui` 的 runtime stats 第一版显示已有且可靠的字段：snapshot age、GUI fps/render lag、overwritten snapshot count、raw dropped frames、parse errors。`receive_fps` 如果没有可靠来源，显示为 N/A，不硬造。
 
-已知风险：当前 live `--gui` 是 debug display，不是正式实验 lifecycle GUI。在 Windows/Qt 下，`Ctrl+C` 行为可能不如纯 CLI 模式直接；如果 Qt 窗口获得焦点，终端里的 `e/q` 读取也可能不如纯 CLI 稳定。如果需要停止整个 run，仍依赖现有 runner 的 `KeyboardInterrupt` / `request_stop` / `stop_event` 机制。后续正式 GUI 阶段需要单独设计 Stop / Abort / Pause / Resume 和完整生命周期控制。
+已知风险：当前 live `--gui` 是 debug display，不是正式实验 lifecycle GUI。实验员和受试者仍共用一个窗口，experiment profile 只是隐藏调试 geometry，不是真正的双窗口/双屏实验界面。在 Windows/Qt 下，`Ctrl+C` 行为可能不如纯 CLI 模式直接；如果 Qt 窗口获得焦点，终端里的 `e/q` 读取也可能不如纯 CLI 稳定。如果需要停止整个 run，仍依赖现有 runner 的 `KeyboardInterrupt` / `request_stop` / `stop_event` 机制。后续正式 GUI 阶段需要区分 experimenter view / participant view，并单独设计 Stop / Abort / Pause / Resume 和完整生命周期控制。
 
 ## Session 输出校验
 
@@ -999,7 +1100,7 @@ python validate_session_outputs.py --session-dir data\live_integrated_session\de
 python validate_session_outputs.py --session-dir data\live_integrated_session\debug_01\session --summary-json path\to\summary.json
 ```
 
-validator 会检查当前 live integrated 单 trial 的必需 artifact、`trial_outcome`、`end_reason`、effective termination config、末帧 block / pinch / target 诊断，以及 summary / trial summary / termination config / calibration / map / trial id 的一致性。`--gui` 启用但缺少 `gui_diagnostics.csv`，或 live integrated 中 `timing_enabled=true` 但缺少 `timing_diagnostics.csv`，会报告 ERROR。raw 为空、末帧诊断为 null、GUI 行数很少、timing 可选字段为空等情况会报告 WARNING；默认 WARNING 不让校验失败，可用 `--strict` 将 WARNING 视为失败。
+validator 会检查当前 live integrated 单 trial 的必需 artifact、`trial_outcome`、`end_reason`、effective termination config、末帧 block / pinch / target 诊断，以及 summary / trial summary / termination config / calibration / map / trial id 的一致性。新 cue-aware live session 还会检查 `cue_config.json` 一致性、`cue_log.csv` header、行数、type counts、cue_id 唯一性与 trial/mode 一致性；`cue_count=0` 的 header-only cue log 可以直接通过。`--gui` 启用但缺少 `gui_diagnostics.csv`，live integrated 中 `timing_enabled=true` 但缺少 `timing_diagnostics.csv`，或启用 cue 但缺少 `cue_log.csv`，会报告 ERROR。raw 为空、末帧诊断为 null、GUI 行数很少、timing 可选字段为空等情况会报告 WARNING；默认 WARNING 不让校验失败，可用 `--strict` 将 WARNING 视为失败。
 
 ## Timing Diagnostics
 
@@ -1046,7 +1147,7 @@ python analyze_timing.py --session-dir data\live_integrated_session\debug_01\ses
 
 默认输出 `session/timing_analysis_summary.json` 并向终端打印 JSON。已有输出不会被覆盖，除非传 `--overwrite`；也可以用 `--out` 指定其他路径。summary 包含 median / p95 / max 延迟、各 phase transport 统计、published / consumed / processed / overwritten 计数、`max_no_frame_gap_ms` 和 operator command 到 stop 的延迟。
 
-timing collector 在控制 loop 和 GUI render 中只更新线程安全内存，不做逐帧文件 I/O，run 结束后一次写 CSV。代价是进程硬崩溃时 timing log 可能丢失。本阶段只做 system timing diagnostics，不计算 haptic cue 或受试者 behavioral reaction time；这些应在真实 haptic 和行为 marker 定义稳定后单独做离线分析。
+timing collector 在控制 loop 和 GUI render 中只更新线程安全内存，不做逐帧文件 I/O，run 结束后一次写 CSV。代价是进程硬崩溃时 timing log 可能丢失。本阶段只做 system timing diagnostics，并记录模拟 cue command；不在线计算受试者 behavioral reaction time。真实 haptic hardware sink 和 behavioral RT analyzer 仍是后续独立阶段。
 
 ## `analyze_session.py`
 

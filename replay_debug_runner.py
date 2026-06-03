@@ -18,6 +18,8 @@ from calibration_io import (
     calibration_from_dict,
 )
 from config import EngineConfig
+from cue_config import CueConfig, default_cue_config, load_cue_config
+from cue_feedback import CUE_SINK_CHOICES, CueRuntime, CueSinkConfig
 from data_models import Box3D, TrackRegion, Vec3
 from debug_view_model import DebugSceneView, scene_view_from_trial_config
 from latest_frame_buffer import LatestFrameBuffer
@@ -27,6 +29,7 @@ from live_trial_runner import LiveTrialRunner, LiveTrialRunnerConfig
 from raw_frame_source import JsonlRawFrameSource
 from task_coordinate_system import TaskCoordinateSystem
 from timing_diagnostics import TimingDiagnostics
+from visual_profile import resolve_visual_profile
 
 
 SnapshotCallback = Callable[[Any], None]
@@ -51,6 +54,13 @@ class ReplayDebugConfig:
     tracker_index: int = 0
     skeleton_index: int = 0
     no_frame_timeout_seconds: float = 5.0
+    cue_sink: str = "logging"
+    cue_config_path: Path | None = None
+    cue_config: CueConfig | None = None
+    visual_profile: str = "debug_all"
+    status_panel: str = "auto"
+    show_axes: str = "auto"
+    show_grid: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -64,6 +74,8 @@ class ReplayDebugInputs:
     trial_config: dict[str, Any]
     session_meta: dict[str, Any]
     scene: DebugSceneView
+    cue_config: CueConfig
+    cue_config_path: Path | None
 
 
 @dataclass(frozen=True)
@@ -75,6 +87,8 @@ class ReplayDebugResult:
     last_snapshot: Any | None
     snapshot_count: int
     timing_diagnostics: TimingDiagnostics
+    cue_records: tuple[dict[str, Any], ...]
+    cue_runtime: CueRuntime
 
 
 def load_replay_debug_inputs(config: ReplayDebugConfig) -> ReplayDebugInputs:
@@ -85,6 +99,7 @@ def load_replay_debug_inputs(config: ReplayDebugConfig) -> ReplayDebugInputs:
     trial_config = _read_json(trial_config_path, "trial config")
     session_meta = _read_optional_json(session_meta_path) if session_meta_path is not None else {}
     scene = scene_view_from_trial_config(trial_config)
+    cue_config, cue_config_path = _resolve_replay_cue_config(config)
     if not scene.track_boxes:
         raise ValueError("trial_config does not contain usable track geometry for replay.")
     _task_system_from_calibration_payload(calibration_payload)
@@ -99,6 +114,8 @@ def load_replay_debug_inputs(config: ReplayDebugConfig) -> ReplayDebugInputs:
         trial_config=trial_config,
         session_meta=session_meta,
         scene=scene,
+        cue_config=cue_config,
+        cue_config_path=cue_config_path,
     )
 
 
@@ -108,6 +125,7 @@ def run_replay_debug(
     snapshot_store: LatestSnapshotStore | None = None,
     snapshot_callback: SnapshotCallback | None = None,
     timing_diagnostics: TimingDiagnostics | None = None,
+    cue_runtime: CueRuntime | None = None,
 ) -> ReplayDebugResult:
     """Replay raw frames through LiveTrialRunner and publish snapshots."""
 
@@ -118,6 +136,21 @@ def run_replay_debug(
     block_center = _block_center_from_trial_config(inputs.trial_config)
     block_size = _block_size_from_trial_config(inputs.trial_config)
     engine_config = _engine_config_from_trial_config(inputs.trial_config, block_size, inputs.session_meta)
+    trial_id = str(inputs.trial_config.get("trial_id", inputs.session_meta.get("trial_id", "replay_debug")))
+    cue_log_path = (
+        config.out_dir / "cue_log.csv"
+        if config.out_dir is not None and config.cue_sink != "none"
+        else None
+    )
+    cue_runtime = cue_runtime or CueRuntime(
+        trial_id=trial_id,
+        cue_config=inputs.cue_config,
+        sink_config=CueSinkConfig(
+            cue_sink=config.cue_sink,
+            mode="replay",
+            is_live_cue_timing=False,
+        ),
+    )
     timing_diagnostics = timing_diagnostics or TimingDiagnostics(mode="replay", is_live_latency=False)
     latest_buffer = LatestFrameBuffer(
         frame_published_callback=lambda frame, published, overwritten: timing_diagnostics.record_frame_published(
@@ -150,7 +183,7 @@ def run_replay_debug(
         engine_config=engine_config,
         session_recorder=None,
         config=LiveTrialRunnerConfig(
-            trial_id=str(inputs.trial_config.get("trial_id", inputs.session_meta.get("trial_id", "replay_debug"))),
+            trial_id=trial_id,
             max_frames=None,
             no_frame_timeout_seconds=config.no_frame_timeout_seconds,
             timestamp_scale=config.timestamp_scale,
@@ -167,6 +200,8 @@ def run_replay_debug(
         snapshot_callback=on_snapshot,
         source_stats_getter=lambda: {"total_received_frames": replay_state["raw_seen"]},
         timing_diagnostics=timing_diagnostics,
+        cue_runtime=cue_runtime,
+        cue_log_path=str(cue_log_path) if cue_log_path is not None else None,
     )
 
     previous_raw_time: float | None = None
@@ -190,6 +225,7 @@ def run_replay_debug(
         raise ValueError(f"raw_jsonl did not contain any frames: {inputs.raw_jsonl}")
     if runner.stats_snapshot().run_stop_reason == "running":
         runner.request_stop("eof")
+    cue_runtime.end_trial()
     summary = runner.build_summary()
     summary.update(
         {
@@ -203,17 +239,29 @@ def run_replay_debug(
             "replay_speed": config.replay_speed,
             "snapshot_count": replay_state["snapshots"],
             "gui_scene": inputs.scene.to_dict(),
+            "requested_cue_config_path": (
+                str(config.cue_config_path) if config.cue_config_path is not None else None
+            ),
+            **resolve_visual_profile(
+                config.visual_profile,
+                status_panel=config.status_panel,
+                show_axes=config.show_axes,
+                show_grid=config.show_grid,
+            ).to_dict(),
         }
     )
     summary.update(timing_diagnostics.summary())
+    summary.update(cue_runtime.summary(cue_log_path=cue_log_path))
     timing_path: Path | None = None
     if config.out_dir is not None:
         config.out_dir.mkdir(parents=True, exist_ok=True)
         timing_path = timing_diagnostics.write_csv(config.out_dir / "timing_diagnostics.csv")
         summary["timing_diagnostics_path"] = str(timing_path)
-        (config.out_dir / "replay_debug_summary.json").write_text(
-            json.dumps(_json_safe(summary), indent=2, ensure_ascii=False, sort_keys=True),
-            encoding="utf-8",
+        _write_replay_cue_outputs(
+            config.out_dir,
+            cue_runtime=cue_runtime,
+            cue_config=inputs.cue_config,
+            summary=summary,
         )
     else:
         summary["timing_diagnostics_path"] = None
@@ -223,6 +271,20 @@ def run_replay_debug(
         last_snapshot=runner.last_snapshot,
         snapshot_count=replay_state["snapshots"],
         timing_diagnostics=timing_diagnostics,
+        cue_records=cue_runtime.records_snapshot(),
+        cue_runtime=cue_runtime,
+    )
+
+
+def finalize_replay_debug_outputs(result: ReplayDebugResult, out_dir: str | Path) -> None:
+    """Rewrite final replay cue/summary outputs after GUI display has exited."""
+
+    output = Path(out_dir)
+    _write_replay_cue_outputs(
+        output,
+        cue_runtime=result.cue_runtime,
+        cue_config=result.cue_runtime.cue_config,
+        summary=result.summary,
     )
 
 
@@ -234,6 +296,18 @@ def _pinch_position_mode_for_replay(trial_config: dict[str, Any], session_meta: 
     if mode == "live_integrated_session":
         return "nodes_world"
     return "tracker_plus_local"
+
+
+def _resolve_replay_cue_config(config: ReplayDebugConfig) -> tuple[CueConfig, Path | None]:
+    if config.cue_config is not None:
+        return config.cue_config, config.cue_config_path
+    if config.cue_config_path is not None:
+        return load_cue_config(config.cue_config_path), config.cue_config_path
+    if config.session_dir is not None:
+        session_cue_config = Path(config.session_dir) / "cue_config.json"
+        if session_cue_config.exists():
+            return load_cue_config(session_cue_config), session_cue_config
+    return default_cue_config(), None
 
 
 def _resolve_input_paths(config: ReplayDebugConfig) -> tuple[Path, Path, Path, Path | None]:
@@ -280,6 +354,14 @@ def _validate_config(config: ReplayDebugConfig) -> None:
         raise ValueError("replay_fps must be > 0.")
     if config.replay_speed <= 0.0:
         raise ValueError("replay_speed must be > 0.")
+    if config.cue_sink not in CUE_SINK_CHOICES:
+        raise ValueError("cue_sink must be one of: " + ", ".join(CUE_SINK_CHOICES))
+    resolve_visual_profile(
+        config.visual_profile,
+        status_panel=config.status_panel,
+        show_axes=config.show_axes,
+        show_grid=config.show_grid,
+    )
 
 
 def _task_system_from_calibration_payload(payload: dict[str, Any]) -> TaskCoordinateSystem:
@@ -428,6 +510,28 @@ def _read_optional_json(path: Path) -> dict[str, Any]:
         return _read_json(path, "session meta")
     except FileNotFoundError:
         return {}
+
+
+def _write_replay_cue_outputs(
+    out_dir: Path,
+    *,
+    cue_runtime: CueRuntime,
+    cue_config: CueConfig,
+    summary: dict[str, Any],
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cue_log_path = out_dir / "cue_log.csv" if cue_runtime.cue_enabled else None
+    if cue_log_path is not None:
+        cue_runtime.write_log(cue_log_path)
+    summary.update(cue_runtime.summary(cue_log_path=cue_log_path))
+    (out_dir / "cue_config.json").write_text(
+        json.dumps(cue_config.to_dict(), indent=2, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    (out_dir / "replay_debug_summary.json").write_text(
+        json.dumps(_json_safe(summary), indent=2, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def _required_vec3(value: Any, label: str) -> list[float]:

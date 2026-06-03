@@ -24,6 +24,8 @@ from calibration_io import (
 )
 from calibration_live_runner import CalibrationLiveConfig, CalibrationSegmentSpec, run_live_table_calibration
 from config import EngineConfig
+from cue_config import CueConfig, default_cue_config, load_cue_config
+from cue_feedback import CUE_SINK_CHOICES, CueRuntime, CueSinkConfig
 from dashboard_snapshot import build_compact_status_line
 from device_frame_models import DeviceAdapterConfig
 from latest_frame_buffer import LatestFrameBuffer, LatestFramePump
@@ -44,6 +46,11 @@ from session_recorder import SessionRecorder
 from termination_config import TerminationConfig, default_termination_config, load_termination_config
 from timing_diagnostics import TimingDiagnostics
 from trial_controller import ExperimentInputSample
+from visual_profile import (
+    DISPLAY_CONTROL_CHOICES,
+    VISUAL_PROFILE_CHOICES,
+    resolve_visual_profile,
+)
 
 
 InputFn = Callable[[str], str]
@@ -88,6 +95,13 @@ class LiveIntegratedSessionConfig:
     print_every: int = 30
     gui: bool = False
     gui_fps: float = 30.0
+    cue_sink: str = "logging"
+    cue_config: CueConfig = field(default_factory=default_cue_config)
+    cue_config_path: Path | None = None
+    visual_profile: str = "debug_all"
+    status_panel: str = "auto"
+    show_axes: str = "auto"
+    show_grid: str = "auto"
     termination_config: TerminationConfig = field(default_factory=default_termination_config)
     termination_config_path: Path | None = None
     anchor_current_pinch_debug: bool = False
@@ -124,6 +138,16 @@ def run_live_integrated_session(
     """Run a complete live calibration + trial session."""
 
     input_fn = input_fn or input
+    visual_settings = resolve_visual_profile(
+        config.visual_profile,
+        status_panel=config.status_panel,
+        show_axes=config.show_axes,
+        show_grid=config.show_grid,
+    )
+    if config.cue_sink not in CUE_SINK_CHOICES:
+        raise ValueError("cue_sink must be one of: " + ", ".join(CUE_SINK_CHOICES))
+    if config.cue_sink == "gui_text" and not config.gui:
+        raise ValueError("--cue-sink gui_text requires --gui.")
     if config.gui:
         _preflight_live_gui_dependencies()
     out_dir = Path(config.out_dir)
@@ -191,6 +215,8 @@ def run_live_integrated_session(
     gui_snapshot_store: Any | None = None
     gui_diagnostics_path: Path | None = None
     gui_requested_stop = False
+    cue_runtime: CueRuntime | None = None
+    cue_log_path: Path | None = None
 
     def set_status(
         new_phase: LiveSessionPhase,
@@ -329,6 +355,17 @@ def run_live_integrated_session(
             trial_config=trial_config,
         )
         _write_json(session_dir / "termination_config.json", config.termination_config.to_dict())
+        _write_json(session_dir / "cue_config.json", config.cue_config.to_dict())
+        cue_log_path = session_dir / "cue_log.csv"
+        cue_runtime = CueRuntime(
+            trial_id=config.trial_id,
+            cue_config=config.cue_config,
+            sink_config=CueSinkConfig(
+                cue_sink=config.cue_sink,
+                mode="live",
+                is_live_cue_timing=True,
+            ),
+        )
         set_status(LiveSessionPhase.READY_FOR_TRIAL, "Press Enter to start trial.", map_id=map_config.map_id)
         _prompt(input_fn, "Press Enter to start trial...")
         set_status(LiveSessionPhase.TRIAL_RUNNING, "Trial running.", map_id=map_config.map_id)
@@ -369,6 +406,8 @@ def run_live_integrated_session(
             source_stats_getter=lambda: pump.stats_snapshot(),
             operator_command_checker=_read_operator_command,
             timing_diagnostics=timing_diagnostics,
+            cue_runtime=cue_runtime,
+            cue_log_path=str(cue_log_path),
         )
         if gui_snapshot_store is not None:
             live_trial_result = _run_live_trial_with_gui(
@@ -383,6 +422,8 @@ def run_live_integrated_session(
                     pump=pump,
                 ),
                 timing_diagnostics=timing_diagnostics,
+                cue_runtime=cue_runtime,
+                visual_settings=visual_settings,
             )
         else:
             live_trial_result = live_trial_runner.run_until_done()
@@ -432,6 +473,14 @@ def run_live_integrated_session(
         pump.join(timeout=1.0)
         raw_handle.close()
         timing_path_written: Path | None = None
+        cue_path_written: Path | None = None
+        if cue_runtime is not None:
+            cue_runtime.end_session()
+            if cue_log_path is not None:
+                try:
+                    cue_path_written = cue_runtime.write_log(cue_log_path)
+                except Exception as exc:
+                    errors.append(f"cue log write failed: {exc}")
         if session_recorder is not None:
             try:
                 timing_path_written = timing_diagnostics.write_csv(timing_diagnostics_path)
@@ -473,8 +522,12 @@ def run_live_integrated_session(
         summary["timing_diagnostics_path"] = (
             str(timing_path_written) if timing_path_written is not None else None
         )
+        if cue_runtime is not None:
+            summary.update(cue_runtime.summary(cue_log_path=cue_path_written))
         if trial_runner_summary:
             _merge_live_trial_runner_summary(summary, trial_runner_summary)
+            if cue_runtime is not None:
+                summary.update(cue_runtime.summary(cue_log_path=cue_path_written))
         if session_recorder is not None:
             try:
                 summary["session_finalized"] = True
@@ -871,10 +924,28 @@ def _trial_config_payload(
             "timing_mode": "live",
             "timing_is_live_latency": True,
             "haptic_hardware_enabled": False,
+            "cue_sink": config.cue_sink,
+            "cue_enabled": config.cue_sink != "none",
+            "cue_mode": "live",
+            "is_live_cue_timing": True,
+            "effective_cue_config": config.cue_config.to_dict(),
+            "requested_cue_config_path": (
+                str(config.cue_config_path) if config.cue_config_path is not None else None
+            ),
+            **_visual_settings_payload(config),
             "warnings": list(warnings) + list(map_warnings),
         }
     )
     return payload
+
+
+def _visual_settings_payload(config: LiveIntegratedSessionConfig) -> dict[str, Any]:
+    return resolve_visual_profile(
+        config.visual_profile,
+        status_panel=config.status_panel,
+        show_axes=config.show_axes,
+        show_grid=config.show_grid,
+    ).to_dict()
 
 
 def _session_meta(
@@ -909,6 +980,15 @@ def _session_meta(
         "timing_enabled": True,
         "timing_mode": "live",
         "timing_is_live_latency": True,
+        "cue_sink": config.cue_sink,
+        "cue_enabled": config.cue_sink != "none",
+        "cue_mode": "live",
+        "is_live_cue_timing": True,
+        "effective_cue_config": config.cue_config.to_dict(),
+        "requested_cue_config_path": (
+            str(config.cue_config_path) if config.cue_config_path is not None else None
+        ),
+        **_visual_settings_payload(config),
         "warnings": list(warnings),
     }
     if map_anchor["mode"] == "current_pinch_debug":
@@ -991,6 +1071,22 @@ def _build_summary(
         "valid_tracker_timeout_seconds": config.valid_tracker_timeout_seconds,
         "valid_pinch_timeout_seconds": config.valid_pinch_timeout_seconds,
         "no_frame_timeout_seconds": config.no_frame_timeout_seconds,
+        "cue_enabled": config.cue_sink != "none",
+        "cue_sink": config.cue_sink,
+        "cue_mode": "live",
+        "is_live_cue_timing": True,
+        "cue_log_path": None,
+        "cue_count": 0,
+        "cue_type_counts": {},
+        "suppressed_cue_count": 0,
+        "suppressed_cue_type_counts": {},
+        "suppressed_cue_reason_counts": {},
+        "effective_cue_config": config.cue_config.to_dict(),
+        "requested_cue_config_path": (
+            str(config.cue_config_path) if config.cue_config_path is not None else None
+        ),
+        "cue_warnings": [],
+        **_visual_settings_payload(config),
         "total_received_frames": int(total_received or 0),
         "total_processed_frames": int(total_processed_frames),
         "source_stop_reason": source_stop_reason,
@@ -1130,6 +1226,8 @@ def _run_live_trial_with_gui(
     log_path: Path | None,
     runtime_stats_getter: Callable[[], dict[str, Any]],
     timing_diagnostics: TimingDiagnostics,
+    cue_runtime: CueRuntime,
+    visual_settings: Any,
 ) -> Any:
     result_holder: dict[str, Any] = {}
 
@@ -1149,6 +1247,9 @@ def _run_live_trial_with_gui(
             log_path=log_path,
             runtime_stats_getter=runtime_stats_getter,
             render_callback=timing_diagnostics.record_gui_render,
+            cue_store=cue_runtime.gui_cue_store,
+            close_callback=cue_runtime.handle_gui_closed,
+            visual_settings=visual_settings,
         )
     except KeyboardInterrupt:
         snapshot_store.mark_gui_closed()
@@ -1179,6 +1280,9 @@ def _run_live_debug_gui(
     log_path: Path | None,
     runtime_stats_getter: Callable[[], dict[str, Any]],
     render_callback: Callable[[Any, float], None] | None = None,
+    cue_store: Any | None = None,
+    close_callback: Callable[[], None] | None = None,
+    visual_settings: Any | None = None,
 ) -> int:
     try:
         from debug_gui import GuiDependencyError, run_debug_gui
@@ -1187,6 +1291,7 @@ def _run_live_debug_gui(
         raise LiveGuiDependencyError("Missing GUI dependencies. Install with: pip install PySide6 pyqtgraph") from exc
 
     try:
+        visual_settings = visual_settings or resolve_visual_profile()
         return run_debug_gui(
             snapshot_store=snapshot_store,
             scene=scene_view_from_trial_config(trial_config),
@@ -1196,6 +1301,12 @@ def _run_live_debug_gui(
             runtime_stats_getter=runtime_stats_getter,
             log_path=log_path,
             render_callback=render_callback,
+            cue_store=cue_store,
+            close_callback=close_callback,
+            visual_profile=visual_settings.visual_profile,
+            status_panel=visual_settings.status_panel,
+            show_axes=visual_settings.show_axes,
+            show_grid=visual_settings.show_grid,
         )
     except GuiDependencyError as exc:
         raise LiveGuiDependencyError(str(exc)) from exc
@@ -1358,6 +1469,18 @@ def _merge_live_trial_runner_summary(
         "first_target_entry_frame_index",
         "last_snapshot_time",
         "last_frame_index",
+        "cue_enabled",
+        "cue_sink",
+        "cue_mode",
+        "is_live_cue_timing",
+        "cue_log_path",
+        "cue_count",
+        "cue_type_counts",
+        "suppressed_cue_count",
+        "suppressed_cue_type_counts",
+        "suppressed_cue_reason_counts",
+        "effective_cue_config",
+        "cue_warnings",
     )
     for key in legacy_keys:
         if key in runner_summary:
@@ -1493,6 +1616,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--print-every", default=30, type=int)
     parser.add_argument("--gui", action="store_true", help="Open the debug display during trial running.")
     parser.add_argument("--gui-fps", default=30.0, type=float)
+    parser.add_argument("--cue-sink", choices=CUE_SINK_CHOICES, default="logging")
+    parser.add_argument("--cue-config", default=None, help="JSON/YAML cue generation config.")
+    parser.add_argument("--visual-profile", choices=VISUAL_PROFILE_CHOICES, default="debug_all")
+    parser.add_argument("--status-panel", choices=DISPLAY_CONTROL_CHOICES, default="auto")
+    parser.add_argument("--show-axes", choices=DISPLAY_CONTROL_CHOICES, default="auto")
+    parser.add_argument("--show-grid", choices=DISPLAY_CONTROL_CHOICES, default="auto")
     parser.add_argument("--termination-config", default=None, help="JSON/YAML protective termination config.")
     parser.add_argument("--anchor-current-pinch-debug", action="store_true")
     parser.add_argument("--anchor-timeout-seconds", default=10.0, type=float)
@@ -1547,6 +1676,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
     termination_path = Path(args.termination_config) if args.termination_config is not None else None
     termination = load_termination_config(termination_path)
+    cue_config_path = Path(args.cue_config) if args.cue_config is not None else None
+    cue_config = load_cue_config(cue_config_path)
+    if args.cue_sink == "gui_text" and not args.gui:
+        raise ValueError("--cue-sink gui_text requires --gui.")
+    resolve_visual_profile(
+        args.visual_profile,
+        status_panel=args.status_panel,
+        show_axes=args.show_axes,
+        show_grid=args.show_grid,
+    )
     return LiveIntegratedSessionConfig(
         map_config=Path(args.map_config),
         host=args.host,
@@ -1579,6 +1718,13 @@ def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
         print_every=args.print_every,
         gui=args.gui,
         gui_fps=args.gui_fps,
+        cue_sink=args.cue_sink,
+        cue_config=cue_config,
+        cue_config_path=cue_config_path,
+        visual_profile=args.visual_profile,
+        status_panel=args.status_panel,
+        show_axes=args.show_axes,
+        show_grid=args.show_grid,
         termination_config=termination,
         termination_config_path=termination_path,
         anchor_current_pinch_debug=args.anchor_current_pinch_debug,

@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 from block_controller import BlockController
 from config import EngineConfig
+from cue_feedback import CueRuntime
 from dashboard_snapshot import DashboardSnapshot, build_dashboard_snapshot
 from data_models import Vec3
 from device_frame_models import DeviceAdapterConfig
@@ -118,6 +119,8 @@ class LiveTrialRunner:
         user_quit_checker: UserQuitChecker | None = None,
         operator_command_checker: OperatorCommandChecker | None = None,
         timing_diagnostics: TimingDiagnostics | None = None,
+        cue_runtime: CueRuntime | None = None,
+        cue_log_path: str | None = None,
     ) -> None:
         if config.control_rate_hz <= 0.0:
             raise ValueError("control_rate_hz must be > 0.")
@@ -148,6 +151,8 @@ class LiveTrialRunner:
         self.user_quit_checker = user_quit_checker
         self.operator_command_checker = operator_command_checker
         self.timing_diagnostics = timing_diagnostics
+        self.cue_runtime = cue_runtime
+        self.cue_log_path = cue_log_path
 
         self.adapter_config = DeviceAdapterConfig(
             skeleton_index=config.skeleton_index,
@@ -254,6 +259,8 @@ class LiveTrialRunner:
             self._operator_command = operator_command
             self._operator_command_time = self._last_sample_time
         self._set_outcome_for_stop(reason, trial_outcome=trial_outcome, end_reason=end_reason)
+        if self.cue_runtime is not None:
+            self.cue_runtime.end_trial()
 
     def step_once(self) -> DashboardSnapshot | None:
         """Process the latest available frame once.
@@ -281,6 +288,8 @@ class LiveTrialRunner:
         if device_frame is not None and self.session_recorder is not None:
             self.session_recorder.record_device_frame(live_frame.frame_index, device_frame)
         if not processed["parse_ok"] or not processed["adapter_ok"] or processed["sample"] is None:
+            if self.cue_runtime is not None:
+                self.cue_runtime.handle_input_error("invalid_before_render")
             return None
 
         sample = processed["sample"]
@@ -323,6 +332,24 @@ class LiveTrialRunner:
         self._last_trial_result = result
         self._update_target_entry(snapshot)
         self._update_snapshot_stats(snapshot)
+        terminal_state = result.trial_state in {
+            TrialState.ENDED_BY_SUBJECT,
+            TrialState.FAILED_TIMEOUT,
+            TrialState.FAILED_TOO_MANY_DETACHES,
+        }
+        reaches_max_frames = (
+            self.config.max_frames is not None
+            and self._total_processed_frames >= self.config.max_frames
+        )
+        if self.cue_runtime is not None:
+            self.cue_runtime.process_frame(
+                frame_index=live_frame.frame_index,
+                source_frame_id=getattr(processed["device_frame"], "source_frame_id", None),
+                sample=sample,
+                trial_result=result,
+                snapshot=snapshot,
+                terminal_frame=terminal_state or reaches_max_frames,
+            )
         self._record_frame(live_frame, processed, sample, result, snapshot)
         if self.timing_diagnostics is not None:
             self.timing_diagnostics.record_snapshot_published(
@@ -331,11 +358,7 @@ class LiveTrialRunner:
             )
         self._emit_callbacks(snapshot)
 
-        if result.trial_state in {
-            TrialState.ENDED_BY_SUBJECT,
-            TrialState.FAILED_TIMEOUT,
-            TrialState.FAILED_TOO_MANY_DETACHES,
-        }:
+        if terminal_state:
             self.request_stop(
                 result.trial_state.name.lower(),
                 trial_outcome=_trial_state_outcome(result.trial_state),
@@ -407,6 +430,8 @@ class LiveTrialRunner:
         if self._run_stop_reason == "running":
             self._run_stop_reason = "completed"
         self._set_outcome_for_stop(self._run_stop_reason)
+        if self.cue_runtime is not None:
+            self.cue_runtime.end_trial()
         summary = self.build_summary()
         return LiveTrialRunnerResult(
             stats=self.stats_snapshot(),
@@ -436,6 +461,11 @@ class LiveTrialRunner:
                 "warnings": list(self.warnings),
             }
         )
+        if self.cue_runtime is not None:
+            payload.update(self.cue_runtime.summary(cue_log_path=self.cue_log_path))
+            for warning in self.cue_runtime.warnings:
+                if warning not in payload["warnings"]:
+                    payload["warnings"].append(warning)
         return payload
 
     def stats_snapshot(self) -> LiveTrialRunnerStats:

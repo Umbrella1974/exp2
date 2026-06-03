@@ -105,10 +105,72 @@ def test_calculate_debug_view_range_includes_map_block_and_pinch() -> None:
     assert view_range.y_max > 1.0
 
 
+def test_experiment_visibility_feedback_shows_only_visible_block_and_pinch() -> None:
+    scene = scene_view_from_trial_config(
+        {
+            "block_initial_center_task": [0.0, 0.0, 0.0],
+            "block_size": [0.2, 0.2, 0.2],
+            "track_boxes": [{"id": "track", "min": [-0.5, -0.5, -0.1], "max": [0.5, 0.5, 0.1]}],
+            "target_region": {"id": "target", "min": [0.3, -0.1, -0.1], "max": [0.5, 0.1, 0.1]},
+        }
+    )
+
+    visible = snapshot_to_debug_view_model(
+        _snapshot(block_visible=True),
+        scene=scene,
+        visual_profile="experiment_visibility_feedback",
+    )
+    hidden = snapshot_to_debug_view_model(
+        _snapshot(block_visible=False),
+        scene=scene,
+        visual_profile="experiment_markers_when_hidden",
+    )
+
+    assert visible.visual_profile == "experiment_visibility_feedback"
+    assert visible.show_block is True
+    assert visible.show_pinch is True
+    assert visible.show_track is False
+    assert visible.show_target is False
+    assert visible.show_block_pinch_line is False
+    assert visible.status_panel_visible is False
+    assert visible.axes_visible is False
+    assert hidden.visual_profile == "experiment_visibility_feedback"
+    assert hidden.show_block is False
+    assert hidden.show_pinch is False
+    assert hidden.show_initial_block is False
+
+
+def test_experiment_profiles_use_scene_only_fixed_view_range() -> None:
+    scene = scene_view_from_trial_config(
+        {
+            "block_initial_center_task": [0.0, 0.0, 0.0],
+            "block_size": [0.2, 0.2, 0.2],
+            "track_boxes": [{"id": "track", "min": [-0.5, -0.5, -0.1], "max": [0.5, 0.5, 0.1]}],
+        }
+    )
+
+    near = snapshot_to_debug_view_model(
+        _snapshot(pinch_center_task=[0.0, 0.0, 0.0]),
+        scene=scene,
+        visual_profile="experiment_blank",
+    )
+    far = snapshot_to_debug_view_model(
+        _snapshot(pinch_center_task=[100.0, 100.0, 0.0]),
+        scene=scene,
+        visual_profile="experiment_blank",
+    )
+
+    assert near.view_range == far.view_range
+    assert far.show_block is False
+    assert far.show_pinch is False
+    assert far.show_track is False
+
+
 def _snapshot(
     *,
     pinch_center_task: list[float] | None = None,
     block_center_task: list[float] | None = None,
+    block_visible: bool = True,
 ) -> DashboardSnapshot:
     return DashboardSnapshot(
         frame_index=7,
@@ -122,6 +184,7 @@ def _snapshot(
         block_size=[0.2, 0.2, 0.2],
         contact_state="INSIDE_BLOCK",
         block_motion_state="GRABBED_MOVING",
+        block_visible=block_visible,
         stop_reason="NONE",
         track_state="INSIDE_TRACK",
         pinch_state="PINCH_VALID",

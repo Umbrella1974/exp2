@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from cue_feedback import CUE_CSV_FIELDS
+
 
 FINAL_DIAGNOSTIC_FIELDS = (
     "block_center_task_position_at_end",
@@ -126,6 +128,17 @@ def validate_session_outputs(
     _validate_timing_artifact(
         session_path,
         mode,
+        summary,
+        trial_summary,
+        errors,
+        warnings,
+        checked_files,
+    )
+    _validate_cue_artifacts(
+        session_path,
+        mode,
+        meta,
+        trial_config,
         summary,
         trial_summary,
         errors,
@@ -388,6 +401,157 @@ def _validate_timing_artifact(
             "timing_diagnostics.csv has empty optional timing fields: "
             + ", ".join(partially_empty)
         )
+
+
+def _validate_cue_artifacts(
+    session_dir: Path,
+    mode: str | None,
+    meta: dict[str, Any] | None,
+    trial_config: dict[str, Any] | None,
+    summary: dict[str, Any] | None,
+    trial_summary: dict[str, Any] | None,
+    errors: list[str],
+    warnings: list[str],
+    checked_files: dict[str, str],
+) -> None:
+    if mode != "live_integrated_session":
+        return
+    payloads = (
+        ("session_meta.json", meta),
+        ("trial_config.json", trial_config),
+        ("summary.json", summary),
+        ("trial_summary.json", trial_summary),
+    )
+    cue_aware = any(
+        isinstance(payload, dict)
+        and (
+            "effective_cue_config" in payload
+            or "cue_sink" in payload
+            or "cue_enabled" in payload
+        )
+        for _, payload in payloads
+    )
+    if not cue_aware:
+        return
+
+    cue_config_path = session_dir / "cue_config.json"
+    checked_files["cue_config.json"] = str(cue_config_path)
+    cue_config = _read_json_object(
+        cue_config_path,
+        "cue_config.json",
+        errors,
+        checked_files,
+    )
+    if cue_config is None and not cue_config_path.exists():
+        errors.append(f"cue-aware live session is missing cue_config.json: {cue_config_path}")
+
+    for label, payload in payloads:
+        if payload is None:
+            continue
+        effective = payload.get("effective_cue_config")
+        if not isinstance(effective, dict):
+            errors.append(f"{label}.effective_cue_config must be an object for cue-aware sessions.")
+        elif cue_config is not None and effective != cue_config:
+            errors.append(f"cue_config.json disagrees with {label}.effective_cue_config.")
+    if summary is not None and trial_summary is not None:
+        for field in ("cue_sink", "cue_enabled", "cue_mode", "cue_count", "cue_type_counts"):
+            left = summary.get(field)
+            right = trial_summary.get(field)
+            if left not in (None, "") and right not in (None, "") and left != right:
+                errors.append(f"summary.json and trial_summary.json disagree on {field}.")
+
+    cue_sink = _first_nonempty(
+        _dict_value(summary, "cue_sink"),
+        _dict_value(trial_summary, "cue_sink"),
+        _dict_value(meta, "cue_sink"),
+        _dict_value(trial_config, "cue_sink"),
+    )
+    cue_enabled = _any_true(
+        _dict_value(summary, "cue_enabled"),
+        _dict_value(trial_summary, "cue_enabled"),
+        _dict_value(meta, "cue_enabled"),
+        _dict_value(trial_config, "cue_enabled"),
+    )
+    if cue_sink == "none" and cue_enabled:
+        errors.append("cue_sink=none is inconsistent with cue_enabled=true.")
+    if cue_sink not in (None, "", "none") and not cue_enabled:
+        errors.append(f"cue_sink={cue_sink!r} is inconsistent with cue_enabled=false.")
+
+    if not cue_enabled and cue_sink in (None, "", "none"):
+        return
+
+    cue_log_path = session_dir / "cue_log.csv"
+    checked_files["cue_log.csv"] = str(cue_log_path)
+    if not cue_log_path.exists():
+        errors.append(f"cue is enabled but cue_log.csv is missing: {cue_log_path}")
+        return
+    try:
+        with cue_log_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames or []
+            rows = list(reader)
+    except (OSError, csv.Error) as exc:
+        errors.append(f"cue_log.csv could not be parsed: {exc}")
+        return
+
+    missing_fields = [field for field in CUE_CSV_FIELDS if field not in fieldnames]
+    if missing_fields:
+        errors.append("cue_log.csv is missing required fields: " + ", ".join(missing_fields))
+
+    expected_count = _first_nonempty(
+        _dict_value(summary, "cue_count"),
+        _dict_value(trial_summary, "cue_count"),
+    )
+    if expected_count not in (None, ""):
+        try:
+            count_value = int(expected_count)
+        except (TypeError, ValueError):
+            errors.append("cue_count must be an integer.")
+        else:
+            if count_value != len(rows):
+                errors.append(f"cue_count does not match cue_log.csv rows: {count_value} != {len(rows)}")
+
+    actual_type_counts: dict[str, int] = {}
+    cue_ids: list[str] = []
+    expected_trial_id = _first_nonempty(
+        _dict_value(summary, "trial_id"),
+        _dict_value(trial_summary, "trial_id"),
+        _dict_value(meta, "trial_id"),
+    )
+    for row in rows:
+        cue_type = str(row.get("cue_type", ""))
+        actual_type_counts[cue_type] = actual_type_counts.get(cue_type, 0) + 1
+        cue_id = str(row.get("cue_id", ""))
+        cue_ids.append(cue_id)
+        if not cue_id:
+            errors.append("cue_log.csv contains an empty cue_id.")
+        if row.get("mode") not in ("live", None, ""):
+            errors.append(f"cue_log.csv contains non-live cue mode: {row.get('mode')!r}")
+        if row.get("is_live_cue_timing") not in ("true", "True", True):
+            errors.append("cue_log.csv live cue rows must set is_live_cue_timing=true.")
+        if cue_sink not in (None, "") and row.get("requested_cue_sink") != str(cue_sink):
+            errors.append("cue_log.csv requested_cue_sink is inconsistent with summary cue_sink.")
+        if expected_trial_id not in (None, "") and str(row.get("trial_id", "")) != str(expected_trial_id):
+            errors.append("cue_log.csv trial_id is inconsistent with session trial_id.")
+            break
+    if len(cue_ids) != len(set(cue_ids)):
+        errors.append("cue_log.csv cue_id values must be unique.")
+
+    expected_type_counts = _first_nonempty(
+        _dict_value(summary, "cue_type_counts"),
+        _dict_value(trial_summary, "cue_type_counts"),
+    )
+    if isinstance(expected_type_counts, dict):
+        try:
+            normalized = {str(key): int(value) for key, value in expected_type_counts.items()}
+        except (TypeError, ValueError):
+            errors.append("cue_type_counts values must be integers.")
+        else:
+            if normalized != actual_type_counts:
+                errors.append(
+                    "cue_type_counts does not match cue_log.csv: "
+                    f"{normalized!r} != {actual_type_counts!r}"
+                )
 
 
 def _csv_data_row_count(path: Path, label: str, errors: list[str]) -> int | None:

@@ -10,6 +10,13 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from visual_profile import (
+    DEBUG_ALL,
+    EXPERIMENT_BLANK,
+    EXPERIMENT_VISIBILITY_FEEDBACK,
+    resolve_visual_profile,
+)
+
 
 @dataclass(frozen=True)
 class DebugBox2D:
@@ -96,6 +103,7 @@ class DebugViewModel:
     pinch_center_task: list[float] | None
     block_center_task: list[float] | None
     block_size: list[float] | None
+    block_visible: bool
     delta_task: list[float] | None
     distance_to_block_center: float | None
     main_state_label: str
@@ -107,6 +115,16 @@ class DebugViewModel:
     scene: DebugSceneView | None
     view_range: DebugViewRange
     status_lines: tuple[str, ...]
+    visual_profile: str
+    show_track: bool
+    show_target: bool
+    show_initial_block: bool
+    show_block: bool
+    show_pinch: bool
+    show_block_pinch_line: bool
+    status_panel_visible: bool
+    axes_visible: bool
+    grid_visible: bool
     runtime: DebugRuntimeStats = field(default_factory=DebugRuntimeStats)
 
     def to_dict(self) -> dict[str, Any]:
@@ -157,20 +175,33 @@ def snapshot_to_debug_view_model(
     *,
     scene: DebugSceneView | None = None,
     runtime: DebugRuntimeStats | None = None,
+    visual_profile: str = DEBUG_ALL,
+    status_panel: str = "auto",
+    show_axes: str = "auto",
+    show_grid: str = "auto",
 ) -> DebugViewModel:
     """Convert a DashboardSnapshot-like object into a debug view model."""
 
     runtime = runtime or DebugRuntimeStats()
+    visual = resolve_visual_profile(
+        visual_profile,
+        status_panel=status_panel,
+        show_axes=show_axes,
+        show_grid=show_grid,
+    )
     pinch = _optional_vec3(getattr(snapshot, "pinch_center_task", None))
     block = _optional_vec3(getattr(snapshot, "block_center_task", None))
     block_size = _block_size_from_payload(getattr(snapshot, "block_size", None))
+    block_visible = bool(getattr(snapshot, "block_visible", True))
     delta = _delta(pinch, block)
     distance = _norm(delta)
+    render_policy = _render_policy(visual.visual_profile, block_visible=block_visible)
     view_range = calculate_debug_view_range(
         scene=scene,
         pinch_center_task=pinch,
         block_center_task=block,
         block_size=block_size,
+        include_dynamic=visual.visual_profile == DEBUG_ALL,
     )
     status_lines = build_status_lines(
         snapshot,
@@ -191,6 +222,7 @@ def snapshot_to_debug_view_model(
         pinch_center_task=pinch,
         block_center_task=block,
         block_size=block_size,
+        block_visible=block_visible,
         delta_task=delta,
         distance_to_block_center=distance,
         main_state_label=str(getattr(snapshot, "main_state_label", "")),
@@ -202,6 +234,16 @@ def snapshot_to_debug_view_model(
         scene=scene,
         view_range=view_range,
         status_lines=status_lines,
+        visual_profile=visual.visual_profile,
+        show_track=render_policy["show_track"],
+        show_target=render_policy["show_target"],
+        show_initial_block=render_policy["show_initial_block"],
+        show_block=render_policy["show_block"],
+        show_pinch=render_policy["show_pinch"],
+        show_block_pinch_line=render_policy["show_block_pinch_line"],
+        status_panel_visible=visual.effective_status_panel_visible,
+        axes_visible=visual.effective_axes_visible,
+        grid_visible=visual.effective_grid_visible,
         runtime=runtime,
     )
 
@@ -214,6 +256,7 @@ def calculate_debug_view_range(
     block_size: list[float] | None = None,
     min_span: float = 0.5,
     padding_ratio: float = 0.15,
+    include_dynamic: bool = True,
 ) -> DebugViewRange:
     """Return an x-y range that keeps map, block, and pinch visible."""
 
@@ -228,8 +271,9 @@ def calculate_debug_view_range(
             ys.extend([scene.target_region.min_y, scene.target_region.max_y])
         _extend_point(xs, ys, scene.block_initial_center_task, scene.block_size)
 
-    _extend_point(xs, ys, pinch_center_task, None)
-    _extend_point(xs, ys, block_center_task, block_size)
+    if include_dynamic:
+        _extend_point(xs, ys, pinch_center_task, None)
+        _extend_point(xs, ys, block_center_task, block_size)
 
     if not xs or not ys:
         return DebugViewRange(-0.5, 0.5, -0.5, 0.5)
@@ -271,6 +315,7 @@ def build_status_lines(
         f"pinch_distance: {_format_optional_float(getattr(snapshot, 'pinch_distance', None), 'm')}",
         f"pinch_task: {_format_vec(getattr(snapshot, 'pinch_center_task', None))}",
         f"block_task: {_format_vec(getattr(snapshot, 'block_center_task', None))}",
+        f"block_visible: {bool(getattr(snapshot, 'block_visible', True))}",
         f"delta_task: {_format_vec(delta_task)}",
         f"distance_to_block: {_format_optional_float(distance_to_block_center, 'm')}",
         f"contact: {getattr(snapshot, 'contact_label', '')}",
@@ -296,6 +341,37 @@ def build_status_lines(
     if runtime.receive_fps is not None:
         lines.append(f"receive_fps: {_format_optional_float(runtime.receive_fps, 'Hz')}")
     return tuple(lines)
+
+
+def _render_policy(visual_profile: str, *, block_visible: bool) -> dict[str, bool]:
+    if visual_profile == DEBUG_ALL:
+        return {
+            "show_track": True,
+            "show_target": True,
+            "show_initial_block": True,
+            "show_block": True,
+            "show_pinch": True,
+            "show_block_pinch_line": True,
+        }
+    if visual_profile == EXPERIMENT_VISIBILITY_FEEDBACK:
+        return {
+            "show_track": False,
+            "show_target": False,
+            "show_initial_block": False,
+            "show_block": block_visible,
+            "show_pinch": block_visible,
+            "show_block_pinch_line": False,
+        }
+    if visual_profile == EXPERIMENT_BLANK:
+        return {
+            "show_track": False,
+            "show_target": False,
+            "show_initial_block": False,
+            "show_block": False,
+            "show_pinch": False,
+            "show_block_pinch_line": False,
+        }
+    raise ValueError(f"unsupported visual profile: {visual_profile}")
 
 
 def _track_bounds_box(payload: dict[str, Any]) -> DebugBox2D | None:

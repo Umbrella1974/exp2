@@ -43,6 +43,12 @@ def test_replay_debug_runner_from_explicit_files_produces_snapshots(tmp_path: Pa
     assert timing_path.exists()
     assert result.summary["timing_mode"] == "replay"
     assert result.summary["timing_is_live_latency"] is False
+    assert result.summary["cue_mode"] == "replay"
+    assert result.summary["cue_sink"] == "logging"
+    assert result.summary["cue_count"] == len(result.cue_records)
+    assert result.summary["is_live_cue_timing"] is False
+    assert (tmp_path / "out" / "cue_config.json").exists()
+    assert (tmp_path / "out" / "cue_log.csv").exists()
     with timing_path.open("r", newline="", encoding="utf-8") as handle:
         timing_rows = list(csv.DictReader(handle))
     assert timing_rows
@@ -70,6 +76,7 @@ def test_replay_debug_runner_from_session_dir_discovers_files(tmp_path: Path) ->
     assert result.snapshot_count == 1
     assert result.summary["session_dir"] == str(session_dir)
     assert not (session_dir / "timing_diagnostics.csv").exists()
+    assert not (session_dir / "cue_log.csv").exists()
 
 
 def test_replay_debug_infers_nodes_world_for_legacy_live_integrated_session(tmp_path: Path) -> None:
@@ -140,6 +147,90 @@ def test_replay_debug_gui_headless_entrypoint(tmp_path: Path, capsys: pytest.Cap
     captured = capsys.readouterr()
     assert exit_code == 0
     assert '"mode": "replay_debug_gui"' in captured.out
+
+
+def test_replay_uses_session_cue_config_but_writes_only_to_out_dir(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    _write_raw_jsonl(session_dir / "raw_frames.jsonl")
+    _write_task_calibration(session_dir / "calibration.json")
+    _write_trial_config(session_dir / "trial_config.json")
+    (session_dir / "cue_config.json").write_text(
+        json.dumps({"enable_contact_cue": False}),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "out"
+
+    result = run_replay_debug(
+        ReplayDebugConfig(session_dir=session_dir, replay_timing="fast", out_dir=out_dir)
+    )
+
+    effective = json.loads((out_dir / "cue_config.json").read_text(encoding="utf-8"))
+    assert effective["enable_contact_cue"] is False
+    assert result.summary["effective_cue_config"] == effective
+    assert result.summary["cue_count"] == 0
+    assert (out_dir / "cue_log.csv").exists()
+    assert not (session_dir / "cue_log.csv").exists()
+
+
+def test_replay_headless_rejects_gui_text_sink(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = replay_gui_main(
+        [
+            "--raw-jsonl",
+            str(_write_raw_jsonl(tmp_path / "raw_frames.jsonl")),
+            "--calibration-json",
+            str(_write_task_calibration(tmp_path / "calibration.json")),
+            "--trial-config-json",
+            str(_write_trial_config(tmp_path / "trial_config.json")),
+            "--replay-timing",
+            "fast",
+            "--headless",
+            "--cue-sink",
+            "gui_text",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "gui_text" in captured.err
+
+
+def test_replay_explicit_invalid_cue_config_exits_before_run(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cue_path = tmp_path / "bad_cue.json"
+    cue_path.write_text(json.dumps({"unknown_cue_key": True}), encoding="utf-8")
+
+    exit_code = replay_gui_main(
+        [
+            "--raw-jsonl",
+            str(_write_raw_jsonl(tmp_path / "raw_frames.jsonl")),
+            "--calibration-json",
+            str(_write_task_calibration(tmp_path / "calibration.json")),
+            "--trial-config-json",
+            str(_write_trial_config(tmp_path / "trial_config.json")),
+            "--cue-config",
+            str(cue_path),
+            "--headless",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "Config error" in captured.err
+
+
+def test_replay_corrupt_auto_loaded_session_cue_config_fails(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    _write_raw_jsonl(session_dir / "raw_frames.jsonl")
+    _write_task_calibration(session_dir / "calibration.json")
+    _write_trial_config(session_dir / "trial_config.json")
+    (session_dir / "cue_config.json").write_text("{bad", encoding="utf-8")
+
+    with pytest.raises(json.JSONDecodeError):
+        run_replay_debug(ReplayDebugConfig(session_dir=session_dir, replay_timing="fast"))
 
 
 def test_replay_debug_gui_dependency_preflight_happens_before_worker_start(

@@ -13,6 +13,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from cue_config import load_cue_config
+from cue_feedback import CUE_SINK_CHOICES, CueRuntime, CueSinkConfig
 from debug_gui import (
     GuiDependencyError,
     INSTALL_GUI_DEPS_MESSAGE,
@@ -20,29 +22,59 @@ from debug_gui import (
     run_debug_gui,
 )
 from latest_snapshot_store import LatestSnapshotStore
-from replay_debug_runner import ReplayDebugConfig, load_replay_debug_inputs, run_replay_debug
+from replay_debug_runner import (
+    ReplayDebugConfig,
+    finalize_replay_debug_outputs,
+    load_replay_debug_inputs,
+    run_replay_debug,
+)
 from timing_diagnostics import TimingDiagnostics
+from visual_profile import DISPLAY_CONTROL_CHOICES, VISUAL_PROFILE_CHOICES, resolve_visual_profile
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    config = _config_from_args(args)
+    try:
+        config = _config_from_args(args)
+    except Exception as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        return 2
     try:
         inputs = load_replay_debug_inputs(config)
     except Exception as exc:
         print(f"Replay input error: {exc}", file=sys.stderr)
         return 2
+    if args.headless and config.cue_sink == "gui_text":
+        print("Config error: --cue-sink gui_text cannot be used with --headless.", file=sys.stderr)
+        return 2
 
     store = LatestSnapshotStore()
     timing_diagnostics = TimingDiagnostics(mode="replay", is_live_latency=False)
+    visual_settings = resolve_visual_profile(
+        config.visual_profile,
+        status_panel=config.status_panel,
+        show_axes=config.show_axes,
+        show_grid=config.show_grid,
+    )
+    cue_runtime = CueRuntime(
+        trial_id=str(inputs.trial_config.get("trial_id", inputs.session_meta.get("trial_id", "replay_debug"))),
+        cue_config=inputs.cue_config,
+        sink_config=CueSinkConfig(
+            cue_sink=config.cue_sink,
+            mode="replay",
+            is_live_cue_timing=False,
+        ),
+    )
     if args.headless:
         try:
             result = run_replay_debug(
                 config,
                 snapshot_store=store,
                 timing_diagnostics=timing_diagnostics,
+                cue_runtime=cue_runtime,
             )
         except Exception as exc:
+            cue_runtime.end_session()
             print(f"Replay failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(result.summary, indent=2, ensure_ascii=False, sort_keys=True))
@@ -51,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         preflight_gui_dependencies()
     except GuiDependencyError:
+        cue_runtime.end_session()
         print(INSTALL_GUI_DEPS_MESSAGE, file=sys.stderr)
         return 1
 
@@ -62,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
                 config,
                 snapshot_store=store,
                 timing_diagnostics=timing_diagnostics,
+                cue_runtime=cue_runtime,
             )
         except Exception as exc:
             result_holder["error"] = exc
@@ -82,8 +116,15 @@ def main(argv: list[str] | None = None) -> int:
                 "overwritten_snapshot_count": store.stats_snapshot().overwritten_snapshot_count,
             },
             render_callback=timing_diagnostics.record_gui_render,
+            cue_store=cue_runtime.gui_cue_store,
+            close_callback=cue_runtime.handle_gui_closed,
+            visual_profile=visual_settings.visual_profile,
+            status_panel=visual_settings.status_panel,
+            show_axes=visual_settings.show_axes,
+            show_grid=visual_settings.show_grid,
         )
     except GuiDependencyError:
+        cue_runtime.end_session()
         print(INSTALL_GUI_DEPS_MESSAGE, file=sys.stderr)
         thread.join(timeout=1.0)
         return 1
@@ -94,12 +135,14 @@ def main(argv: list[str] | None = None) -> int:
 
     thread.join()
     if "error" in result_holder:
+        cue_runtime.end_session()
         print(f"Replay failed: {result_holder['error']}", file=sys.stderr)
         return 1
     result = result_holder.get("result")
     if result is not None:
         if config.out_dir is not None:
             timing_diagnostics.write_csv(config.out_dir / "timing_diagnostics.csv")
+            finalize_replay_debug_outputs(result, config.out_dir)
         print(json.dumps(result.summary, indent=2, ensure_ascii=False, sort_keys=True))
     return int(exit_code)
 
@@ -122,6 +165,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--tracker-index", default=0, type=int)
     parser.add_argument("--skeleton-index", default=0, type=int)
     parser.add_argument("--headless", action="store_true", help="Run replay without opening the GUI.")
+    parser.add_argument("--cue-sink", choices=CUE_SINK_CHOICES, default="logging")
+    parser.add_argument("--cue-config", default=None, help="JSON/YAML cue generation config.")
+    parser.add_argument("--visual-profile", choices=VISUAL_PROFILE_CHOICES, default="debug_all")
+    parser.add_argument("--status-panel", choices=DISPLAY_CONTROL_CHOICES, default="auto")
+    parser.add_argument("--show-axes", choices=DISPLAY_CONTROL_CHOICES, default="auto")
+    parser.add_argument("--show-grid", choices=DISPLAY_CONTROL_CHOICES, default="auto")
     args = parser.parse_args(argv)
     if args.max_frames is not None and args.max_frames <= 0:
         parser.error("--max-frames must be > 0.")
@@ -137,6 +186,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def _config_from_args(args: argparse.Namespace) -> ReplayDebugConfig:
+    cue_config_path = Path(args.cue_config) if args.cue_config is not None else None
+    cue_config = load_cue_config(cue_config_path) if cue_config_path is not None else None
     return ReplayDebugConfig(
         session_dir=Path(args.session_dir) if args.session_dir is not None else None,
         raw_jsonl=Path(args.raw_jsonl) if args.raw_jsonl is not None else None,
@@ -152,6 +203,13 @@ def _config_from_args(args: argparse.Namespace) -> ReplayDebugConfig:
         index_node=args.index_node,
         tracker_index=args.tracker_index,
         skeleton_index=args.skeleton_index,
+        cue_sink=args.cue_sink,
+        cue_config_path=cue_config_path,
+        cue_config=cue_config,
+        visual_profile=args.visual_profile,
+        status_panel=args.status_panel,
+        show_axes=args.show_axes,
+        show_grid=args.show_grid,
     )
 
 
