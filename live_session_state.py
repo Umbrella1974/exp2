@@ -20,6 +20,7 @@ class LiveSessionPhase(Enum):
     CALIBRATION_REVIEW = auto()
     CALIBRATION_FAILED = auto()
     READY_FOR_TRIAL = auto()
+    PRE_TRIAL_PINCH_THRESHOLD_CALIBRATION = auto()
     TRIAL_RUNNING = auto()
     TRIAL_ENDED = auto()
     SAVING = auto()

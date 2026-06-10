@@ -127,6 +127,111 @@ def test_replay_debug_infers_nodes_world_for_legacy_live_integrated_session(tmp_
     assert result.last_snapshot.pinch_center_task[0] == pytest.approx(0.0)
 
 
+def test_replay_debug_uses_session_node_config_when_cli_omitted(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    _write_raw_jsonl(session_dir / "raw_frames.jsonl", include_node_14=True)
+    _write_task_calibration(session_dir / "calibration.json")
+    trial_config_path = _write_trial_config(session_dir / "trial_config.json")
+    trial_config = json.loads(trial_config_path.read_text(encoding="utf-8"))
+    trial_config.update(
+        {
+            "pinch_position_mode": "nodes_world",
+            "thumb_node": 4,
+            "index_node": 14,
+            "tracker_index": 0,
+            "skeleton_index": 0,
+            "pinch_node_config": {
+                "thumb_node": 4,
+                "secondary_node": 14,
+                "secondary_node_role": "index_node_cli_arg",
+                "tracker_index": 0,
+                "skeleton_index": 0,
+                "pinch_position_mode": "nodes_world",
+            },
+        }
+    )
+    trial_config_path.write_text(json.dumps(trial_config), encoding="utf-8")
+
+    result = run_replay_debug(ReplayDebugConfig(session_dir=session_dir, replay_timing="fast"))
+
+    assert result.summary["index_node"] == 14
+    assert result.summary["pinch_node_config"]["secondary_node"] == 14
+
+
+def test_replay_debug_cli_node_config_overrides_session_config(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    _write_raw_jsonl(session_dir / "raw_frames.jsonl", include_node_14=True)
+    _write_task_calibration(session_dir / "calibration.json")
+    trial_config_path = _write_trial_config(session_dir / "trial_config.json")
+    trial_config = json.loads(trial_config_path.read_text(encoding="utf-8"))
+    trial_config.update({"pinch_position_mode": "nodes_world", "index_node": 14})
+    trial_config_path.write_text(json.dumps(trial_config), encoding="utf-8")
+
+    result = run_replay_debug(
+        ReplayDebugConfig(
+            session_dir=session_dir,
+            replay_timing="fast",
+            index_node=9,
+            pinch_position_mode="nodes_world",
+        )
+    )
+
+    assert result.summary["index_node"] == 9
+    assert result.summary["pinch_node_config"]["secondary_node"] == 9
+
+
+def test_replay_debug_uses_session_pinch_threshold_calibration(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    _write_raw_jsonl(session_dir / "raw_frames.jsonl")
+    _write_task_calibration(session_dir / "calibration.json")
+    _write_trial_config(session_dir / "trial_config.json")
+    (session_dir / "pinch_threshold_calibration.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "method": "three_repeats_window_median",
+                "pinch_on_threshold_m": 0.045,
+                "pinch_off_threshold_m": 0.055,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_replay_debug(ReplayDebugConfig(session_dir=session_dir, replay_timing="fast"))
+
+    assert result.summary["pinch_threshold"]["grab"] == pytest.approx(0.045)
+    assert result.summary["pinch_threshold"]["release"] == pytest.approx(0.055)
+    assert result.summary["pinch_threshold_source"] == "calibrated"
+
+
+def test_replay_debug_cli_pinch_threshold_overrides_session_threshold(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    _write_raw_jsonl(session_dir / "raw_frames.jsonl")
+    _write_task_calibration(session_dir / "calibration.json")
+    _write_trial_config(session_dir / "trial_config.json")
+    (session_dir / "pinch_threshold_calibration.json").write_text(
+        json.dumps({"pinch_on_threshold_m": 0.045, "pinch_off_threshold_m": 0.055}),
+        encoding="utf-8",
+    )
+
+    result = run_replay_debug(
+        ReplayDebugConfig(
+            session_dir=session_dir,
+            replay_timing="fast",
+            pinch_grab_threshold=0.02,
+            pinch_release_threshold=0.03,
+        )
+    )
+
+    assert result.summary["pinch_threshold"]["grab"] == pytest.approx(0.02)
+    assert result.summary["pinch_threshold"]["release"] == pytest.approx(0.03)
+    assert result.summary["pinch_threshold_source"] == "cli"
+
+
 def test_replay_debug_runner_fails_clearly_when_inputs_missing(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="calibration_json"):
         run_replay_debug(
@@ -398,8 +503,11 @@ def test_replay_debug_gui_dependency_preflight_happens_before_worker_start(
     assert "pip install PySide6 pyqtgraph" in captured.err
 
 
-def _write_raw_jsonl(path: Path) -> Path:
+def _write_raw_jsonl(path: Path, *, include_node_14: bool = False) -> Path:
     frames = [_raw_frame(0, [0.0, 0.0, 0.0]), _raw_frame(1, [0.02, 0.0, 0.0])]
+    if include_node_14:
+        for frame in frames:
+            frame["skeletons"][0]["nodes"].append({"id": 14, "position": [0.005, 0.0, 0.0]})
     path.write_text("\n".join(json.dumps(frame) for frame in frames), encoding="utf-8")
     return path
 

@@ -23,7 +23,7 @@ from validate_session_outputs import validate_session_outputs
 
 def test_integrated_session_completes_and_keeps_calibration_consistent(tmp_path: Path) -> None:
     source = FakeLiveSource()
-    config = _config(tmp_path, calibration_id="cal_consistent", max_frames=3)
+    config = _config(tmp_path, calibration_id="cal_consistent", max_frames=3, index_node=14)
 
     result = run_live_integrated_session(
         config,
@@ -50,6 +50,24 @@ def test_integrated_session_completes_and_keeps_calibration_consistent(tmp_path:
     assert trial_config["pinch_position_mode"] == "nodes_world"
     assert meta["pinch_position_mode"] == "nodes_world"
     assert result.summary["pinch_position_mode"] == "nodes_world"
+    assert trial_config["thumb_node"] == 4
+    assert trial_config["index_node"] == 14
+    assert trial_config["tracker_index"] == 0
+    assert trial_config["skeleton_index"] == 0
+    assert trial_config["pinch_node_config"] == {
+        "thumb_node": 4,
+        "secondary_node": 14,
+        "secondary_node_role": "index_node_cli_arg",
+        "tracker_index": 0,
+        "skeleton_index": 0,
+        "pinch_position_mode": "nodes_world",
+    }
+    assert meta["index_node"] == 14
+    assert result.summary["index_node"] == 14
+    assert trial_config["pinch_threshold"]["grab"] == pytest.approx(0.1)
+    assert trial_config["pinch_threshold"]["release"] == pytest.approx(0.12)
+    assert trial_config["pinch_threshold_source"] == "default"
+    assert result.summary["pinch_threshold_source"] == "default"
     assert result.summary["map_anchor_mode"] == "none"
     assert meta["map_anchor_mode"] == "none"
     assert trial_config["map_anchor_mode"] == "none"
@@ -102,6 +120,67 @@ def test_cue_sink_none_writes_config_but_not_cue_log(tmp_path: Path) -> None:
     assert (session_dir / "cue_config.json").exists()
     assert not (session_dir / "cue_log.csv").exists()
     assert validate_session_outputs(session_dir)["status"] == "PASS"
+
+
+def test_integrated_session_saves_pinch_threshold_calibration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FakeLiveSource()
+    config = _config(
+        tmp_path,
+        calibration_id="cal_pinch_threshold",
+        max_frames=1,
+        calibrate_pinch_threshold=True,
+        index_node=14,
+    )
+
+    def fake_pinch_calibration(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args
+        node_config = kwargs["node_config"]
+        return {
+            "enabled": True,
+            "method": "three_repeats_window_median",
+            **node_config,
+            "repeat_count": 3,
+            "sample_window_seconds": 1.0,
+            "closed_distance_m": 0.02,
+            "open_distance_m": 0.08,
+            "range_m": 0.06,
+            "on_fraction": 0.40,
+            "off_fraction": 0.50,
+            "pinch_on_threshold_m": 0.044,
+            "pinch_off_threshold_m": 0.05,
+            "required_tracker_valid": False,
+            "tracker_valid_sample_fraction": 0.0,
+            "quality": {
+                "valid": True,
+                "min_required_range_m": 0.015,
+                "max_repeat_spread_m": 0.03,
+                "open_repeat_values_m": [0.08, 0.081, 0.079],
+                "closed_repeat_values_m": [0.02, 0.021, 0.019],
+            },
+        }
+
+    monkeypatch.setattr(
+        runner,
+        "run_interactive_pinch_threshold_calibration",
+        fake_pinch_calibration,
+    )
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    session_dir = Path(result.summary["session_dir"])
+    calibration_payload = _read_json(session_dir / "pinch_threshold_calibration.json")
+    trial_config = _read_json(session_dir / "trial_config.json")
+    trial_summary = _read_json(session_dir / "trial_summary.json")
+    assert calibration_payload["pinch_on_threshold_m"] == pytest.approx(0.044)
+    assert trial_config["pinch_threshold"]["grab"] == pytest.approx(0.044)
+    assert trial_config["pinch_threshold"]["release"] == pytest.approx(0.05)
+    assert trial_config["pinch_threshold_source"] == "calibrated"
+    assert trial_config["pinch_threshold_source_path"].endswith("pinch_threshold_calibration.json")
+    assert result.summary["pinch_threshold_source"] == "calibrated"
+    assert trial_summary["pinch_threshold"]["grab"] == pytest.approx(0.044)
 
 
 def test_visual_profile_alias_is_normalized_in_saved_outputs(tmp_path: Path) -> None:
@@ -820,6 +899,7 @@ def _raw_frame(
                 "nodes": [
                     {"id": 4, "position": [-0.005, 0.0, 0.0]},
                     {"id": 9, "position": [0.005, 0.0, 0.0]},
+                    {"id": 14, "position": [0.005, 0.0, 0.0]},
                 ],
             }
         ],
@@ -856,6 +936,9 @@ def _config(
     termination_config_path: Path | None = None,
     cue_sink: str = "logging",
     visual_profile: str = "debug_all",
+    thumb_node: int = 4,
+    index_node: int = 9,
+    calibrate_pinch_threshold: bool = False,
 ) -> LiveIntegratedSessionConfig:
     return LiveIntegratedSessionConfig(
         map_config=map_path or _write_valid_map(tmp_path / "map.json"),
@@ -882,6 +965,9 @@ def _config(
         termination_config_path=termination_config_path,
         anchor_current_pinch_debug=anchor_current_pinch_debug,
         anchor_timeout_seconds=1.0,
+        thumb_node=thumb_node,
+        index_node=index_node,
+        calibrate_pinch_threshold=calibrate_pinch_threshold,
         stream_wait_timeout_seconds=stream_wait_timeout_seconds,
         valid_tracker_timeout_seconds=valid_tracker_timeout_seconds,
         no_frame_timeout_seconds=no_frame_timeout_seconds,

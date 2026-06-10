@@ -41,6 +41,17 @@ from map_config import (
     map_config_to_trial_config,
     validate_map_config,
 )
+from pinch_threshold_calibration import (
+    PinchThresholdCalibrationAborted,
+    PinchThresholdCalibrationConfig,
+    build_pinch_node_config_payload,
+    default_pinch_threshold_calibration_config,
+    effective_pinch_threshold_payload,
+    load_pinch_threshold_config,
+    load_pinch_threshold_json,
+    run_interactive_pinch_threshold_calibration,
+    validate_pinch_threshold_values,
+)
 from raw_manus_vive_parser import parse_raw_manus_vive_frame
 from session_recorder import SessionRecorder
 from termination_config import TerminationConfig, default_termination_config, load_termination_config
@@ -88,6 +99,12 @@ class LiveIntegratedSessionConfig:
     duration_seconds: float | None = None
     pinch_grab_threshold: float | None = None
     pinch_release_threshold: float | None = None
+    calibrate_pinch_threshold: bool = False
+    pinch_threshold_config: PinchThresholdCalibrationConfig = field(
+        default_factory=default_pinch_threshold_calibration_config
+    )
+    pinch_threshold_config_path: Path | None = None
+    pinch_threshold_json: Path | None = None
     slip_motion_threshold: float | None = None
     ignore_task_z: bool = False
     task_z_half_extent: float = 5.0
@@ -217,6 +234,9 @@ def run_live_integrated_session(
     gui_requested_stop = False
     cue_runtime: CueRuntime | None = None
     cue_log_path: Path | None = None
+    pinch_threshold_calibration_payload: dict[str, Any] | None = None
+    pinch_threshold_calibration_path: Path | None = None
+    pinch_threshold_summary = _configured_pinch_threshold_summary(config)
 
     def set_status(
         new_phase: LiveSessionPhase,
@@ -339,6 +359,42 @@ def run_live_integrated_session(
         map_config = _map_config_for_live_session(map_config, config)
         track_region, block_center, block_size = compile_map_to_track_region(map_config)
         engine_config = _engine_config(config, block_size)
+        engine_config = _engine_config_with_pinch_thresholds(engine_config, pinch_threshold_summary)
+        if config.calibrate_pinch_threshold:
+            set_status(
+                LiveSessionPhase.PRE_TRIAL_PINCH_THRESHOLD_CALIBRATION,
+                "Pinch threshold calibration.",
+                map_id=map_config.map_id,
+            )
+            try:
+                pinch_threshold_calibration_payload = run_interactive_pinch_threshold_calibration(
+                    latest_buffer,
+                    config=config.pinch_threshold_config,
+                    adapter_config=adapter_config,
+                    adapter=adapter,
+                    input_fn=input_fn,
+                    node_config=_pinch_node_config_payload(config),
+                    display_enabled=config.display_mode == "text",
+                )
+            except PinchThresholdCalibrationAborted as exc:
+                set_status(
+                    LiveSessionPhase.PRE_TRIAL_PINCH_THRESHOLD_CALIBRATION,
+                    "Pinch threshold calibration aborted.",
+                    map_id=map_config.map_id,
+                )
+                raise _SessionAbort(
+                    run_stop_reason="pinch_threshold_calibration_aborted",
+                    phase_at_stop=LiveSessionPhase.PRE_TRIAL_PINCH_THRESHOLD_CALIBRATION.name,
+                    message=str(exc),
+                ) from exc
+            pinch_threshold_calibration_path = session_dir / "pinch_threshold_calibration.json"
+            pinch_threshold_summary = effective_pinch_threshold_payload(
+                pinch_on_threshold_m=pinch_threshold_calibration_payload["pinch_on_threshold_m"],
+                pinch_off_threshold_m=pinch_threshold_calibration_payload["pinch_off_threshold_m"],
+                source="calibrated",
+                source_path=pinch_threshold_calibration_path,
+            )
+            engine_config = _engine_config_with_pinch_thresholds(engine_config, pinch_threshold_summary)
         trial_config = _trial_config_payload(
             config,
             map_config,
@@ -347,13 +403,24 @@ def run_live_integrated_session(
             map_anchor,
             warnings,
             map_warnings,
+            pinch_threshold_summary=pinch_threshold_summary,
         )
         session_recorder = SessionRecorder(session_dir, overwrite=config.overwrite_session)
         session_recorder.start_session(
-            session_meta=_session_meta(config, session_dir, calibration, map_config, map_anchor, warnings),
+            session_meta=_session_meta(
+                config,
+                session_dir,
+                calibration,
+                map_config,
+                map_anchor,
+                warnings,
+                pinch_threshold_summary=pinch_threshold_summary,
+            ),
             calibration=calibration_to_dict(calibration),
             trial_config=trial_config,
         )
+        if pinch_threshold_calibration_payload is not None and pinch_threshold_calibration_path is not None:
+            _write_json(pinch_threshold_calibration_path, pinch_threshold_calibration_payload)
         _write_json(session_dir / "termination_config.json", config.termination_config.to_dict())
         _write_json(session_dir / "cue_config.json", config.cue_config.to_dict())
         cue_log_path = session_dir / "cue_log.csv"
@@ -532,6 +599,7 @@ def run_live_integrated_session(
             gui_snapshot_store=gui_snapshot_store,
             gui_diagnostics_path=gui_diagnostics_path,
             gui_requested_stop=gui_requested_stop,
+            pinch_threshold_summary=pinch_threshold_summary,
         )
         summary.update(timing_diagnostics.summary())
         summary["timing_diagnostics_path"] = (
@@ -901,6 +969,74 @@ def _engine_config(config: LiveIntegratedSessionConfig, block_size: Any) -> Engi
     )
 
 
+def _configured_pinch_threshold_summary(config: LiveIntegratedSessionConfig) -> dict[str, Any]:
+    defaults = EngineConfig()
+    source = "default"
+    source_path: Path | None = None
+    grab = defaults.pinch_grab_threshold
+    release = defaults.pinch_release_threshold
+
+    if config.pinch_threshold_json is not None:
+        payload = load_pinch_threshold_json(config.pinch_threshold_json)
+        grab = float(payload["pinch_on_threshold_m"])
+        release = float(payload["pinch_off_threshold_m"])
+        source = "json"
+        source_path = config.pinch_threshold_json
+
+    if config.pinch_grab_threshold is not None:
+        grab = float(config.pinch_grab_threshold)
+        source = "cli"
+        source_path = None
+    if config.pinch_release_threshold is not None:
+        release = float(config.pinch_release_threshold)
+        source = "cli"
+        source_path = None
+
+    validate_pinch_threshold_values(grab, release)
+    return effective_pinch_threshold_payload(
+        pinch_on_threshold_m=grab,
+        pinch_off_threshold_m=release,
+        source=source,
+        source_path=source_path,
+    )
+
+
+def _engine_config_with_pinch_thresholds(
+    engine_config: EngineConfig,
+    threshold_summary: dict[str, Any],
+) -> EngineConfig:
+    return replace(
+        engine_config,
+        pinch_grab_threshold=float(threshold_summary["pinch_on_threshold_m"]),
+        pinch_release_threshold=float(threshold_summary["pinch_off_threshold_m"]),
+    )
+
+
+def _pinch_node_config_payload(config: LiveIntegratedSessionConfig) -> dict[str, Any]:
+    return build_pinch_node_config_payload(
+        thumb_node=config.thumb_node,
+        index_node=config.index_node,
+        tracker_index=config.tracker_index,
+        skeleton_index=config.skeleton_index,
+        pinch_position_mode=config.pinch_position_mode,
+    )
+
+
+def _pinch_threshold_request_payload(config: LiveIntegratedSessionConfig) -> dict[str, Any]:
+    return {
+        "calibrate_pinch_threshold": bool(config.calibrate_pinch_threshold),
+        "pinch_threshold_config": config.pinch_threshold_config.to_dict(),
+        "pinch_threshold_config_path": (
+            str(config.pinch_threshold_config_path)
+            if config.pinch_threshold_config_path is not None
+            else None
+        ),
+        "requested_pinch_threshold_json": (
+            str(config.pinch_threshold_json) if config.pinch_threshold_json is not None else None
+        ),
+    }
+
+
 def _trial_config_payload(
     config: LiveIntegratedSessionConfig,
     map_config: MapConfig,
@@ -909,6 +1045,8 @@ def _trial_config_payload(
     map_anchor: dict[str, Any],
     warnings: list[str],
     map_warnings: list[str],
+    *,
+    pinch_threshold_summary: dict[str, Any],
 ) -> dict[str, Any]:
     payload = map_config_to_trial_config(map_config)
     payload.update(
@@ -935,6 +1073,7 @@ def _trial_config_payload(
             "termination_config_path": (
                 str(config.termination_config_path) if config.termination_config_path is not None else None
             ),
+            **_pinch_threshold_request_payload(config),
             "timing_enabled": True,
             "timing_mode": "live",
             "timing_is_live_latency": True,
@@ -948,6 +1087,8 @@ def _trial_config_payload(
                 str(config.cue_config_path) if config.cue_config_path is not None else None
             ),
             **_visual_settings_payload(config),
+            **_pinch_node_config_payload(config),
+            **pinch_threshold_summary,
             "warnings": list(warnings) + list(map_warnings),
         }
     )
@@ -970,6 +1111,8 @@ def _session_meta(
     map_config: MapConfig,
     map_anchor: dict[str, Any],
     warnings: list[str],
+    *,
+    pinch_threshold_summary: dict[str, Any],
 ) -> dict[str, Any]:
     payload = {
         "session_id": session_dir.name,
@@ -992,6 +1135,7 @@ def _session_meta(
         "termination_config_path": (
             str(config.termination_config_path) if config.termination_config_path is not None else None
         ),
+        **_pinch_threshold_request_payload(config),
         "timing_enabled": True,
         "timing_mode": "live",
         "timing_is_live_latency": True,
@@ -1004,6 +1148,8 @@ def _session_meta(
             str(config.cue_config_path) if config.cue_config_path is not None else None
         ),
         **_visual_settings_payload(config),
+        **_pinch_node_config_payload(config),
+        **pinch_threshold_summary,
         "warnings": list(warnings),
     }
     if map_anchor["mode"] == "current_pinch_debug":
@@ -1045,6 +1191,7 @@ def _build_summary(
     gui_snapshot_store: Any | None,
     gui_diagnostics_path: Path | None,
     gui_requested_stop: bool,
+    pinch_threshold_summary: dict[str, Any],
 ) -> dict[str, Any]:
     stats = pump.stats_snapshot()
     buffer_stats = buffer.stats_snapshot()
@@ -1073,10 +1220,13 @@ def _build_summary(
         "map_anchor_mode": str(map_anchor.get("mode", "none")),
         "map_anchor": dict(map_anchor),
         "pinch_position_mode": config.pinch_position_mode,
+        **_pinch_node_config_payload(config),
+        **pinch_threshold_summary,
         "termination_config": config.termination_config.to_dict(),
         "termination_config_path": (
             str(config.termination_config_path) if config.termination_config_path is not None else None
         ),
+        **_pinch_threshold_request_payload(config),
         "max_trial_duration_seconds": config.termination_config.max_trial_duration_seconds,
         "max_detach_count": config.termination_config.max_detach_count,
         "manual_completion_enabled": config.termination_config.manual_completion_enabled,
@@ -1627,6 +1777,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--duration-seconds", default=None, type=float)
     parser.add_argument("--pinch-grab-threshold", default=None, type=float)
     parser.add_argument("--pinch-release-threshold", default=None, type=float)
+    parser.add_argument("--calibrate-pinch-threshold", action="store_true")
+    parser.add_argument("--pinch-threshold-config", default=None)
+    parser.add_argument("--pinch-threshold-json", default=None)
+    parser.add_argument("--calibration-require-tracker-valid", action="store_true")
     parser.add_argument("--slip-motion-threshold", default=None, type=float)
     parser.add_argument("--ignore-task-z", action="store_true")
     parser.add_argument("--task-z-half-extent", default=5.0, type=float)
@@ -1672,6 +1826,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--max-frames must be > 0.")
     if args.duration_seconds is not None and args.duration_seconds <= 0.0:
         parser.error("--duration-seconds must be > 0.")
+    if args.calibrate_pinch_threshold and args.pinch_threshold_json is not None:
+        parser.error("--calibrate-pinch-threshold and --pinch-threshold-json are mutually exclusive.")
     if args.print_every < 0:
         parser.error("--print-every must be >= 0.")
     if args.gui_fps <= 0.0:
@@ -1696,6 +1852,15 @@ def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
     termination = load_termination_config(termination_path)
     cue_config_path = Path(args.cue_config) if args.cue_config is not None else None
     cue_config = load_cue_config(cue_config_path)
+    pinch_threshold_config_path = (
+        Path(args.pinch_threshold_config) if args.pinch_threshold_config is not None else None
+    )
+    pinch_threshold_config = load_pinch_threshold_config(pinch_threshold_config_path)
+    if args.calibration_require_tracker_valid:
+        pinch_threshold_config = replace(pinch_threshold_config, require_tracker_valid=True)
+    pinch_threshold_json = Path(args.pinch_threshold_json) if args.pinch_threshold_json is not None else None
+    if pinch_threshold_json is not None:
+        load_pinch_threshold_json(pinch_threshold_json)
     if args.cue_sink == "gui_text" and not args.gui:
         raise ValueError("--cue-sink gui_text requires --gui.")
     resolve_visual_profile(
@@ -1729,6 +1894,10 @@ def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
         duration_seconds=args.duration_seconds,
         pinch_grab_threshold=args.pinch_grab_threshold,
         pinch_release_threshold=args.pinch_release_threshold,
+        calibrate_pinch_threshold=args.calibrate_pinch_threshold,
+        pinch_threshold_config=pinch_threshold_config,
+        pinch_threshold_config_path=pinch_threshold_config_path,
+        pinch_threshold_json=pinch_threshold_json,
         slip_motion_threshold=args.slip_motion_threshold,
         ignore_task_z=args.ignore_task_z,
         task_z_half_extent=args.task_z_half_extent,

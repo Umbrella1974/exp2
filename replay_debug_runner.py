@@ -31,6 +31,11 @@ from raw_frame_source import JsonlRawFrameSource
 from task_coordinate_system import TaskCoordinateSystem
 from timing_diagnostics import TimingDiagnostics
 from visual_profile import resolve_visual_profile
+from pinch_threshold_calibration import (
+    effective_pinch_threshold_payload,
+    threshold_values_from_payload,
+    validate_pinch_threshold_values,
+)
 
 
 SnapshotCallback = Callable[[Any], None]
@@ -51,10 +56,13 @@ class ReplayDebugConfig:
     replay_speed: float = 1.0
     gui_fps: float = 30.0
     timestamp_scale: float = 0.001
-    thumb_node: int = 4
-    index_node: int = 9
-    tracker_index: int = 0
-    skeleton_index: int = 0
+    thumb_node: int | None = None
+    index_node: int | None = None
+    tracker_index: int | None = None
+    skeleton_index: int | None = None
+    pinch_position_mode: str | None = None
+    pinch_grab_threshold: float | None = None
+    pinch_release_threshold: float | None = None
     no_frame_timeout_seconds: float = 5.0
     cue_sink: str = "logging"
     cue_config_path: Path | None = None
@@ -75,6 +83,7 @@ class ReplayDebugInputs:
     calibration_payload: dict[str, Any]
     trial_config: dict[str, Any]
     session_meta: dict[str, Any]
+    pinch_threshold_calibration: dict[str, Any]
     scene: DebugSceneView
     cue_config: CueConfig
     cue_config_path: Path | None
@@ -100,6 +109,9 @@ def load_replay_debug_inputs(config: ReplayDebugConfig) -> ReplayDebugInputs:
     calibration_payload = _read_json(calibration_path, "calibration")
     trial_config = _read_json(trial_config_path, "trial config")
     session_meta = _read_optional_json(session_meta_path) if session_meta_path is not None else {}
+    pinch_threshold_calibration = _read_optional_json(
+        Path(config.session_dir) / "pinch_threshold_calibration.json"
+    ) if config.session_dir is not None else {}
     scene = scene_view_from_trial_config(trial_config)
     cue_config, cue_config_path = _resolve_replay_cue_config(config)
     if not scene.track_boxes:
@@ -115,6 +127,7 @@ def load_replay_debug_inputs(config: ReplayDebugConfig) -> ReplayDebugInputs:
         calibration_payload=calibration_payload,
         trial_config=trial_config,
         session_meta=session_meta,
+        pinch_threshold_calibration=pinch_threshold_calibration,
         scene=scene,
         cue_config=cue_config,
         cue_config_path=cue_config_path,
@@ -138,7 +151,18 @@ def run_replay_debug(
     track_region = _track_region_from_trial_config(inputs.trial_config)
     block_center = _block_center_from_trial_config(inputs.trial_config)
     block_size = _block_size_from_trial_config(inputs.trial_config)
-    engine_config = _engine_config_from_trial_config(inputs.trial_config, block_size, inputs.session_meta)
+    adapter_config_payload = _resolve_replay_adapter_config(config, inputs.trial_config, inputs.session_meta)
+    pinch_threshold_summary = _resolve_replay_pinch_threshold_summary(
+        config,
+        inputs.trial_config,
+        inputs.pinch_threshold_calibration,
+    )
+    engine_config = _engine_config_from_trial_config(
+        inputs.trial_config,
+        block_size,
+        inputs.session_meta,
+        pinch_threshold_summary=pinch_threshold_summary,
+    )
     trial_id = str(inputs.trial_config.get("trial_id", inputs.session_meta.get("trial_id", "replay_debug")))
     cue_log_path = (
         config.out_dir / "cue_log.csv"
@@ -190,11 +214,11 @@ def run_replay_debug(
             max_frames=None,
             no_frame_timeout_seconds=config.no_frame_timeout_seconds,
             timestamp_scale=config.timestamp_scale,
-            thumb_node=config.thumb_node,
-            index_node=config.index_node,
-            tracker_index=config.tracker_index,
-            skeleton_index=config.skeleton_index,
-            pinch_position_mode=_pinch_position_mode_for_replay(inputs.trial_config, inputs.session_meta),
+            thumb_node=adapter_config_payload["thumb_node"],
+            index_node=adapter_config_payload["index_node"],
+            tracker_index=adapter_config_payload["tracker_index"],
+            skeleton_index=adapter_config_payload["skeleton_index"],
+            pinch_position_mode=adapter_config_payload["pinch_position_mode"],
             timing_phase="REPLAY",
         ),
         map_id=str(inputs.trial_config.get("map_id", "")),
@@ -257,6 +281,8 @@ def run_replay_debug(
             "requested_cue_config_path": (
                 str(config.cue_config_path) if config.cue_config_path is not None else None
             ),
+            **adapter_config_payload,
+            **pinch_threshold_summary,
             **resolve_visual_profile(
                 config.visual_profile,
                 status_panel=config.status_panel,
@@ -311,6 +337,124 @@ def _pinch_position_mode_for_replay(trial_config: dict[str, Any], session_meta: 
     if mode == "live_integrated_session":
         return "nodes_world"
     return "tracker_plus_local"
+
+
+def _resolve_replay_adapter_config(
+    config: ReplayDebugConfig,
+    trial_config: dict[str, Any],
+    session_meta: dict[str, Any],
+) -> dict[str, Any]:
+    pinch_node_config = trial_config.get("pinch_node_config")
+    if not isinstance(pinch_node_config, dict):
+        pinch_node_config = {}
+
+    thumb_node = _first_int(
+        config.thumb_node,
+        pinch_node_config.get("thumb_node"),
+        trial_config.get("thumb_node"),
+        session_meta.get("thumb_node"),
+        4,
+    )
+    index_node = _first_int(
+        config.index_node,
+        pinch_node_config.get("secondary_node"),
+        trial_config.get("index_node"),
+        session_meta.get("index_node"),
+        9,
+    )
+    tracker_index = _first_int(
+        config.tracker_index,
+        pinch_node_config.get("tracker_index"),
+        trial_config.get("tracker_index"),
+        session_meta.get("tracker_index"),
+        0,
+    )
+    skeleton_index = _first_int(
+        config.skeleton_index,
+        pinch_node_config.get("skeleton_index"),
+        trial_config.get("skeleton_index"),
+        session_meta.get("skeleton_index"),
+        0,
+    )
+    pinch_position_mode = (
+        config.pinch_position_mode
+        or pinch_node_config.get("pinch_position_mode")
+        or _pinch_position_mode_for_replay(trial_config, session_meta)
+    )
+    pinch_position_mode = str(pinch_position_mode)
+    if pinch_position_mode not in {"nodes_world", "tracker_plus_local"}:
+        raise ValueError("pinch_position_mode must be nodes_world or tracker_plus_local.")
+    return {
+        "thumb_node": thumb_node,
+        "index_node": index_node,
+        "tracker_index": tracker_index,
+        "skeleton_index": skeleton_index,
+        "pinch_position_mode": pinch_position_mode,
+        "pinch_node_config": {
+            "thumb_node": thumb_node,
+            "secondary_node": index_node,
+            "secondary_node_role": "index_node_cli_arg",
+            "tracker_index": tracker_index,
+            "skeleton_index": skeleton_index,
+            "pinch_position_mode": pinch_position_mode,
+        },
+    }
+
+
+def _resolve_replay_pinch_threshold_summary(
+    config: ReplayDebugConfig,
+    trial_config: dict[str, Any],
+    pinch_threshold_calibration: dict[str, Any],
+) -> dict[str, Any]:
+    defaults = EngineConfig()
+    source = "default"
+    grab = defaults.pinch_grab_threshold
+    release = defaults.pinch_release_threshold
+    if pinch_threshold_calibration:
+        grab, release = threshold_values_from_payload(pinch_threshold_calibration)
+        source = "calibrated"
+    else:
+        session_thresholds = _threshold_values_from_session_config(trial_config)
+        if session_thresholds is not None:
+            grab, release = session_thresholds
+            source = str(trial_config.get("pinch_threshold_source", "session"))
+
+    if config.pinch_grab_threshold is not None:
+        grab = float(config.pinch_grab_threshold)
+        source = "cli"
+    if config.pinch_release_threshold is not None:
+        release = float(config.pinch_release_threshold)
+        source = "cli"
+    validate_pinch_threshold_values(grab, release)
+    return effective_pinch_threshold_payload(
+        pinch_on_threshold_m=grab,
+        pinch_off_threshold_m=release,
+        source=source,
+    )
+
+
+def _threshold_values_from_session_config(trial_config: dict[str, Any]) -> tuple[float, float] | None:
+    if "pinch_on_threshold_m" in trial_config or "pinch_off_threshold_m" in trial_config:
+        return threshold_values_from_payload(trial_config)
+    effective = trial_config.get("effective_pinch_threshold")
+    if isinstance(effective, dict):
+        return threshold_values_from_payload({"effective_pinch_threshold": effective})
+    threshold = trial_config.get("pinch_threshold")
+    if isinstance(threshold, dict):
+        return threshold_values_from_payload({"pinch_threshold": threshold})
+    return None
+
+
+def _first_int(*values: Any) -> int:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            raise ValueError("adapter node/index values must be integers.")
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError("adapter node/index values must be integers.")
+        return int(value)
+    raise ValueError("missing adapter node/index value.")
 
 
 def _resolve_replay_cue_config(config: ReplayDebugConfig) -> tuple[CueConfig, Path | None]:
@@ -471,19 +615,24 @@ def _engine_config_from_trial_config(
     trial_config: dict[str, Any],
     block_size: Vec3,
     session_meta: dict[str, Any],
+    *,
+    pinch_threshold_summary: dict[str, Any] | None = None,
 ) -> EngineConfig:
     defaults = EngineConfig()
-    pinch_threshold = trial_config.get("pinch_threshold")
-    if not isinstance(pinch_threshold, dict):
-        pinch_threshold = {}
+    if pinch_threshold_summary is None:
+        pinch_threshold_summary = _resolve_replay_pinch_threshold_summary(
+            ReplayDebugConfig(),
+            trial_config,
+            {},
+        )
     mode = str(session_meta.get("mode", trial_config.get("mode", "")))
     default_max_delta = 10.0 if mode.startswith("offline_") else defaults.max_hand_delta_per_frame
     return EngineConfig(
         block_size_x=block_size.x,
         block_size_y=block_size.y,
         block_size_z=block_size.z,
-        pinch_grab_threshold=float(pinch_threshold.get("grab", defaults.pinch_grab_threshold)),
-        pinch_release_threshold=float(pinch_threshold.get("release", defaults.pinch_release_threshold)),
+        pinch_grab_threshold=float(pinch_threshold_summary["pinch_on_threshold_m"]),
+        pinch_release_threshold=float(pinch_threshold_summary["pinch_off_threshold_m"]),
         slip_motion_threshold=float(trial_config.get("slip_motion_threshold", defaults.slip_motion_threshold)),
         trial_timeout_seconds=float(trial_config.get("trial_timeout_seconds", 1e9)),
         max_detach_count=int(trial_config.get("max_detach_count", 1_000_000_000)),

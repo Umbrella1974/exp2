@@ -187,10 +187,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--replay-speed", default=1.0, type=float)
     parser.add_argument("--gui-fps", default=30.0, type=float)
     parser.add_argument("--timestamp-scale", default=0.001, type=float)
-    parser.add_argument("--thumb-node", default=4, type=int)
-    parser.add_argument("--index-node", default=9, type=int)
-    parser.add_argument("--tracker-index", default=0, type=int)
-    parser.add_argument("--skeleton-index", default=0, type=int)
+    parser.add_argument("--thumb-node", default=None, type=int)
+    parser.add_argument("--index-node", default=None, type=int)
+    parser.add_argument("--tracker-index", default=None, type=int)
+    parser.add_argument("--skeleton-index", default=None, type=int)
+    parser.add_argument(
+        "--pinch-position-mode",
+        choices=("nodes_world", "tracker_plus_local"),
+        default=None,
+    )
+    parser.add_argument("--pinch-grab-threshold", default=None, type=float)
+    parser.add_argument("--pinch-release-threshold", default=None, type=float)
     display_group = parser.add_mutually_exclusive_group()
     display_group.add_argument(
         "--gui",
@@ -237,6 +244,9 @@ def _config_from_args(args: argparse.Namespace) -> ReplayDebugConfig:
         index_node=args.index_node,
         tracker_index=args.tracker_index,
         skeleton_index=args.skeleton_index,
+        pinch_position_mode=args.pinch_position_mode,
+        pinch_grab_threshold=args.pinch_grab_threshold,
+        pinch_release_threshold=args.pinch_release_threshold,
         cue_sink=args.cue_sink,
         cue_config_path=cue_config_path,
         cue_config=cue_config,
