@@ -90,6 +90,18 @@ def load_pinch_threshold_config(path: str | Path | None) -> PinchThresholdCalibr
 def pinch_threshold_config_from_dict(payload: dict[str, Any]) -> PinchThresholdCalibrationConfig:
     """Validate a plain calibration config payload."""
 
+    if "pinch_threshold_calibration" in payload:
+        unknown_top_level = sorted(set(payload) - {"pinch_threshold_calibration"})
+        if unknown_top_level:
+            raise ValueError(
+                "pinch threshold config cannot mix pinch_threshold_calibration with: "
+                + ", ".join(unknown_top_level)
+            )
+        nested = payload["pinch_threshold_calibration"]
+        if not isinstance(nested, dict):
+            raise ValueError("pinch_threshold_calibration must be an object.")
+        payload = nested
+
     allowed = {
         "repeat_count",
         "sample_window_seconds",

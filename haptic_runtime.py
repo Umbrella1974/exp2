@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from data_models import Vec3
-from haptic_config import HapticConfig, default_haptic_config
+from haptic_config import HapticConfig, default_haptic_config, normalize_direction_key
 from haptic_tcp_worker import MatrixHapticConnectionError, MatrixTcpWorker
 from matrix_haptic_protocol import encode_matrix_channel_packet
 
@@ -33,6 +33,8 @@ HAPTIC_CSV_FIELDS = [
     "direction",
     "primary_blocked_surface",
     "correction_direction",
+    "blocked_surface_set",
+    "correction_direction_set",
     "matrix_direction_used",
     "matrix_direction_semantics",
     "channel_list",
@@ -68,6 +70,8 @@ class HapticCommandRecord:
     direction: str | None
     primary_blocked_surface: str | None = None
     correction_direction: str | None = None
+    blocked_surface_set: str | None = None
+    correction_direction_set: str | None = None
     matrix_direction_used: str | None = None
     matrix_direction_semantics: str | None = None
     channel_list: list[int] = field(default_factory=list)
@@ -103,6 +107,19 @@ class _FrameContext:
 
 class HapticStartupError(RuntimeError):
     """Raised when required haptic hardware cannot start before trial."""
+
+
+@dataclass(frozen=True)
+class _MatrixBlockedSignature:
+    direction_key: str | None
+    primary_surface: str | None
+    primary_correction: str | None
+    blocked_surface_set: str | None
+    correction_direction_set: str | None
+    semantics: str
+    track_state: str
+    channels: tuple[int, ...]
+    missing_reason: str | None = None
 
 
 class HapticRuntime:
@@ -142,7 +159,7 @@ class HapticRuntime:
         self._session_ended = False
         self._trial_ended = False
         self._previous_slip_signature: tuple[Any, ...] | None = None
-        self._previous_blocked_signature: tuple[Any, ...] | None = None
+        self._previous_blocked_signature: _MatrixBlockedSignature | None = None
         self._last_matrix_send_monotonic_ms: float | None = None
         self._last_context: _FrameContext | None = None
         self._target_box = _target_box_from_trial_config(self.trial_config)
@@ -395,32 +412,62 @@ class HapticRuntime:
         in_target = self._block_center_in_target(trial_result)
         return (reason, in_target)
 
-    def _blocked_signature(self, trial_result: Any) -> tuple[Any, ...] | None:
+    def _blocked_signature(self, trial_result: Any) -> _MatrixBlockedSignature | None:
         haptic = getattr(trial_result, "haptic_feedback_state", None)
         if not bool(getattr(haptic, "blocked_force_active", False)):
             return None
         output = getattr(trial_result, "frame_output", None)
         feedback = getattr(output, "feedback_state", None)
+        surface_names = _blocked_surface_names(trial_result)
         primary_surface = _name(getattr(haptic, "primary_blocked_surface", None))
+        if not primary_surface and surface_names:
+            primary_surface = surface_names[0]
         if not primary_surface:
             primary_surface = _surface_from_track_state(_name(getattr(feedback, "track_state", None)))
-        correction = _opposite_direction(primary_surface)
+        correction_names = tuple(
+            correction
+            for correction in (_opposite_direction(surface) for surface in surface_names)
+            if correction
+        )
+        primary_correction = _opposite_direction(primary_surface)
+        blocked_surface_set = _direction_key(surface_names)
+        correction_direction_set = _direction_key(correction_names)
         semantics = self.haptic_config.matrix.direction_semantics
-        direction_used = primary_surface if semantics == "blocked_surface" else correction
+        direction_names = surface_names if semantics == "blocked_surface" else correction_names
+        direction_key = _direction_key(direction_names)
         track_state = _name(getattr(feedback, "track_state", None))
-        channels = (
-            self.haptic_config.matrix.direction_channel_map.get(direction_used or "", [])
-            if direction_used
-            else []
+        channels, missing_reason = self._matrix_channels_for_direction(direction_key)
+        return _MatrixBlockedSignature(
+            direction_key=direction_key,
+            primary_surface=primary_surface or None,
+            primary_correction=primary_correction,
+            blocked_surface_set=blocked_surface_set,
+            correction_direction_set=correction_direction_set,
+            semantics=semantics,
+            track_state=track_state,
+            channels=tuple(channels),
+            missing_reason=missing_reason,
         )
-        return (
-            direction_used,
-            primary_surface,
-            correction,
-            semantics,
-            track_state,
-            tuple(channels),
-        )
+
+    def _matrix_channels_for_direction(
+        self,
+        direction_key: str | None,
+    ) -> tuple[list[int], str | None]:
+        if not direction_key:
+            return [], None
+        parts = direction_key.split("+")
+        if len(parts) == 1:
+            return list(self.haptic_config.matrix.direction_channel_map.get(direction_key, [])), None
+
+        if direction_key in self.haptic_config.matrix.combination_channel_map:
+            combination = self.haptic_config.matrix.combination_channel_map[direction_key]
+            return list(combination), None
+        if self.haptic_config.matrix.missing_combination_policy == "union_single_directions":
+            channels: list[int] = []
+            for part in parts:
+                channels.extend(self.haptic_config.matrix.direction_channel_map.get(part, []))
+            return channels, None if channels else "missing_combination_mapping"
+        return [], "missing_combination_mapping"
 
     def _block_center_in_target(self, trial_result: Any) -> bool | None:
         if self._target_box is None:
@@ -507,17 +554,23 @@ class HapticRuntime:
     def _record_matrix_command(
         self,
         context: _FrameContext,
-        signature: tuple[Any, ...],
+        signature: _MatrixBlockedSignature,
         phase: str,
     ) -> None:
         if not self.matrix_haptic_enabled:
             return
-        direction, primary, correction, semantics, track_state, channels_tuple = signature
-        channels = list(channels_tuple)
+        direction = signature.direction_key
+        primary = signature.primary_surface
+        correction = signature.primary_correction
+        semantics = signature.semantics
+        track_state = signature.track_state
+        channels = list(signature.channels)
         details = {
             "track_state": track_state,
             "primary_blocked_surface": primary,
             "correction_direction": correction,
+            "blocked_surface_set": signature.blocked_surface_set,
+            "correction_direction_set": signature.correction_direction_set,
             "matrix_direction_used": direction,
             "matrix_direction_semantics": semantics,
         }
@@ -530,6 +583,8 @@ class HapticRuntime:
             direction=str(direction) if direction else None,
             primary_blocked_surface=str(primary) if primary else None,
             correction_direction=str(correction) if correction else None,
+            blocked_surface_set=signature.blocked_surface_set,
+            correction_direction_set=signature.correction_direction_set,
             matrix_direction_used=str(direction) if direction else None,
             matrix_direction_semantics=str(semantics) if semantics else None,
             channel_list=channels,
@@ -537,6 +592,9 @@ class HapticRuntime:
         )
         if not direction:
             self._finish_not_sent(record, "skipped", "missing_direction")
+            return
+        if signature.missing_reason == "missing_combination_mapping":
+            self._finish_not_sent(record, "not_sent", "missing_combination_mapping")
             return
         if not channels:
             self._finish_not_sent(record, "skipped", "no_channel_mapping")
@@ -555,12 +613,16 @@ class HapticRuntime:
     def _record_matrix_end(
         self,
         context: _FrameContext,
-        signature: tuple[Any, ...],
+        signature: _MatrixBlockedSignature,
         reason: str,
     ) -> None:
         if not self.matrix_haptic_enabled:
             return
-        direction, primary, correction, semantics, track_state, channels_tuple = signature
+        direction = signature.direction_key
+        primary = signature.primary_surface
+        correction = signature.primary_correction
+        semantics = signature.semantics
+        track_state = signature.track_state
         record = self._make_record(
             context,
             target_device="matrix",
@@ -570,11 +632,15 @@ class HapticRuntime:
             direction=str(direction) if direction else None,
             primary_blocked_surface=str(primary) if primary else None,
             correction_direction=str(correction) if correction else None,
+            blocked_surface_set=signature.blocked_surface_set,
+            correction_direction_set=signature.correction_direction_set,
             matrix_direction_used=str(direction) if direction else None,
             matrix_direction_semantics=str(semantics) if semantics else None,
-            channel_list=list(channels_tuple),
+            channel_list=list(signature.channels),
             details={
                 "track_state": track_state,
+                "blocked_surface_set": signature.blocked_surface_set,
+                "correction_direction_set": signature.correction_direction_set,
                 "end_reason": reason,
                 "hardware_clear_assumed": False,
             },
@@ -619,6 +685,8 @@ class HapticRuntime:
         direction: str | None,
         primary_blocked_surface: str | None = None,
         correction_direction: str | None = None,
+        blocked_surface_set: str | None = None,
+        correction_direction_set: str | None = None,
         matrix_direction_used: str | None = None,
         matrix_direction_semantics: str | None = None,
         channel_list: list[int] | None = None,
@@ -642,6 +710,8 @@ class HapticRuntime:
             direction=direction,
             primary_blocked_surface=primary_blocked_surface,
             correction_direction=correction_direction,
+            blocked_surface_set=blocked_surface_set,
+            correction_direction_set=correction_direction_set,
             matrix_direction_used=matrix_direction_used,
             matrix_direction_semantics=matrix_direction_semantics,
             channel_list=list(channel_list or []),
@@ -722,6 +792,40 @@ def _surface_from_track_state(track_state: str) -> str | None:
     if track_state.startswith("BLOCKED_"):
         return track_state.removeprefix("BLOCKED_")
     return None
+
+
+def _blocked_surface_names(trial_result: Any) -> tuple[str, ...]:
+    output = getattr(trial_result, "frame_output", None)
+    feedback = getattr(output, "feedback_state", None)
+    blocked_info = getattr(feedback, "blocked_info", None)
+    names = [
+        _name(surface)
+        for surface in getattr(blocked_info, "all_blocked_surfaces", ()) or ()
+        if _name(surface)
+    ]
+    if not names:
+        haptic = getattr(trial_result, "haptic_feedback_state", None)
+        primary = _name(getattr(haptic, "primary_blocked_surface", None))
+        if primary:
+            names = [primary]
+    if not names:
+        track_surface = _surface_from_track_state(_name(getattr(feedback, "track_state", None)))
+        if track_surface:
+            names = [track_surface]
+    return _canonical_direction_names(names)
+
+
+def _canonical_direction_names(values: list[str]) -> tuple[str, ...]:
+    if not values:
+        return ()
+    key = normalize_direction_key("+".join(values), name="blocked direction set")
+    return tuple(key.split("+"))
+
+
+def _direction_key(values: tuple[str, ...]) -> str | None:
+    if not values:
+        return None
+    return normalize_direction_key("+".join(values), name="blocked direction set")
 
 
 def _opposite_direction(value: str | None) -> str | None:

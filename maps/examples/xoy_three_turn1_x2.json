@@ -1,0 +1,78 @@
+{
+  "map_id": "xoy_two_turns",
+  "description": "Manual two-turn x-y corridor example.",
+  "coordinate_space": "task",
+  "unit": "m",
+  "block_initial_center_task": [0.0, 0.0, 0.0],
+  "block_size": [0.1, 0.1, 0.1],
+  "track_boxes": [
+    {
+      "id": "segment_00",
+      "order": 0,
+      "label": "Initial x segment",
+      "min": [0.0, -0.2, -0.2],
+      "max": [0.8, 0.2, 0.2],
+      "metadata": {
+        "direction": "x+",
+        "segment_direction": "x+",
+        "segment_length": 0.8,
+        "turn_from_previous": "straight"
+      }
+    },
+    {
+      "id": "segment_01",
+      "order": 1,
+      "label": "Right turn y segment",
+      "min": [0.8, -0.2, -0.2],
+      "max": [1.2,1, 0.2],
+      "metadata": {
+        "direction": "y+",
+        "segment_direction": "y+",
+        "segment_length": 0.4,
+        "turn_from_previous": "left"
+      }
+    },
+    {
+      "id": "segment_02",
+      "order": 2,
+      "label": "Right turn x segment",
+      "min": [1.2, 0.6, -0.2],
+      "max": [2.0, 1, 0.2],
+      "metadata": {
+        "direction": "x+",
+        "segment_direction": "x+",
+        "segment_length": 0.8,
+        "turn_from_previous": "right"
+      }
+    },
+    {
+      "id": "segment_03",
+      "order": 3,
+      "label": "Right turn x segment",
+      "min": [2.0, 0.6, -0.2],
+      "max": [2.4, 1.8, 0.2],
+      "metadata": {
+        "direction": "y+",
+        "segment_direction": "y+",
+        "segment_length": 0.4,
+        "turn_from_previous": "left"
+      }
+    }
+  ],
+  "target_region": {
+    "id": "target",
+    "order": null,
+    "label": "Target region",
+    "min": [2.0, 1.6, -0.2],
+    "max": [2.4, 1.8, 0.2],
+    "metadata": {
+      "type": "target_region"
+    }
+  },
+  "metadata": {
+    "generated": false,
+    "generator_name": null,
+    "generator_seed": null,
+    "generator_params": {}
+  }
+}

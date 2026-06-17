@@ -12,6 +12,7 @@ from typing import Any
 DIRECTION_KEYS = ("X_NEG", "X_POS", "Y_NEG", "Y_POS", "Z_NEG", "Z_POS")
 MATRIX_FEEDBACK_MODES = ("latched_once", "continuous_resend")
 MATRIX_DIRECTION_SEMANTICS = ("blocked_surface", "correction_direction")
+MATRIX_MISSING_COMBINATION_POLICIES = ("skip", "union_single_directions")
 VIBRATION_PROTOCOLS = ("pending",)
 
 
@@ -34,6 +35,8 @@ class MatrixHapticConfig:
     direction_channel_map: dict[str, list[int]] = field(
         default_factory=lambda: {key: [] for key in DIRECTION_KEYS}
     )
+    combination_channel_map: dict[str, list[int]] = field(default_factory=dict)
+    missing_combination_policy: str = "skip"
 
     def __post_init__(self) -> None:
         _bool_value(self.enabled, "matrix.enabled")
@@ -85,6 +88,16 @@ class MatrixHapticConfig:
             "direction_channel_map",
             _direction_channel_map(self.direction_channel_map),
         )
+        object.__setattr__(
+            self,
+            "combination_channel_map",
+            _combination_channel_map(self.combination_channel_map),
+        )
+        if self.missing_combination_policy not in MATRIX_MISSING_COMBINATION_POLICIES:
+            raise ValueError(
+                "matrix.missing_combination_policy must be one of: "
+                + ", ".join(MATRIX_MISSING_COMBINATION_POLICIES)
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -215,6 +228,8 @@ def _matrix_config_from_dict(payload: dict[str, Any]) -> MatrixHapticConfig:
         "resend_interval_ms",
         "direction_semantics",
         "direction_channel_map",
+        "combination_channel_map",
+        "missing_combination_policy",
     }
     unknown = sorted(set(payload) - allowed)
     if unknown:
@@ -247,6 +262,13 @@ def _matrix_config_from_dict(payload: dict[str, Any]) -> MatrixHapticConfig:
             payload.get("direction_semantics", MatrixHapticConfig.direction_semantics)
         ),
         direction_channel_map=payload.get("direction_channel_map", {}),
+        combination_channel_map=payload.get("combination_channel_map", {}),
+        missing_combination_policy=str(
+            payload.get(
+                "missing_combination_policy",
+                MatrixHapticConfig.missing_combination_policy,
+            )
+        ),
     )
 
 
@@ -327,14 +349,71 @@ def _direction_channel_map(value: Any) -> dict[str, list[int]]:
     return normalized
 
 
-def _channel_value(value: Any, direction: str) -> int:
+def _combination_channel_map(value: Any) -> dict[str, list[int]]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError("matrix.combination_channel_map must be an object.")
+
+    normalized: dict[str, list[int]] = {}
+    for raw_key, raw_channels in value.items():
+        key = normalize_direction_key(raw_key, name="matrix.combination_channel_map key")
+        parts = key.split("+")
+        if len(parts) < 2:
+            raise ValueError(
+                f"matrix.combination_channel_map.{key} must contain at least two directions."
+            )
+        axes = [part.split("_", 1)[0] for part in parts]
+        if len(set(axes)) != len(axes):
+            raise ValueError(
+                f"matrix.combination_channel_map.{key} must not contain duplicate axes."
+            )
+        if not isinstance(raw_channels, list):
+            raise ValueError(f"matrix.combination_channel_map.{key} must be a list.")
+        if key in normalized:
+            raise ValueError(f"matrix.combination_channel_map has duplicate key after normalization: {key}")
+        normalized[key] = [
+            _channel_value(ch, key, field_name="matrix.combination_channel_map")
+            for ch in raw_channels
+        ]
+    return normalized
+
+
+def normalize_direction_key(value: Any, *, name: str = "direction key") -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string.")
+    parts = [part.strip().upper() for part in value.split("+") if part.strip()]
+    if not parts:
+        raise ValueError(f"{name} must contain at least one direction.")
+    unknown = sorted(set(parts) - set(DIRECTION_KEYS))
+    if unknown:
+        raise ValueError(f"{name} has unknown directions: " + ", ".join(unknown))
+    if len(set(parts)) != len(parts):
+        raise ValueError(f"{name} must not contain duplicate directions.")
+    return "+".join(sorted(parts, key=_direction_sort_key))
+
+
+def _direction_sort_key(direction: str) -> tuple[int, int]:
+    axis = direction.split("_", 1)[0]
+    sign = direction.split("_", 1)[1]
+    axis_order = {"X": 0, "Y": 1, "Z": 2}
+    sign_order = {"POS": 0, "NEG": 1}
+    return axis_order[axis], sign_order[sign]
+
+
+def _channel_value(
+    value: Any,
+    direction: str,
+    *,
+    field_name: str = "matrix.direction_channel_map",
+) -> int:
     if not isinstance(value, int):
         raise ValueError(
-            f"matrix.direction_channel_map.{direction} channels must be integers."
+            f"{field_name}.{direction} channels must be integers."
         )
     if value < 0 or value > 127:
         raise ValueError(
-            f"matrix.direction_channel_map.{direction} channel must be in 0..127."
+            f"{field_name}.{direction} channel must be in 0..127."
         )
     return value
 

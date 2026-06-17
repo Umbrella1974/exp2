@@ -995,12 +995,11 @@ def _blocked_signature(trial_result: Any) -> tuple[Any, ...] | None:
     haptic = trial_result.haptic_feedback_state
     if not bool(getattr(haptic, "blocked_force_active", False)):
         return None
-    output = trial_result.frame_output
+    surface_key = _blocked_surface_key_from_result(trial_result)
     direction = _direction_from_result(trial_result)
     return (
         "blocked_directional",
-        _name(output.feedback_state.track_state),
-        _name(getattr(haptic, "primary_blocked_surface", None)),
+        surface_key,
         direction,
     )
 
@@ -1075,6 +1074,8 @@ def _continuous_details(trial_result: Any) -> dict[str, Any]:
     haptic = trial_result.haptic_feedback_state
     output = trial_result.frame_output
     blocked_info = getattr(output.feedback_state, "blocked_info", None)
+    blocked_surfaces = _blocked_surface_names_from_result(trial_result)
+    correction_directions = _opposite_directions(blocked_surfaces)
     return {
         "force_vector_task": _vec_to_list(getattr(haptic, "force_vector_task", None)),
         "force_magnitude": _optional_float(getattr(haptic, "force_magnitude", None)),
@@ -1083,18 +1084,61 @@ def _continuous_details(trial_result: Any) -> dict[str, Any]:
             _name(surface)
             for surface in getattr(blocked_info, "all_blocked_surfaces", ()) or ()
         ],
+        "blocked_surface_set": _direction_key(blocked_surfaces),
+        "correction_direction_set": _direction_key(correction_directions),
     }
 
 
 def _direction_from_result(trial_result: Any) -> str | None:
-    haptic = trial_result.haptic_feedback_state
-    surface = _name(getattr(haptic, "primary_blocked_surface", None))
-    if surface:
-        return _opposite_direction(surface)
-    track_state = _name(trial_result.frame_output.feedback_state.track_state)
-    if track_state.startswith("BLOCKED_"):
-        return _opposite_direction(track_state.removeprefix("BLOCKED_"))
-    return None
+    return _direction_key(_opposite_directions(_blocked_surface_names_from_result(trial_result)))
+
+
+def _blocked_surface_key_from_result(trial_result: Any) -> str | None:
+    return _direction_key(_blocked_surface_names_from_result(trial_result))
+
+
+def _blocked_surface_names_from_result(trial_result: Any) -> tuple[str, ...]:
+    output = trial_result.frame_output
+    feedback = output.feedback_state
+    blocked_info = getattr(feedback, "blocked_info", None)
+    names = [
+        _name(surface)
+        for surface in getattr(blocked_info, "all_blocked_surfaces", ()) or ()
+        if _name(surface)
+    ]
+    if not names:
+        haptic = trial_result.haptic_feedback_state
+        primary = _name(getattr(haptic, "primary_blocked_surface", None))
+        if primary:
+            names = [primary]
+    if not names:
+        track_state = _name(feedback.track_state)
+        if track_state.startswith("BLOCKED_"):
+            names = [track_state.removeprefix("BLOCKED_")]
+    return _canonical_direction_names(names)
+
+
+def _opposite_directions(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(direction for direction in (_opposite_direction(value) for value in values) if direction)
+
+
+def _direction_key(values: tuple[str, ...]) -> str | None:
+    if not values:
+        return None
+    return "+".join(values)
+
+
+def _canonical_direction_names(values: list[str]) -> tuple[str, ...]:
+    valid = {"X_POS", "X_NEG", "Y_POS", "Y_NEG", "Z_POS", "Z_NEG"}
+    unique = {str(value).upper() for value in values if str(value).upper() in valid}
+    return tuple(sorted(unique, key=_direction_sort_key))
+
+
+def _direction_sort_key(direction: str) -> tuple[int, int]:
+    axis, sign = direction.split("_", 1)
+    axis_order = {"X": 0, "Y": 1, "Z": 2}
+    sign_order = {"POS": 0, "NEG": 1}
+    return axis_order[axis], sign_order[sign]
 
 
 def _opposite_direction(value: str) -> str | None:
@@ -1125,7 +1169,9 @@ def _cue_message(cue_type: str, direction: str | None) -> str:
         "slip_track_blocked": "TRACK BLOCKED",
     }
     if cue_type == "blocked_directional":
-        return f"MOVE {direction}" if direction else "TRACK BLOCKED"
+        if not direction:
+            return "TRACK BLOCKED"
+        return f"MOVE {direction.replace('+', ' + ')}"
     return messages[cue_type]
 
 

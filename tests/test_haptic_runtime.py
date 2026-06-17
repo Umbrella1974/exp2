@@ -77,6 +77,118 @@ def test_matrix_direction_semantics_can_use_correction_direction() -> None:
     assert row["channel_list"] == "[4]"
 
 
+def test_matrix_combination_uses_exact_combination_mapping_not_union() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "direction_channel_map": {"X_POS": [1], "Y_POS": [2]},
+                "combination_channel_map": {"X_POS+Y_POS": [20, 21]},
+            },
+        },
+        worker_factory=worker,
+    )
+    runtime.start()
+
+    runtime.process_frame(
+        frame_index=1,
+        source_frame_id=None,
+        sample=_sample(),
+        trial_result=_trial_result(
+            blocked=True,
+            primary_surface="X_POS",
+            track_state="BLOCKED_X_POS",
+            blocked_surfaces=("Y_POS", "X_POS"),
+        ),
+        snapshot=None,
+    )
+
+    row = runtime.records_snapshot()[0]
+    assert row["blocked_surface_set"] == "X_POS+Y_POS"
+    assert row["correction_direction_set"] == "X_NEG+Y_NEG"
+    assert row["matrix_direction_used"] == "X_POS+Y_POS"
+    assert row["channel_list"] == "[20,21]"
+    assert row["send_status"] == "sent"
+    assert worker.instances[0].packets
+
+
+def test_matrix_combination_missing_mapping_skips_without_union_by_default() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "direction_channel_map": {"X_POS": [1], "Y_POS": [2]},
+            },
+        },
+        worker_factory=worker,
+    )
+    runtime.start()
+
+    runtime.process_frame(
+        frame_index=1,
+        source_frame_id=None,
+        sample=_sample(),
+        trial_result=_trial_result(
+            blocked=True,
+            primary_surface="X_POS",
+            track_state="BLOCKED_X_POS",
+            blocked_surfaces=("X_POS", "Y_POS"),
+        ),
+        snapshot=None,
+    )
+
+    row = runtime.records_snapshot()[0]
+    assert row["matrix_direction_used"] == "X_POS+Y_POS"
+    assert row["send_status"] == "not_sent"
+    assert row["not_sent_reason"] == "missing_combination_mapping"
+    assert worker.instances[0].packets == []
+
+
+def test_matrix_combination_can_use_correction_direction_semantics() -> None:
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "direction_semantics": "correction_direction",
+                "combination_channel_map": {"X_NEG+Y_NEG": [40]},
+            },
+        },
+        worker_factory=_FakeWorkerFactory(),
+    )
+    runtime.start()
+
+    runtime.process_frame(
+        frame_index=1,
+        source_frame_id=None,
+        sample=_sample(),
+        trial_result=_trial_result(
+            blocked=True,
+            primary_surface="X_POS",
+            track_state="BLOCKED_X_POS",
+            blocked_surfaces=("X_POS", "Y_POS"),
+        ),
+        snapshot=None,
+    )
+
+    row = runtime.records_snapshot()[0]
+    assert row["blocked_surface_set"] == "X_POS+Y_POS"
+    assert row["correction_direction_set"] == "X_NEG+Y_NEG"
+    assert row["matrix_direction_used"] == "X_NEG+Y_NEG"
+    assert row["matrix_direction_semantics"] == "correction_direction"
+    assert row["channel_list"] == "[40]"
+
+
 def test_missing_channel_mapping_is_skipped_without_send() -> None:
     worker = _FakeWorkerFactory()
     runtime = _runtime(
@@ -328,6 +440,7 @@ def _trial_result(
     slip_reason: str | None = None,
     events: tuple[str, ...] = (),
     block_center: Vec3 = Vec3(0.0, 0.0, 0.0),
+    blocked_surfaces: tuple[str, ...] = (),
 ) -> Any:
     return SimpleNamespace(
         time_since_prompt=0.1,
@@ -346,6 +459,7 @@ def _trial_result(
                 tracking_valid=True,
                 recovery_frame=False,
                 track_state=track_state,
+                blocked_info=SimpleNamespace(all_blocked_surfaces=blocked_surfaces),
             ),
             block_state=SimpleNamespace(center=block_center),
         ),

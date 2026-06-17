@@ -15,6 +15,7 @@ from pinch_threshold_calibration import (
     build_pinch_node_config_payload,
     build_pinch_threshold_calibration_payload,
     collect_pinch_distance_window,
+    load_pinch_threshold_config,
     load_pinch_threshold_json,
 )
 
@@ -108,6 +109,26 @@ def test_load_pinch_threshold_json_accepts_minimal_payload(tmp_path: Path) -> No
 
     assert payload["pinch_threshold"]["grab"] == pytest.approx(0.045)
     assert payload["pinch_threshold"]["release"] == pytest.approx(0.055)
+
+
+def test_load_pinch_threshold_config_accepts_nested_payload(tmp_path: Path) -> None:
+    path = tmp_path / "pinch_config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "pinch_threshold_calibration": {
+                    "on_fraction": 0.25,
+                    "off_fraction": 0.35,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_pinch_threshold_config(path)
+
+    assert config.on_fraction == pytest.approx(0.25)
+    assert config.off_fraction == pytest.approx(0.35)
 
 
 def _node_config() -> dict:

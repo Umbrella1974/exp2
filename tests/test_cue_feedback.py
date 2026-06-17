@@ -19,6 +19,7 @@ from cue_feedback import (
     write_cue_log_csv,
 )
 from data_models import (
+    BlockedInfo,
     BlockMotionState,
     BlockState,
     ContactState,
@@ -265,6 +266,54 @@ def test_blocked_surface_change_emits_state_signature_changed() -> None:
     assert second[0].direction == "Y_NEG"
 
 
+def test_blocked_combination_cue_uses_surface_set_not_primary_jitter() -> None:
+    runtime = _runtime()
+    first = runtime.process_frame(
+        frame_index=1,
+        source_frame_id=1,
+        sample=_Sample(1.0),
+        trial_result=_result(
+            blocked_force_active=True,
+            primary_surface=Surface.X_POS,
+            track_state=TrackState.BLOCKED_X_POS,
+            blocked_surfaces=(Surface.X_POS, Surface.Y_POS),
+        ),
+        snapshot=_Snapshot(pinch_center_task=[0.0, 0.0, 0.0]),
+    )
+    same_surface_set = runtime.process_frame(
+        frame_index=2,
+        source_frame_id=2,
+        sample=_Sample(1.1),
+        trial_result=_result(
+            blocked_force_active=True,
+            primary_surface=Surface.Y_POS,
+            track_state=TrackState.BLOCKED_Y_POS,
+            blocked_surfaces=(Surface.Y_POS, Surface.X_POS),
+        ),
+        snapshot=_Snapshot(pinch_center_task=[0.0, 0.0, 0.0]),
+    )
+    changed_surface_set = runtime.process_frame(
+        frame_index=3,
+        source_frame_id=3,
+        sample=_Sample(1.2),
+        trial_result=_result(
+            blocked_force_active=True,
+            primary_surface=Surface.X_POS,
+            track_state=TrackState.BLOCKED_X_POS,
+            blocked_surfaces=(Surface.X_POS,),
+        ),
+        snapshot=_Snapshot(pinch_center_task=[0.0, 0.0, 0.0]),
+    )
+    runtime.end_trial()
+
+    assert first[0].direction == "X_NEG+Y_NEG"
+    assert first[0].message == "MOVE X_NEG + Y_NEG"
+    assert first[0].details["blocked_surface_set"] == "X_POS+Y_POS"
+    assert same_surface_set == ()
+    assert changed_surface_set[0].trigger_reason == "state_signature_changed"
+    assert changed_surface_set[0].direction == "X_NEG"
+
+
 def test_rate_limit_counts_suppressed_candidate_without_log_row() -> None:
     runtime = _runtime(CueConfig(min_cue_interval_ms=1000.0))
 
@@ -465,6 +514,7 @@ def _result(
     slip_reason: SlipReason | None = None,
     blocked_force_active: bool = False,
     primary_surface: Surface | None = None,
+    blocked_surfaces: tuple[Surface, ...] = (),
     track_state: TrackState = TrackState.INSIDE_TRACK,
     events: tuple[_Event, ...] = (),
     trial_time: float = 0.0,
@@ -486,6 +536,17 @@ def _result(
                 stop_reason=stop_reason,
                 track_state=track_state,
                 detach_state=DetachState.NONE,
+                blocked_info=(
+                    BlockedInfo(
+                        primary_blocked_surface=primary_surface,
+                        primary_blocked_amount=0.1,
+                        blocked_distance=0.1,
+                        blocked_vector=Vec3(0.1, 0.1, 0.0),
+                        all_blocked_surfaces=blocked_surfaces,
+                    )
+                    if blocked_surfaces
+                    else None
+                ),
             ),
         ),
         haptic_feedback_state=HapticFeedbackState(

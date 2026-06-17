@@ -909,7 +909,14 @@ python run_live_integrated_session.py ^
       "Y_POS": [10, 11, 12],
       "Z_NEG": [],
       "Z_POS": []
-    }
+    },
+    "combination_channel_map": {
+      "X_POS+Y_POS": [20, 21, 22],
+      "X_POS+Y_NEG": [23, 24, 25],
+      "X_NEG+Y_POS": [26, 27, 28],
+      "X_NEG+Y_NEG": [29, 30, 31]
+    },
+    "missing_combination_policy": "skip"
   },
   "vibration": {
     "enabled": true,
@@ -926,7 +933,9 @@ python run_live_integrated_session.py ^
 }
 ```
 
-`matrix.direction_semantics` 默认是 `blocked_surface`，channel map 表示撞到哪一侧边界，例如 `BLOCKED_X_NEG -> X_NEG`。也可以改成 `correction_direction`，channel map 表示应该往哪个方向退回，例如 `BLOCKED_X_NEG -> X_POS`。haptic log 会同时保存 `primary_blocked_surface`、`correction_direction`、`matrix_direction_used` 和 `matrix_direction_semantics`。
+`matrix.direction_semantics` 默认是 `blocked_surface`，channel map 表示撞到哪一侧边界，例如 `BLOCKED_X_NEG -> X_NEG`。也可以改成 `correction_direction`，channel map 表示应该往哪个方向退回，例如 `BLOCKED_X_NEG -> X_POS`。haptic log 会同时保存 `primary_blocked_surface`、`correction_direction`、`blocked_surface_set`、`correction_direction_set`、`matrix_direction_used` 和 `matrix_direction_semantics`。
+
+单方向 blocked 继续查 `direction_channel_map`。多方向 blocked 会按 X/Y/Z 轴顺序规范化成组合 key，例如 `X_POS+Y_POS`，然后查 `combination_channel_map`。默认 `missing_combination_policy=skip`，组合缺失时不会把 `X_POS` 和 `Y_POS` 的通道相加，而是在 `haptic_command_log.csv` 中记录 `send_status=not_sent`、`not_sent_reason=missing_combination_mapping`。如需调试并集行为，可以显式设置 `missing_combination_policy=union_single_directions`，但正式实验建议为每个组合单独配置硬件通道。
 
 Matrix `feedback_mode=latched_once` 时，blocked start 或方向变化才发送一次 channel frame；blocked 持续且方向不变不重复发送。`continuous_resend` 会在 blocked active 期间按 `resend_interval_ms` 重发当前方向。blocked end、trial end、invalid、abort 只记录 `state_end`，不发送 `clear_all`、`stop_all` 或默认 zero-channel frame。
 
@@ -955,6 +964,35 @@ summary / session_meta / trial_config / trial_summary 会包含 `haptic_enabled`
 TODO: 当前 Matrix ESP32 parser 对 empty payload frame 可能不解析，且 HV507/latch 结构下电脑端不应假设 zero/empty frame 是可靠 hardware clear。如果未来需要硬件级 clear/stop，需要单独修改或确认 ESP32 parser、HV507 blanking、LE/BL 控制或硬件侧安全机制。
 
 如果 calibration quality 出来后你在 `Continue with this calibration? [y/N]` 里选择 no 或直接回车，runner 会重新进入四段 calibration，而不是退出整个流程。只有 calibration 采集失败后，在 `Retry calibration? [y/N]` 里选择 no，才会停止本次 run。
+
+Pinch distance threshold 标定默认不会自动运行。需要在 live integrated 命令里显式加：
+
+```powershell
+--calibrate-pinch-threshold
+```
+
+如果要修改 open/closed 距离之间的阈值比例，可以额外传 `--pinch-threshold-config path\to\pinch_threshold_config.json`。配置既支持平铺字段，也支持包一层 `pinch_threshold_calibration`：
+
+```json
+{
+  "pinch_threshold_calibration": {
+    "repeat_count": 3,
+    "sample_window_seconds": 1.0,
+    "min_valid_samples": 10,
+    "on_fraction": 0.25,
+    "off_fraction": 0.35,
+    "min_required_range_m": 0.015,
+    "max_repeat_spread_m": 0.03,
+    "require_tracker_valid": false
+  }
+}
+```
+
+计算公式是 `closed_distance + fraction * (open_distance - closed_distance)`。`on_fraction` 对应 pinch on/grab 阈值，`off_fraction` 对应 pinch off/release 阈值，必须满足 `0 < on_fraction < off_fraction < 1`。标定输出会写到 `session/pinch_threshold_calibration.json`，其中包含实际 `on_fraction/off_fraction` 和最终 `pinch_on_threshold_m/pinch_off_threshold_m`；`trial_config`、`summary`、`session_meta` 和 `trial_summary` 也会记录最终 effective threshold。若要直接复用固定阈值，可以传：
+
+```powershell
+--pinch-threshold-json path\to\pinch_threshold_calibration.json
+```
 
 如果一直没有发送端连接，或连接后一直没有有效 tracker，runner 不会无限等待；它会写 `out_dir/summary.json` 后退出。常见停止原因：
 
