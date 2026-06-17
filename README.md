@@ -939,6 +939,14 @@ python run_live_integrated_session.py ^
 
 Matrix `feedback_mode=latched_once` 时，blocked start 或方向变化才发送一次 channel frame；blocked 持续且方向不变不重复发送。`continuous_resend` 会在 blocked active 期间按 `resend_interval_ms` 重发当前方向。blocked end、trial end、invalid、abort 只记录 `state_end`，不发送 `clear_all`、`stop_all` 或默认 zero-channel frame。
 
+如果只想测试 Matrix ESP32 硬件链路，不依赖 MANUS/Vive、trial、地图或 blocked 状态，可以运行独立 smoke：
+
+```powershell
+python run_matrix_haptic_smoke.py --host 192.168.x.x --port 12345 --channels 1,2,3
+```
+
+脚本只会连接 Matrix ESP32、等待 `--startup-settle-seconds`，发送一次 channel list，写一个 JSON smoke log，然后退出。默认 log 写到 `data/haptic_smoke/matrix_haptic_smoke_<timestamp>.json`；也可以用 `--out data\haptic_smoke\smoke_01.json` 指定路径。这个入口适合先确认 ESP32 IP/端口、TCP parser、HV507 channel 映射是否工作，再进入正式 live trial。
+
 如果 `matrix.enabled=true` 且 `matrix.required=true`，程序会在 trial 开始前连接 Matrix ESP32，并等待 `startup_settle_seconds`。连接失败会明显停止在 trial 前，`run_stop_reason=matrix_haptic_connect_failed`，不会进入 trial。trial loop 中只提交 haptic command，不执行阻塞式 connect/send；队列有界，发送失败或队列替换写入 `session/haptic_command_log.csv`。
 
 Vibration Stage 1 只记录：
