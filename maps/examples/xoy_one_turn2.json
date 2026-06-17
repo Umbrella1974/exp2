@@ -1,9 +1,9 @@
 {
-  "template_id": "xoy_turn", 
+  "map_id": "xoy_turn", 
   "description": "Manual one-turn x-y corridor example.",
-  "coordinate_space": "template",
+  "coordinate_space": "map",
   "unit": "m",
-  "block_initial_center_template": [0.0, 0.0, 0.0],
+  "block_initial_center_task": [0.0, 0.0, 0.0],
   "block_size": [0.1, 0.1, 0.1],
   "track_boxes": [
     {
