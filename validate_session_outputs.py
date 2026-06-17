@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from cue_feedback import CUE_CSV_FIELDS
+from haptic_runtime import HAPTIC_CSV_FIELDS
 
 
 FINAL_DIAGNOSTIC_FIELDS = (
@@ -109,8 +110,24 @@ def validate_session_outputs(
         checked_files,
     )
 
-    _validate_required_summary_fields(summary, "summary.json", errors, warnings)
-    _validate_required_summary_fields(trial_summary, "trial_summary.json", errors, warnings)
+    trial_started = _any_true(
+        _dict_value(summary, "trial_controller_started"),
+        _dict_value(trial_summary, "trial_controller_started"),
+    )
+    _validate_required_summary_fields(
+        summary,
+        "summary.json",
+        errors,
+        warnings,
+        require_trial_fields=trial_started,
+    )
+    _validate_required_summary_fields(
+        trial_summary,
+        "trial_summary.json",
+        errors,
+        warnings,
+        require_trial_fields=trial_started,
+    )
     _validate_summary_consistency(summary, trial_summary, errors)
     _validate_termination_consistency(termination, summary, trial_summary, is_live_integrated, errors, warnings)
     _validate_identifier_consistency(
@@ -135,6 +152,17 @@ def validate_session_outputs(
         checked_files,
     )
     _validate_cue_artifacts(
+        session_path,
+        mode,
+        meta,
+        trial_config,
+        summary,
+        trial_summary,
+        errors,
+        warnings,
+        checked_files,
+    )
+    _validate_haptic_artifacts(
         session_path,
         mode,
         meta,
@@ -198,17 +226,25 @@ def _validate_required_summary_fields(
     label: str,
     errors: list[str],
     warnings: list[str],
+    *,
+    require_trial_fields: bool = True,
 ) -> None:
     if payload is None:
         return
     for field in ("trial_outcome", "end_reason", "termination_config"):
         if field not in payload or payload.get(field) in (None, ""):
-            errors.append(f"{label} is missing required field: {field}")
+            if field == "termination_config" or require_trial_fields:
+                errors.append(f"{label} is missing required field: {field}")
+            else:
+                warnings.append(f"{label} is missing pre-trial field: {field}")
     if "termination_config" in payload and not isinstance(payload.get("termination_config"), dict):
         errors.append(f"{label}.termination_config must be an object.")
     for field in FINAL_DIAGNOSTIC_FIELDS:
         if field not in payload:
-            errors.append(f"{label} is missing required field: {field}")
+            if require_trial_fields:
+                errors.append(f"{label} is missing required field: {field}")
+            else:
+                warnings.append(f"{label} is missing pre-trial diagnostic field: {field}")
         elif payload.get(field) is None:
             warnings.append(f"{label}.{field} is null.")
 
@@ -550,6 +586,158 @@ def _validate_cue_artifacts(
             if normalized != actual_type_counts:
                 errors.append(
                     "cue_type_counts does not match cue_log.csv: "
+                    f"{normalized!r} != {actual_type_counts!r}"
+                )
+
+
+def _validate_haptic_artifacts(
+    session_dir: Path,
+    mode: str | None,
+    meta: dict[str, Any] | None,
+    trial_config: dict[str, Any] | None,
+    summary: dict[str, Any] | None,
+    trial_summary: dict[str, Any] | None,
+    errors: list[str],
+    warnings: list[str],
+    checked_files: dict[str, str],
+) -> None:
+    if mode != "live_integrated_session":
+        return
+    payloads = (
+        ("session_meta.json", meta),
+        ("trial_config.json", trial_config),
+        ("summary.json", summary),
+        ("trial_summary.json", trial_summary),
+    )
+    haptic_aware = any(
+        isinstance(payload, dict)
+        and (
+            "haptic_enabled" in payload
+            or "effective_haptic_config" in payload
+            or "haptic_command_log_path" in payload
+        )
+        for _, payload in payloads
+    )
+    if not haptic_aware:
+        return
+
+    haptic_config_path = session_dir / "haptic_config.json"
+    checked_files["haptic_config.json"] = str(haptic_config_path)
+    haptic_config = _read_json_object(
+        haptic_config_path,
+        "haptic_config.json",
+        errors,
+        checked_files,
+    )
+    if haptic_config is None and not haptic_config_path.exists():
+        errors.append(f"haptic-aware live session is missing haptic_config.json: {haptic_config_path}")
+
+    for label, payload in payloads:
+        if payload is None:
+            continue
+        effective = payload.get("effective_haptic_config")
+        if effective is None:
+            continue
+        if not isinstance(effective, dict):
+            errors.append(f"{label}.effective_haptic_config must be an object.")
+        elif haptic_config is not None and effective != haptic_config:
+            errors.append(f"haptic_config.json disagrees with {label}.effective_haptic_config.")
+
+    if summary is not None and trial_summary is not None:
+        for field in (
+            "haptic_enabled",
+            "matrix_haptic_enabled",
+            "vibration_haptic_enabled",
+            "haptic_mode",
+            "haptic_count",
+            "haptic_type_counts",
+        ):
+            left = summary.get(field)
+            right = trial_summary.get(field)
+            if left not in (None, "") and right not in (None, "") and left != right:
+                errors.append(f"summary.json and trial_summary.json disagree on {field}.")
+
+    haptic_enabled = _any_true(
+        _dict_value(summary, "haptic_enabled"),
+        _dict_value(trial_summary, "haptic_enabled"),
+        _dict_value(meta, "haptic_enabled"),
+        _dict_value(trial_config, "haptic_enabled"),
+    )
+    if not haptic_enabled:
+        return
+
+    haptic_log_path = session_dir / "haptic_command_log.csv"
+    checked_files["haptic_command_log.csv"] = str(haptic_log_path)
+    if not haptic_log_path.exists():
+        errors.append(f"haptic is enabled but haptic_command_log.csv is missing: {haptic_log_path}")
+        return
+    try:
+        with haptic_log_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames or []
+            rows = list(reader)
+    except (OSError, csv.Error) as exc:
+        errors.append(f"haptic_command_log.csv could not be parsed: {exc}")
+        return
+
+    missing_fields = [field for field in HAPTIC_CSV_FIELDS if field not in fieldnames]
+    if missing_fields:
+        errors.append(
+            "haptic_command_log.csv is missing required fields: " + ", ".join(missing_fields)
+        )
+
+    expected_count = _first_nonempty(
+        _dict_value(summary, "haptic_count"),
+        _dict_value(trial_summary, "haptic_count"),
+    )
+    if expected_count not in (None, ""):
+        try:
+            count_value = int(expected_count)
+        except (TypeError, ValueError):
+            errors.append("haptic_count must be an integer.")
+        else:
+            if count_value != len(rows):
+                errors.append(
+                    f"haptic_count does not match haptic_command_log.csv rows: {count_value} != {len(rows)}"
+                )
+
+    actual_type_counts: dict[str, int] = {}
+    haptic_ids: list[str] = []
+    expected_trial_id = _first_nonempty(
+        _dict_value(summary, "trial_id"),
+        _dict_value(trial_summary, "trial_id"),
+        _dict_value(meta, "trial_id"),
+    )
+    for row in rows:
+        haptic_type = str(row.get("haptic_type", ""))
+        actual_type_counts[haptic_type] = actual_type_counts.get(haptic_type, 0) + 1
+        haptic_id = str(row.get("haptic_id", ""))
+        haptic_ids.append(haptic_id)
+        if not haptic_id:
+            errors.append("haptic_command_log.csv contains an empty haptic_id.")
+        if row.get("mode") not in ("live", None, ""):
+            errors.append(f"haptic_command_log.csv contains non-live haptic mode: {row.get('mode')!r}")
+        if row.get("is_live_haptic_timing") not in ("true", "True", True):
+            errors.append("haptic_command_log.csv live haptic rows must set is_live_haptic_timing=true.")
+        if expected_trial_id not in (None, "") and str(row.get("trial_id", "")) != str(expected_trial_id):
+            errors.append("haptic_command_log.csv trial_id is inconsistent with session trial_id.")
+            break
+    if len(haptic_ids) != len(set(haptic_ids)):
+        errors.append("haptic_command_log.csv haptic_id values must be unique.")
+
+    expected_type_counts = _first_nonempty(
+        _dict_value(summary, "haptic_type_counts"),
+        _dict_value(trial_summary, "haptic_type_counts"),
+    )
+    if isinstance(expected_type_counts, dict):
+        try:
+            normalized = {str(key): int(value) for key, value in expected_type_counts.items()}
+        except (TypeError, ValueError):
+            errors.append("haptic_type_counts values must be integers.")
+        else:
+            if normalized != actual_type_counts:
+                errors.append(
+                    "haptic_type_counts does not match haptic_command_log.csv: "
                     f"{normalized!r} != {actual_type_counts!r}"
                 )
 

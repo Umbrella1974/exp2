@@ -18,6 +18,7 @@ from run_live_integrated_session import (
     LiveIntegratedSessionConfig,
     run_live_integrated_session,
 )
+from haptic_config import haptic_config_from_dict
 from validate_session_outputs import validate_session_outputs
 
 
@@ -119,6 +120,42 @@ def test_cue_sink_none_writes_config_but_not_cue_log(tmp_path: Path) -> None:
     assert result.summary["cue_count"] == 0
     assert (session_dir / "cue_config.json").exists()
     assert not (session_dir / "cue_log.csv").exists()
+    assert validate_session_outputs(session_dir)["status"] == "PASS"
+
+
+def test_matrix_haptic_required_connect_failure_stops_before_trial(tmp_path: Path) -> None:
+    source = FakeLiveSource()
+    haptic_config = haptic_config_from_dict(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "required": True,
+                "host": "127.0.0.1",
+                "port": 1,
+                "connect_timeout_s": 0.01,
+                "startup_settle_seconds": 0.0,
+                "direction_channel_map": {"X_NEG": [1]},
+            },
+        }
+    )
+    config = _config(
+        tmp_path,
+        calibration_id="cal_haptic_fail_fast",
+        max_frames=1,
+        haptic_config=haptic_config,
+    )
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    session_dir = Path(result.summary["session_dir"])
+    assert result.summary["run_stop_reason"] == "matrix_haptic_connect_failed"
+    assert result.summary["trial_controller_started"] is False
+    assert result.summary["haptic_enabled"] is True
+    assert result.summary["matrix_haptic_enabled"] is True
+    assert result.summary["haptic_connect_error"]
+    assert (session_dir / "haptic_config.json").exists()
+    assert (session_dir / "haptic_command_log.csv").exists()
     assert validate_session_outputs(session_dir)["status"] == "PASS"
 
 
@@ -939,6 +976,7 @@ def _config(
     thumb_node: int = 4,
     index_node: int = 9,
     calibrate_pinch_threshold: bool = False,
+    haptic_config: Any | None = None,
 ) -> LiveIntegratedSessionConfig:
     return LiveIntegratedSessionConfig(
         map_config=map_path or _write_valid_map(tmp_path / "map.json"),
@@ -961,6 +999,7 @@ def _config(
         gui_fps=gui_fps,
         cue_sink=cue_sink,
         visual_profile=visual_profile,
+        haptic_config=haptic_config or runner.default_haptic_config(),
         termination_config=termination_config or runner.default_termination_config(),
         termination_config_path=termination_config_path,
         anchor_current_pinch_debug=anchor_current_pinch_debug,

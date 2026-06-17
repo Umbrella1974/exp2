@@ -783,7 +783,7 @@ python run_live_integrated_session.py ^
 
 ### Cue / Haptic Abstraction
 
-当前 cue 层只做非硬件提示，不接 ESP32、DRV2605、serial、UDP 或其他真实 haptic hardware。它观察现有 `TrialController` / `BlockController` 输出，不修改 contact、slip、blocked、detach 或 trial outcome 逻辑。
+cue 层只做非硬件提示；haptic Stage 1 是独立输出层。两者都观察现有 `TrialController` / `BlockController` 输出，不修改 contact、slip、blocked、detach 或 trial outcome 逻辑。cue priority 只影响 GUI/console 显示一个主要提示；haptic 不复用 cue priority，`matrix` 和 `vibration` 两个 target 可以同时生成 command。
 
 支持的 sink：
 
@@ -830,7 +830,7 @@ slip_track_blocked
 blocked_directional
 ```
 
-当 `TRACK_BLOCKED` 同时有 slip 和明确方向时，只生成 `blocked_directional`，避免同一状态产生两个 RT 起点。`primary_blocked_surface` 表示撞到的 task 边界，例如 `X_POS`；`direction` 表示建议修正方向，例如 `X_NEG`。第一版保留 `Z_POS / Z_NEG`，不翻译成 left/right/up/down。
+当 `TRACK_BLOCKED` 同时有 slip 和明确方向时，cue 显示层优先生成 `blocked_directional`，避免同一 GUI/console 状态产生两个 RT 起点。haptic 层不受这个显示优先级压制：matrix 仍可输出 blocked direction，vibration 也可按配置记录 slip。`primary_blocked_surface` 表示撞到的 task 边界，例如 `X_POS`；cue `direction` 表示建议修正方向，例如 `X_NEG`。第一版保留 `Z_POS / Z_NEG`，不翻译成 left/right/up/down。
 
 cue config 示例：
 
@@ -860,6 +860,99 @@ ack_monotonic_ms         第一版始终为空，没有硬件 acknowledgement
 GUI 的 `displayed_monotonic_ms` 表示一次 GUI refresh 已应用文本，受 `gui_fps` 量化影响；它不是物理屏幕扫描时间，也不证明受试者真正看到。当前不在线计算 behavioral RT。后续 RT analyzer 应联合 `cue_log.csv`、逐帧状态、events 和 timing diagnostics 离线计算。
 
 `experiment_visibility_feedback` 中物块消失/重现本身是视觉刺激，但 Stage 1 不把它写入 `cue_log.csv`，也不把它当作 behavioral RT 起点。如果以后需要分析 block visibility visual RT，应新增独立 visual-state render diagnostics，不要混入 cue command log。
+
+### Haptic TCP Stage 1
+
+Stage 1 只实现 Matrix / electrotactile ESP32 的 TCP packet 编码与非阻塞发送；vibration ESP32 协议仍未确定，本阶段只记录 vibration command，不连接、不编码、不发送。replay 默认 `haptic_enabled=false`，不会向真实硬件发送。
+
+Matrix ESP32 packet:
+
+```text
+MAGIC(AA 55 AA 55) + payload_length(1B) + payload(N<=128B) + checksum(1B)
+checksum = sum(payload) & 0xFF
+payload = HV507 channel list，每个 channel 必须是 0..127
+```
+
+live 使用 haptic config：
+
+```powershell
+python run_live_integrated_session.py ^
+  --map-config maps\examples\xoy_turn.json ^
+  --host 127.0.0.1 ^
+  --port 8888 ^
+  --out-dir data\live_integrated_session\haptic_01 ^
+  --haptic-config configs\haptic_matrix.json
+```
+
+示例配置：
+
+```json
+{
+  "enabled": true,
+  "matrix": {
+    "enabled": true,
+    "required": true,
+    "host": "192.168.x.x",
+    "port": 12345,
+    "connect_timeout_s": 3.0,
+    "send_timeout_s": 0.05,
+    "startup_settle_seconds": 7.0,
+    "max_queue_size": 8,
+    "latest_only": true,
+    "feedback_mode": "latched_once",
+    "resend_interval_ms": 100,
+    "direction_semantics": "blocked_surface",
+    "direction_channel_map": {
+      "X_NEG": [1, 2, 3],
+      "X_POS": [4, 5, 6],
+      "Y_NEG": [7, 8, 9],
+      "Y_POS": [10, 11, 12],
+      "Z_NEG": [],
+      "Z_POS": []
+    }
+  },
+  "vibration": {
+    "enabled": true,
+    "host": "",
+    "port": 12345,
+    "protocol": "pending",
+    "enable_contact": true,
+    "enable_release": true,
+    "enable_slip": true,
+    "enable_slip_pinch_insufficient": true,
+    "enable_slip_track_blocked": true,
+    "enable_slip_track_blocked_in_target_region": true
+  }
+}
+```
+
+`matrix.direction_semantics` 默认是 `blocked_surface`，channel map 表示撞到哪一侧边界，例如 `BLOCKED_X_NEG -> X_NEG`。也可以改成 `correction_direction`，channel map 表示应该往哪个方向退回，例如 `BLOCKED_X_NEG -> X_POS`。haptic log 会同时保存 `primary_blocked_surface`、`correction_direction`、`matrix_direction_used` 和 `matrix_direction_semantics`。
+
+Matrix `feedback_mode=latched_once` 时，blocked start 或方向变化才发送一次 channel frame；blocked 持续且方向不变不重复发送。`continuous_resend` 会在 blocked active 期间按 `resend_interval_ms` 重发当前方向。blocked end、trial end、invalid、abort 只记录 `state_end`，不发送 `clear_all`、`stop_all` 或默认 zero-channel frame。
+
+如果 `matrix.enabled=true` 且 `matrix.required=true`，程序会在 trial 开始前连接 Matrix ESP32，并等待 `startup_settle_seconds`。连接失败会明显停止在 trial 前，`run_stop_reason=matrix_haptic_connect_failed`，不会进入 trial。trial loop 中只提交 haptic command，不执行阻塞式 connect/send；队列有界，发送失败或队列替换写入 `session/haptic_command_log.csv`。
+
+Vibration Stage 1 只记录：
+
+```text
+contact_enter -> vibration one_shot, protocol_pending
+contact_exit  -> vibration one_shot, protocol_pending
+slip_start    -> vibration state_start, protocol_pending
+slip_end      -> vibration state_end, protocol_pending
+```
+
+Slip 开关是分层的：`enable_slip=false` 关闭所有 slip vibration；`PINCH_INSUFFICIENT` 由 `enable_slip_pinch_insufficient` 控制；`TRACK_BLOCKED` 在 target_region 外由 `enable_slip_track_blocked` 控制，在 map 定义的 `target_region` 内由 `enable_slip_track_blocked_in_target_region` 控制。target 判断复用 `trial_config.target_region` 的 box，不新造距离阈值。
+
+live haptic enabled 时会写：
+
+```text
+session/haptic_config.json
+session/haptic_command_log.csv
+```
+
+summary / session_meta / trial_config / trial_summary 会包含 `haptic_enabled`、`matrix_haptic_enabled`、`vibration_haptic_enabled`、`haptic_mode`、`haptic_count`、`haptic_type_counts`、`effective_haptic_config` 和 `haptic_command_log_path`。`sent_monotonic_ms` 只是电脑端 socket send 完成时间，不代表真实硬件物理 onset 或受试者感知时间。
+
+TODO: 当前 Matrix ESP32 parser 对 empty payload frame 可能不解析，且 HV507/latch 结构下电脑端不应假设 zero/empty frame 是可靠 hardware clear。如果未来需要硬件级 clear/stop，需要单独修改或确认 ESP32 parser、HV507 blanking、LE/BL 控制或硬件侧安全机制。
 
 如果 calibration quality 出来后你在 `Continue with this calibration? [y/N]` 里选择 no 或直接回车，runner 会重新进入四段 calibration，而不是退出整个流程。只有 calibration 采集失败后，在 `Retry calibration? [y/N]` 里选择 no，才会停止本次 run。
 
@@ -905,6 +998,8 @@ out_dir/session/haptic.csv
 out_dir/session/termination_config.json
 out_dir/session/cue_config.json              新 live session 始终写入
 out_dir/session/cue_log.csv                 仅 cue sink 非 none 时写入
+out_dir/session/haptic_config.json          新 live session 始终写入
+out_dir/session/haptic_command_log.csv      仅 haptic enabled 时写入
 out_dir/session/trial_summary.json
 out_dir/session/timing_diagnostics.csv      live integrated 默认始终写入
 out_dir/session/gui_diagnostics.csv       仅 --gui 时，优先写入这里
@@ -988,9 +1083,9 @@ LatestFrameBuffer
   -> DashboardSnapshot callback
 ```
 
-`LiveTrialRunner` 不做 calibration、不验证地图、不画 GUI、不发送真实 haptic hardware。它只接收已经准备好的 `TaskCoordinateSystem`、`TrackRegion`、`EngineConfig`、`SessionRecorder` 和 latest-frame buffer，然后按固定频率推进现有 `TrialController`。这次重构不改 `BlockController` / `TrialController` 的 contact、slip、blocked 语义。
+`LiveTrialRunner` 不做 calibration、不验证地图、不画 GUI。它只接收已经准备好的 `TaskCoordinateSystem`、`TrackRegion`、`EngineConfig`、`SessionRecorder`、latest-frame buffer，以及可选的非阻塞 haptic runtime，然后按固定频率推进现有 `TrialController`。这次重构不改 `BlockController` / `TrialController` 的 contact、slip、blocked 语义。
 
-replay/live debug GUI 已经通过 `snapshot_callback(snapshot)` 订阅这层输出，显示层不需要直接调用 `TrialController`。如果 callback 抛异常，runner 会继续运行，并在 summary 中记录 `callback_error_count`、`mean_callback_latency_ms`、`max_callback_latency_ms` 和 warning。真实 haptic hardware 以后应通过独立 sink 接入；当前 integrated session 仍写逻辑 haptic 状态，但 `haptic_hardware_enabled=false`。
+replay/live debug GUI 已经通过 `snapshot_callback(snapshot)` 订阅这层输出，显示层不需要直接调用 `TrialController`。如果 callback 抛异常，runner 会继续运行，并在 summary 中记录 `callback_error_count`、`mean_callback_latency_ms`、`max_callback_latency_ms` 和 warning。Stage 1 Matrix haptic 通过独立 runtime 接入；trial loop 只提交 command，不在 loop 内执行阻塞式 TCP connect/send。
 
 `run_live_integrated_session.py` 的输出仍保持旧字段为主，同时会额外写：
 
@@ -1247,7 +1342,7 @@ python analyze_timing.py --session-dir data\live_integrated_session\debug_01\ses
 
 默认输出 `session/timing_analysis_summary.json` 并向终端打印 JSON。已有输出不会被覆盖，除非传 `--overwrite`；也可以用 `--out` 指定其他路径。summary 包含 median / p95 / max 延迟、各 phase transport 统计、published / consumed / processed / overwritten 计数、`max_no_frame_gap_ms` 和 operator command 到 stop 的延迟。
 
-timing collector 在控制 loop 和 GUI render 中只更新线程安全内存，不做逐帧文件 I/O，run 结束后一次写 CSV。代价是进程硬崩溃时 timing log 可能丢失。本阶段只做 system timing diagnostics，并记录模拟 cue command；不在线计算受试者 behavioral reaction time。真实 haptic hardware sink 和 behavioral RT analyzer 仍是后续独立阶段。
+timing collector 在控制 loop 和 GUI render 中只更新线程安全内存，不做逐帧文件 I/O，run 结束后一次写 CSV。代价是进程硬崩溃时 timing log 可能丢失。本阶段只做 system timing diagnostics，并记录 cue / haptic command；不在线计算受试者 behavioral reaction time。Matrix haptic 的 `sent_monotonic_ms` 只是电脑端发送完成时间，behavioral RT analyzer 仍是后续独立阶段。
 
 ## `analyze_session.py`
 
@@ -1561,7 +1656,7 @@ large_delta
 
 离线 replay 中如果前几帧在 trial start time 之前，`trial_time` 可能为负数。这通常表示 pre-roll 数据，不是状态机错误。
 
-`haptic.csv` 记录现有状态机产生的逐帧逻辑 haptic 状态，不代表真实硬件已经发送或被受试者感知。`cue_log.csv` 记录通过 cue 配置和限流后进入 sink 的命令级提示；它适合检查 contact/slip/blocked 提示语义，但当前也不能直接当作 behavioral RT 结果。
+`haptic.csv` 记录现有状态机产生的逐帧逻辑 haptic 状态，不代表真实硬件已经发送或被受试者感知。`haptic_command_log.csv` 记录 Stage 1 haptic command 与 Matrix TCP 发送状态；`cue_log.csv` 记录通过 cue 配置和限流后进入 sink 的命令级提示。它们适合检查 contact/slip/blocked 提示语义，但不能直接当作 behavioral RT 结果。
 
 ## 怎么看结果
 
@@ -1914,7 +2009,7 @@ pinch_release_threshold = 0.12
 ## 当前限制
 
 - 现有 GUI 是 replay/live debug display，不是正式 experiment lifecycle GUI；实验员和受试者仍共用一个窗口，也没有 Stop / Abort / Pause / Resume 的完整界面控制。
-- 当前没有真实触觉硬件控制。`haptic.csv` 是逻辑状态，`cue_log.csv` 是非硬件 cue command 记录；还没有硬件 acknowledgement 或 behavioral RT analyzer。
+- 当前只有 Matrix / electrotactile ESP32 的 Stage 1 TCP 输出；vibration 仍是 protocol pending/logging。`haptic.csv` 是逻辑状态，`haptic_command_log.csv` 是 command/发送记录；还没有硬件 acknowledgement 或 behavioral RT analyzer。
 - `run_live_integrated_session.py` 是单次 trial 的连续标定 + trial 调试流程，仍标记 `is_formal_experiment=false`；target 进入只做诊断，trial 主要由实验员按 `e` 完成。
 - 当前不直接依赖 MANUS/Vive SDK，而是接收 `manus_vive_com` 发送的 combined JSON；也没有完整 MANUS/Vive rotation fusion。
 - 没有正式在线 calibration GUI；当前只有命令行版 live table-line calibration 和 integrated runner。

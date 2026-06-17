@@ -23,6 +23,7 @@ from cue_config import CueConfig, default_cue_config, load_cue_config
 from cue_feedback import CUE_SINK_CHOICES, CueRuntime, CueSinkConfig
 from data_models import Box3D, TrackRegion, Vec3
 from debug_view_model import DebugSceneView, scene_view_from_trial_config
+from haptic_runtime import disabled_haptic_summary
 from latest_frame_buffer import LatestFrameBuffer
 from latest_snapshot_store import LatestSnapshotStore
 from live_raw_stream import LiveRawFrame
@@ -281,6 +282,7 @@ def run_replay_debug(
             "requested_cue_config_path": (
                 str(config.cue_config_path) if config.cue_config_path is not None else None
             ),
+            **disabled_haptic_summary(),
             **adapter_config_payload,
             **pinch_threshold_summary,
             **resolve_visual_profile(

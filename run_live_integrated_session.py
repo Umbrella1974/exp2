@@ -28,6 +28,8 @@ from cue_config import CueConfig, default_cue_config, load_cue_config
 from cue_feedback import CUE_SINK_CHOICES, CueRuntime, CueSinkConfig
 from dashboard_snapshot import build_compact_status_line
 from device_frame_models import DeviceAdapterConfig
+from haptic_config import HapticConfig, default_haptic_config, load_haptic_config
+from haptic_runtime import HapticRuntime, HapticStartupError, disabled_haptic_summary
 from latest_frame_buffer import LatestFrameBuffer, LatestFramePump
 from live_raw_stream import LiveRawFrame, LiveRawStreamServer
 from live_session_state import LiveSessionPhase, LiveSessionStatus
@@ -115,6 +117,8 @@ class LiveIntegratedSessionConfig:
     cue_sink: str = "logging"
     cue_config: CueConfig = field(default_factory=default_cue_config)
     cue_config_path: Path | None = None
+    haptic_config: HapticConfig = field(default_factory=default_haptic_config)
+    haptic_config_path: Path | None = None
     visual_profile: str = "debug_all"
     status_panel: str = "auto"
     show_axes: str = "auto"
@@ -234,6 +238,9 @@ def run_live_integrated_session(
     gui_requested_stop = False
     cue_runtime: CueRuntime | None = None
     cue_log_path: Path | None = None
+    haptic_runtime: HapticRuntime | None = None
+    haptic_log_path: Path | None = None
+    haptic_path_written: Path | None = None
     pinch_threshold_calibration_payload: dict[str, Any] | None = None
     pinch_threshold_calibration_path: Path | None = None
     pinch_threshold_summary = _configured_pinch_threshold_summary(config)
@@ -423,6 +430,7 @@ def run_live_integrated_session(
             _write_json(pinch_threshold_calibration_path, pinch_threshold_calibration_payload)
         _write_json(session_dir / "termination_config.json", config.termination_config.to_dict())
         _write_json(session_dir / "cue_config.json", config.cue_config.to_dict())
+        _write_json(session_dir / "haptic_config.json", config.haptic_config.to_dict())
         cue_log_path = session_dir / "cue_log.csv"
         cue_runtime = CueRuntime(
             trial_id=config.trial_id,
@@ -433,6 +441,27 @@ def run_live_integrated_session(
                 is_live_cue_timing=True,
             ),
         )
+        haptic_log_path = session_dir / "haptic_command_log.csv"
+        haptic_runtime = HapticRuntime(
+            trial_id=config.trial_id,
+            haptic_config=config.haptic_config,
+            trial_config=trial_config,
+            mode="live",
+            is_live_haptic_timing=True,
+        )
+        try:
+            haptic_runtime.start()
+        except HapticStartupError as exc:
+            set_status(
+                LiveSessionPhase.READY_FOR_TRIAL,
+                "Matrix haptic connection failed before trial.",
+                map_id=map_config.map_id,
+            )
+            raise _SessionAbort(
+                run_stop_reason="matrix_haptic_connect_failed",
+                phase_at_stop=LiveSessionPhase.READY_FOR_TRIAL.name,
+                message=str(exc),
+            ) from exc
         set_status(LiveSessionPhase.READY_FOR_TRIAL, "Press Enter to start trial.", map_id=map_config.map_id)
         _prompt(input_fn, "Press Enter to start trial...")
         set_status(LiveSessionPhase.TRIAL_RUNNING, "Trial running.", map_id=map_config.map_id)
@@ -475,6 +504,8 @@ def run_live_integrated_session(
             timing_diagnostics=timing_diagnostics,
             cue_runtime=cue_runtime,
             cue_log_path=str(cue_log_path),
+            haptic_runtime=haptic_runtime,
+            haptic_log_path=str(haptic_log_path),
         )
         if gui_snapshot_store is not None:
             live_trial_result = _run_live_trial_with_gui(
@@ -563,6 +594,13 @@ def run_live_integrated_session(
                     cue_path_written = cue_runtime.write_log(cue_log_path)
                 except Exception as exc:
                     errors.append(f"cue log write failed: {exc}")
+        if haptic_runtime is not None:
+            haptic_runtime.end_session()
+            if haptic_log_path is not None and haptic_runtime.haptic_enabled:
+                try:
+                    haptic_path_written = haptic_runtime.write_log(haptic_log_path)
+                except Exception as exc:
+                    errors.append(f"haptic command log write failed: {exc}")
         if session_recorder is not None:
             try:
                 timing_path_written = timing_diagnostics.write_csv(timing_diagnostics_path)
@@ -607,10 +645,14 @@ def run_live_integrated_session(
         )
         if cue_runtime is not None:
             summary.update(cue_runtime.summary(cue_log_path=cue_path_written))
+        if haptic_runtime is not None:
+            summary.update(haptic_runtime.summary(haptic_log_path=haptic_path_written))
         if trial_runner_summary:
             _merge_live_trial_runner_summary(summary, trial_runner_summary)
             if cue_runtime is not None:
                 summary.update(cue_runtime.summary(cue_log_path=cue_path_written))
+            if haptic_runtime is not None:
+                summary.update(haptic_runtime.summary(haptic_log_path=haptic_path_written))
         if session_recorder is not None:
             try:
                 summary["session_finalized"] = True
@@ -1037,6 +1079,20 @@ def _pinch_threshold_request_payload(config: LiveIntegratedSessionConfig) -> dic
     }
 
 
+def _haptic_settings_payload(config: LiveIntegratedSessionConfig) -> dict[str, Any]:
+    return {
+        "haptic_enabled": config.haptic_config.enabled,
+        "matrix_haptic_enabled": config.haptic_config.matrix_enabled,
+        "vibration_haptic_enabled": config.haptic_config.vibration_enabled,
+        "haptic_mode": "live",
+        "is_live_haptic_timing": True,
+        "effective_haptic_config": config.haptic_config.to_dict(),
+        "requested_haptic_config_path": (
+            str(config.haptic_config_path) if config.haptic_config_path is not None else None
+        ),
+    }
+
+
 def _trial_config_payload(
     config: LiveIntegratedSessionConfig,
     map_config: MapConfig,
@@ -1077,7 +1133,8 @@ def _trial_config_payload(
             "timing_enabled": True,
             "timing_mode": "live",
             "timing_is_live_latency": True,
-            "haptic_hardware_enabled": False,
+            "haptic_hardware_enabled": config.haptic_config.matrix_enabled,
+            **_haptic_settings_payload(config),
             "cue_sink": config.cue_sink,
             "cue_enabled": config.cue_sink != "none",
             "cue_mode": "live",
@@ -1129,7 +1186,8 @@ def _session_meta(
         "map_id": map_config.map_id,
         "scene_type": "map_config",
         "map_anchor_mode": map_anchor["mode"],
-        "haptic_hardware_enabled": False,
+        "haptic_hardware_enabled": config.haptic_config.matrix_enabled,
+        **_haptic_settings_payload(config),
         "pinch_position_mode": config.pinch_position_mode,
         "termination_config": config.termination_config.to_dict(),
         "termination_config_path": (
@@ -1236,6 +1294,8 @@ def _build_summary(
         "valid_tracker_timeout_seconds": config.valid_tracker_timeout_seconds,
         "valid_pinch_timeout_seconds": config.valid_pinch_timeout_seconds,
         "no_frame_timeout_seconds": config.no_frame_timeout_seconds,
+        **disabled_haptic_summary(),
+        **_haptic_settings_payload(config),
         "cue_enabled": config.cue_sink != "none",
         "cue_sink": config.cue_sink,
         "cue_mode": "live",
@@ -1576,7 +1636,7 @@ def _live_trial_runner_config(config: LiveIntegratedSessionConfig) -> LiveTrialR
         manual_completion_enabled=config.termination_config.manual_completion_enabled,
         timeout_enabled=config.termination_config.timeout_enabled,
         detach_limit_enabled=config.termination_config.detach_limit_enabled,
-        haptic_hardware_enabled=False,
+        haptic_hardware_enabled=config.haptic_config.matrix_enabled,
     )
 
 
@@ -1790,6 +1850,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--gui-fps", default=30.0, type=float)
     parser.add_argument("--cue-sink", choices=CUE_SINK_CHOICES, default="logging")
     parser.add_argument("--cue-config", default=None, help="JSON/YAML cue generation config.")
+    parser.add_argument("--haptic-config", default=None, help="JSON/YAML Stage 1 haptic config.")
     parser.add_argument("--visual-profile", choices=VISUAL_PROFILE_CHOICES, default="debug_all")
     parser.add_argument("--status-panel", choices=DISPLAY_CONTROL_CHOICES, default="auto")
     parser.add_argument("--show-axes", choices=DISPLAY_CONTROL_CHOICES, default="auto")
@@ -1852,6 +1913,8 @@ def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
     termination = load_termination_config(termination_path)
     cue_config_path = Path(args.cue_config) if args.cue_config is not None else None
     cue_config = load_cue_config(cue_config_path)
+    haptic_config_path = Path(args.haptic_config) if args.haptic_config is not None else None
+    haptic_config = load_haptic_config(haptic_config_path)
     pinch_threshold_config_path = (
         Path(args.pinch_threshold_config) if args.pinch_threshold_config is not None else None
     )
@@ -1908,6 +1971,8 @@ def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
         cue_sink=args.cue_sink,
         cue_config=cue_config,
         cue_config_path=cue_config_path,
+        haptic_config=haptic_config,
+        haptic_config_path=haptic_config_path,
         visual_profile=args.visual_profile,
         status_panel=args.status_panel,
         show_axes=args.show_axes,

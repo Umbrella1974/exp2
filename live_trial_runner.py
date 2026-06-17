@@ -2,8 +2,8 @@
 
 LiveTrialRunner owns only the realtime trial loop:
 latest raw frame -> parser -> adapter -> TrialController -> session recorder
--> display snapshot. It does not collect calibration, validate maps, draw GUI,
-or send haptic hardware commands.
+-> display snapshot. It does not collect calibration, validate maps, or draw GUI.
+Optional haptic output is submitted through a non-blocking runtime.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from cue_feedback import CueRuntime
 from dashboard_snapshot import DashboardSnapshot, build_dashboard_snapshot
 from data_models import Vec3
 from device_frame_models import DeviceAdapterConfig
+from haptic_runtime import HapticRuntime, disabled_haptic_summary
 from manus_vive_adapter import ManusViveExperimentAdapter
 from raw_manus_vive_parser import parse_raw_manus_vive_frame
 from timing_diagnostics import TimingDiagnostics
@@ -121,6 +122,8 @@ class LiveTrialRunner:
         timing_diagnostics: TimingDiagnostics | None = None,
         cue_runtime: CueRuntime | None = None,
         cue_log_path: str | None = None,
+        haptic_runtime: HapticRuntime | None = None,
+        haptic_log_path: str | None = None,
     ) -> None:
         if config.control_rate_hz <= 0.0:
             raise ValueError("control_rate_hz must be > 0.")
@@ -153,6 +156,8 @@ class LiveTrialRunner:
         self.timing_diagnostics = timing_diagnostics
         self.cue_runtime = cue_runtime
         self.cue_log_path = cue_log_path
+        self.haptic_runtime = haptic_runtime
+        self.haptic_log_path = haptic_log_path
 
         self.adapter_config = DeviceAdapterConfig(
             skeleton_index=config.skeleton_index,
@@ -261,6 +266,8 @@ class LiveTrialRunner:
         self._set_outcome_for_stop(reason, trial_outcome=trial_outcome, end_reason=end_reason)
         if self.cue_runtime is not None:
             self.cue_runtime.end_trial()
+        if self.haptic_runtime is not None:
+            self.haptic_runtime.end_trial(reason=reason)
 
     def step_once(self) -> DashboardSnapshot | None:
         """Process the latest available frame once.
@@ -290,6 +297,8 @@ class LiveTrialRunner:
         if not processed["parse_ok"] or not processed["adapter_ok"] or processed["sample"] is None:
             if self.cue_runtime is not None:
                 self.cue_runtime.handle_input_error("invalid_before_render")
+            if self.haptic_runtime is not None:
+                self.haptic_runtime.handle_input_error("invalid_before_haptic")
             return None
 
         sample = processed["sample"]
@@ -343,6 +352,15 @@ class LiveTrialRunner:
         )
         if self.cue_runtime is not None:
             self.cue_runtime.process_frame(
+                frame_index=live_frame.frame_index,
+                source_frame_id=getattr(processed["device_frame"], "source_frame_id", None),
+                sample=sample,
+                trial_result=result,
+                snapshot=snapshot,
+                terminal_frame=terminal_state or reaches_max_frames,
+            )
+        if self.haptic_runtime is not None:
+            self.haptic_runtime.process_frame(
                 frame_index=live_frame.frame_index,
                 source_frame_id=getattr(processed["device_frame"], "source_frame_id", None),
                 sample=sample,
@@ -432,6 +450,8 @@ class LiveTrialRunner:
         self._set_outcome_for_stop(self._run_stop_reason)
         if self.cue_runtime is not None:
             self.cue_runtime.end_trial()
+        if self.haptic_runtime is not None:
+            self.haptic_runtime.end_trial(reason=self._run_stop_reason)
         summary = self.build_summary()
         return LiveTrialRunnerResult(
             stats=self.stats_snapshot(),
@@ -484,6 +504,13 @@ class LiveTrialRunner:
             for warning in self.cue_runtime.warnings:
                 if warning not in payload["warnings"]:
                     payload["warnings"].append(warning)
+        if self.haptic_runtime is not None:
+            payload.update(self.haptic_runtime.summary(haptic_log_path=self.haptic_log_path))
+            for warning in self.haptic_runtime.warnings:
+                if warning not in payload["warnings"]:
+                    payload["warnings"].append(warning)
+        else:
+            payload.update(disabled_haptic_summary())
         return payload
 
     def stats_snapshot(self) -> LiveTrialRunnerStats:
