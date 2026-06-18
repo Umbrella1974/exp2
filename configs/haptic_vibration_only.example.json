@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "matrix": {
-    "enabled": true,
+    "enabled": false,
     "transport": "tcp_magic_v1",
     "required": true,
     "host": "192.168.1.9",

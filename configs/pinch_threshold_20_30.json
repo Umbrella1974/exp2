@@ -1,0 +1,12 @@
+{
+  "pinch_threshold_calibration": {
+    "repeat_count": 3,
+    "sample_window_seconds": 1.0,
+    "min_valid_samples": 10,
+    "on_fraction": 0.20,
+    "off_fraction": 0.30,
+    "min_required_range_m": 0.015,
+    "max_repeat_spread_m": 0.03,
+    "require_tracker_valid": false
+  }
+}
