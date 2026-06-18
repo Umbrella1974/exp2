@@ -452,13 +452,23 @@ def run_live_integrated_session(
         try:
             haptic_runtime.start()
         except HapticStartupError as exc:
+            target_device = getattr(exc, "target_device", "haptic")
+            if target_device == "matrix":
+                run_stop_reason_for_haptic = "matrix_haptic_connect_failed"
+                status_message = "Matrix haptic connection failed before trial."
+            elif target_device == "vibration":
+                run_stop_reason_for_haptic = "vibration_haptic_connect_failed"
+                status_message = "Vibration haptic connection failed before trial."
+            else:
+                run_stop_reason_for_haptic = "haptic_connect_failed"
+                status_message = "Haptic connection failed before trial."
             set_status(
                 LiveSessionPhase.READY_FOR_TRIAL,
-                "Matrix haptic connection failed before trial.",
+                status_message,
                 map_id=map_config.map_id,
             )
             raise _SessionAbort(
-                run_stop_reason="matrix_haptic_connect_failed",
+                run_stop_reason=run_stop_reason_for_haptic,
                 phase_at_stop=LiveSessionPhase.READY_FOR_TRIAL.name,
                 message=str(exc),
             ) from exc
@@ -1084,6 +1094,12 @@ def _haptic_settings_payload(config: LiveIntegratedSessionConfig) -> dict[str, A
         "haptic_enabled": config.haptic_config.enabled,
         "matrix_haptic_enabled": config.haptic_config.matrix_enabled,
         "vibration_haptic_enabled": config.haptic_config.vibration_enabled,
+        "matrix_haptic_transport": config.haptic_config.matrix.transport,
+        "vibration_haptic_transport": config.haptic_config.vibration.transport,
+        "matrix_haptic_startup_connected": None,
+        "vibration_haptic_startup_connected": None,
+        "matrix_haptic_connect_error": None,
+        "vibration_haptic_connect_error": None,
         "haptic_mode": "live",
         "is_live_haptic_timing": True,
         "effective_haptic_config": config.haptic_config.to_dict(),
@@ -1091,6 +1107,12 @@ def _haptic_settings_payload(config: LiveIntegratedSessionConfig) -> dict[str, A
             str(config.haptic_config_path) if config.haptic_config_path is not None else None
         ),
     }
+
+
+def _any_haptic_hardware_enabled(config: LiveIntegratedSessionConfig) -> bool:
+    return bool(
+        config.haptic_config.matrix_enabled or config.haptic_config.vibration_enabled
+    )
 
 
 def _trial_config_payload(
@@ -1133,7 +1155,7 @@ def _trial_config_payload(
             "timing_enabled": True,
             "timing_mode": "live",
             "timing_is_live_latency": True,
-            "haptic_hardware_enabled": config.haptic_config.matrix_enabled,
+            "haptic_hardware_enabled": _any_haptic_hardware_enabled(config),
             **_haptic_settings_payload(config),
             "cue_sink": config.cue_sink,
             "cue_enabled": config.cue_sink != "none",
@@ -1186,7 +1208,7 @@ def _session_meta(
         "map_id": map_config.map_id,
         "scene_type": "map_config",
         "map_anchor_mode": map_anchor["mode"],
-        "haptic_hardware_enabled": config.haptic_config.matrix_enabled,
+        "haptic_hardware_enabled": _any_haptic_hardware_enabled(config),
         **_haptic_settings_payload(config),
         "pinch_position_mode": config.pinch_position_mode,
         "termination_config": config.termination_config.to_dict(),
@@ -1636,7 +1658,7 @@ def _live_trial_runner_config(config: LiveIntegratedSessionConfig) -> LiveTrialR
         manual_completion_enabled=config.termination_config.manual_completion_enabled,
         timeout_enabled=config.termination_config.timeout_enabled,
         detach_limit_enabled=config.termination_config.detach_limit_enabled,
-        haptic_hardware_enabled=config.haptic_config.matrix_enabled,
+        haptic_hardware_enabled=_any_haptic_hardware_enabled(config),
     )
 
 

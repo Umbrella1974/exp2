@@ -12,9 +12,17 @@ from typing import Any
 DIRECTION_KEYS = ("X_NEG", "X_POS", "Y_NEG", "Y_POS", "Z_NEG", "Z_POS")
 AXIS_KEYS = ("X", "Y", "Z")
 MATRIX_FEEDBACK_MODES = ("latched_once", "continuous_resend")
+MATRIX_TRANSPORTS = ("tcp_magic_v1", "disabled")
 MATRIX_DIRECTION_SEMANTICS = ("blocked_surface", "correction_direction")
 MATRIX_MISSING_COMBINATION_POLICIES = ("skip", "union_single_directions")
-VIBRATION_PROTOCOLS = ("pending",)
+VIBRATION_TRANSPORTS = ("tcp_line_int_v1", "disabled")
+VIBRATION_COMMAND_LABELS = ("contact_enter", "contact_exit", "slip_start", "slip_end")
+DEFAULT_VIBRATION_COMMAND_MAP = {
+    "contact_enter": 1,
+    "contact_exit": 2,
+    "slip_start": 3,
+    "slip_end": 4,
+}
 
 
 @dataclass(frozen=True)
@@ -22,6 +30,7 @@ class MatrixHapticConfig:
     """Configuration for the Matrix/electrotactile ESP32 target."""
 
     enabled: bool = False
+    transport: str = "tcp_magic_v1"
     required: bool = True
     host: str = ""
     port: int = 12345
@@ -43,6 +52,12 @@ class MatrixHapticConfig:
     def __post_init__(self) -> None:
         _bool_value(self.enabled, "matrix.enabled")
         _bool_value(self.required, "matrix.required")
+        if self.transport not in MATRIX_TRANSPORTS:
+            raise ValueError(
+                "matrix.transport must be one of: " + ", ".join(MATRIX_TRANSPORTS)
+            )
+        if self.enabled and self.transport == "disabled":
+            raise ValueError("matrix.transport cannot be disabled when matrix.enabled=true.")
         if self.enabled and not str(self.host).strip():
             raise ValueError("matrix.host is required when matrix.enabled=true.")
         object.__setattr__(self, "port", _port_value(self.port, "matrix.port"))
@@ -112,12 +127,22 @@ class MatrixHapticConfig:
 
 @dataclass(frozen=True)
 class VibrationHapticConfig:
-    """Configuration for the reserved vibration ESP32 target."""
+    """Configuration for the vibration ESP32 target."""
 
     enabled: bool = False
+    transport: str = "tcp_line_int_v1"
+    required: bool = True
     host: str = ""
-    port: int = 12345
-    protocol: str = "pending"
+    port: int = 12346
+    connect_timeout_s: float = 3.0
+    send_timeout_s: float = 0.05
+    startup_settle_seconds: float = 7.0
+    max_queue_size: int = 16
+    command_map: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_VIBRATION_COMMAND_MAP)
+    )
+    one_shot_interrupts_slip: bool = True
+    reassert_slip_after_one_shot: bool = True
     enable_contact: bool = True
     enable_release: bool = True
     enable_slip: bool = True
@@ -128,6 +153,9 @@ class VibrationHapticConfig:
     def __post_init__(self) -> None:
         for name in (
             "enabled",
+            "required",
+            "one_shot_interrupts_slip",
+            "reassert_slip_after_one_shot",
             "enable_contact",
             "enable_release",
             "enable_slip",
@@ -136,12 +164,43 @@ class VibrationHapticConfig:
             "enable_slip_track_blocked_in_target_region",
         ):
             _bool_value(getattr(self, name), f"vibration.{name}")
-        object.__setattr__(self, "port", _port_value(self.port, "vibration.port"))
-        if self.protocol not in VIBRATION_PROTOCOLS:
+        if self.transport not in VIBRATION_TRANSPORTS:
             raise ValueError(
-                "vibration.protocol must be one of: "
-                + ", ".join(VIBRATION_PROTOCOLS)
+                "vibration.transport must be one of: " + ", ".join(VIBRATION_TRANSPORTS)
             )
+        if self.enabled and self.transport == "disabled":
+            raise ValueError("vibration.transport cannot be disabled when vibration.enabled=true.")
+        if self.enabled and not str(self.host).strip():
+            raise ValueError("vibration.host is required when vibration.enabled=true.")
+        object.__setattr__(self, "port", _port_value(self.port, "vibration.port"))
+        object.__setattr__(
+            self,
+            "connect_timeout_s",
+            _positive_float(self.connect_timeout_s, "vibration.connect_timeout_s"),
+        )
+        object.__setattr__(
+            self,
+            "send_timeout_s",
+            _positive_float(self.send_timeout_s, "vibration.send_timeout_s"),
+        )
+        object.__setattr__(
+            self,
+            "startup_settle_seconds",
+            _non_negative_float(
+                self.startup_settle_seconds,
+                "vibration.startup_settle_seconds",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "max_queue_size",
+            _positive_int(self.max_queue_size, "vibration.max_queue_size"),
+        )
+        object.__setattr__(
+            self,
+            "command_map",
+            _vibration_command_map(self.command_map),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -164,11 +223,19 @@ class HapticConfig:
 
     @property
     def matrix_enabled(self) -> bool:
-        return bool(self.enabled and self.matrix.enabled)
+        return bool(
+            self.enabled
+            and self.matrix.enabled
+            and self.matrix.transport != "disabled"
+        )
 
     @property
     def vibration_enabled(self) -> bool:
-        return bool(self.enabled and self.vibration.enabled)
+        return bool(
+            self.enabled
+            and self.vibration.enabled
+            and self.vibration.transport != "disabled"
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -223,6 +290,7 @@ def haptic_config_from_dict(payload: dict[str, Any]) -> HapticConfig:
 def _matrix_config_from_dict(payload: dict[str, Any]) -> MatrixHapticConfig:
     allowed = {
         "enabled",
+        "transport",
         "required",
         "host",
         "port",
@@ -244,6 +312,7 @@ def _matrix_config_from_dict(payload: dict[str, Any]) -> MatrixHapticConfig:
         raise ValueError(f"unknown matrix haptic config keys: {', '.join(unknown)}")
     return MatrixHapticConfig(
         enabled=_bool_value(payload.get("enabled", False), "matrix.enabled"),
+        transport=str(payload.get("transport", MatrixHapticConfig.transport)),
         required=_bool_value(payload.get("required", True), "matrix.required"),
         host=str(payload.get("host", "")),
         port=payload.get("port", MatrixHapticConfig.port),
@@ -284,9 +353,18 @@ def _matrix_config_from_dict(payload: dict[str, Any]) -> MatrixHapticConfig:
 def _vibration_config_from_dict(payload: dict[str, Any]) -> VibrationHapticConfig:
     allowed = {
         "enabled",
+        "transport",
+        "protocol",
+        "required",
         "host",
         "port",
-        "protocol",
+        "connect_timeout_s",
+        "send_timeout_s",
+        "startup_settle_seconds",
+        "max_queue_size",
+        "command_map",
+        "one_shot_interrupts_slip",
+        "reassert_slip_after_one_shot",
         "enable_contact",
         "enable_release",
         "enable_slip",
@@ -297,11 +375,44 @@ def _vibration_config_from_dict(payload: dict[str, Any]) -> VibrationHapticConfi
     unknown = sorted(set(payload) - allowed)
     if unknown:
         raise ValueError(f"unknown vibration haptic config keys: {', '.join(unknown)}")
+    transport = payload.get("transport", payload.get("protocol", VibrationHapticConfig.transport))
     return VibrationHapticConfig(
         enabled=_bool_value(payload.get("enabled", False), "vibration.enabled"),
+        transport=str(transport),
+        required=_bool_value(payload.get("required", True), "vibration.required"),
         host=str(payload.get("host", "")),
         port=payload.get("port", VibrationHapticConfig.port),
-        protocol=str(payload.get("protocol", VibrationHapticConfig.protocol)),
+        connect_timeout_s=payload.get(
+            "connect_timeout_s",
+            VibrationHapticConfig.connect_timeout_s,
+        ),
+        send_timeout_s=payload.get(
+            "send_timeout_s",
+            VibrationHapticConfig.send_timeout_s,
+        ),
+        startup_settle_seconds=payload.get(
+            "startup_settle_seconds",
+            VibrationHapticConfig.startup_settle_seconds,
+        ),
+        max_queue_size=payload.get(
+            "max_queue_size",
+            VibrationHapticConfig.max_queue_size,
+        ),
+        command_map=payload.get("command_map", DEFAULT_VIBRATION_COMMAND_MAP),
+        one_shot_interrupts_slip=_bool_value(
+            payload.get(
+                "one_shot_interrupts_slip",
+                VibrationHapticConfig.one_shot_interrupts_slip,
+            ),
+            "vibration.one_shot_interrupts_slip",
+        ),
+        reassert_slip_after_one_shot=_bool_value(
+            payload.get(
+                "reassert_slip_after_one_shot",
+                VibrationHapticConfig.reassert_slip_after_one_shot,
+            ),
+            "vibration.reassert_slip_after_one_shot",
+        ),
         enable_contact=_bool_value(
             payload.get("enable_contact", VibrationHapticConfig.enable_contact),
             "vibration.enable_contact",
@@ -336,6 +447,28 @@ def _vibration_config_from_dict(payload: dict[str, Any]) -> VibrationHapticConfi
             "vibration.enable_slip_track_blocked_in_target_region",
         ),
     )
+
+
+def _vibration_command_map(value: Any) -> dict[str, int]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError("vibration.command_map must be an object.")
+    unknown = sorted(set(value) - set(VIBRATION_COMMAND_LABELS))
+    if unknown:
+        raise ValueError(
+            "vibration.command_map has unknown labels: " + ", ".join(unknown)
+        )
+    normalized = dict(DEFAULT_VIBRATION_COMMAND_MAP)
+    for label, raw_command in value.items():
+        try:
+            command = int(raw_command)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"vibration.command_map.{label} must be an integer.") from exc
+        if command < 1 or command > 255:
+            raise ValueError(f"vibration.command_map.{label} must be in 1..255.")
+        normalized[label] = command
+    return normalized
 
 
 def _direction_channel_map(value: Any) -> dict[str, list[int]]:

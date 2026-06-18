@@ -783,7 +783,7 @@ python run_live_integrated_session.py ^
 
 ### Cue / Haptic Abstraction
 
-cue 层只做非硬件提示；haptic Stage 1 是独立输出层。两者都观察现有 `TrialController` / `BlockController` 输出，不修改 contact、slip、blocked、detach 或 trial outcome 逻辑。cue priority 只影响 GUI/console 显示一个主要提示；haptic 不复用 cue priority，`matrix` 和 `vibration` 两个 target 可以同时生成 command。
+cue 层只做非硬件提示；haptic Stage 2 是独立输出层。两者都观察现有 `TrialController` / `BlockController` 输出，不修改 contact、slip、blocked、detach 或 trial outcome 逻辑。cue priority 只影响 GUI/console 显示一个主要提示；haptic 不复用 cue priority，`matrix` 和 `vibration` 两个 target 可以同时生成 command。
 
 支持的 sink：
 
@@ -861,9 +861,9 @@ GUI 的 `displayed_monotonic_ms` 表示一次 GUI refresh 已应用文本，受 
 
 `experiment_visibility_feedback` 中物块消失/重现本身是视觉刺激，但 Stage 1 不把它写入 `cue_log.csv`，也不把它当作 behavioral RT 起点。如果以后需要分析 block visibility visual RT，应新增独立 visual-state render diagnostics，不要混入 cue command log。
 
-### Haptic TCP Stage 1
+### Haptic TCP Stage 2
 
-Stage 1 只实现 Matrix / electrotactile ESP32 的 TCP packet 编码与非阻塞发送；vibration ESP32 协议仍未确定，本阶段只记录 vibration command，不连接、不编码、不发送。replay 默认 `haptic_enabled=false`，不会向真实硬件发送。
+Haptic 层是独立输出层，只观察现有 `TrialController` / `BlockController` 结果，不修改 contact、slip、blocked、detach 或 trial outcome 逻辑。Stage 2 支持两个独立 ESP32 target：Matrix / electrotactile 用于 blocked direction，vibration motor 用于 contact/release/slip。两个 target 可以独立启用、独立连接、独立 smoke test。replay 默认 `haptic_enabled=false`，不会向真实硬件发送。
 
 Matrix ESP32 packet:
 
@@ -873,6 +873,18 @@ checksum = sum(payload) & 0xFF
 payload = HV507 channel list，每个 channel 必须是 0..127
 ```
 
+Vibration ESP32 line-int protocol:
+
+```text
+TCP payload = ASCII integer + newline
+contact_enter -> 1\n
+contact_exit  -> 2\n
+slip_start    -> 3\n
+slip_end      -> 4\n
+```
+
+`haptic_command_log.csv` 里 `sent_payload` 不写真实换行，而写 CSV 安全字符串，例如 `3\\n`；`payload_hex` 对应 `330a`。config validation 允许 `command_map` 使用 `1..255` 的正整数，但当前 ESP32 固件只实现 `1/2/3/4`，未知命令发过去只会被固件打印为 unknown，不会产生反馈。
+
 live 使用 haptic config：
 
 ```powershell
@@ -881,8 +893,10 @@ python run_live_integrated_session.py ^
   --host 127.0.0.1 ^
   --port 8888 ^
   --out-dir data\live_integrated_session\haptic_01 ^
-  --haptic-config configs\haptic_matrix.json
+  --haptic-config configs\haptic_matrix_vibration.example.json
 ```
+
+运行前请把示例配置里的 `192.168.x.x` / `192.168.x.y` 改成现场 Matrix / vibration ESP32 的真实 IP；如果只测试其中一个 target，把另一个 target 的 `enabled` 改成 `false`。
 
 示例配置：
 
@@ -891,6 +905,7 @@ python run_live_integrated_session.py ^
   "enabled": true,
   "matrix": {
     "enabled": true,
+    "transport": "tcp_magic_v1",
     "required": true,
     "host": "192.168.x.x",
     "port": 12345,
@@ -921,9 +936,22 @@ python run_live_integrated_session.py ^
   },
   "vibration": {
     "enabled": true,
-    "host": "",
-    "port": 12345,
-    "protocol": "pending",
+    "transport": "tcp_line_int_v1",
+    "required": true,
+    "host": "192.168.x.y",
+    "port": 12346,
+    "connect_timeout_s": 3.0,
+    "send_timeout_s": 0.05,
+    "startup_settle_seconds": 7.0,
+    "max_queue_size": 16,
+    "command_map": {
+      "contact_enter": 1,
+      "contact_exit": 2,
+      "slip_start": 3,
+      "slip_end": 4
+    },
+    "one_shot_interrupts_slip": true,
+    "reassert_slip_after_one_shot": true,
     "enable_contact": true,
     "enable_release": true,
     "enable_slip": true,
@@ -952,16 +980,31 @@ python run_matrix_haptic_smoke.py --host 192.168.x.x --port 12345 --channels 1,2
 
 如果 `matrix.enabled=true` 且 `matrix.required=true`，程序会在 trial 开始前连接 Matrix ESP32，并等待 `startup_settle_seconds`。连接失败会明显停止在 trial 前，`run_stop_reason=matrix_haptic_connect_failed`，不会进入 trial。trial loop 中只提交 haptic command，不执行阻塞式 connect/send；队列有界，发送失败或队列替换写入 `session/haptic_command_log.csv`。
 
-Vibration Stage 1 只记录：
+如果只想测试 vibration ESP32 硬件链路，不依赖 MANUS/Vive、trial、地图、contact 或 slip 状态，可以运行独立 smoke：
+
+```powershell
+python run_vibration_haptic_smoke.py --host 192.168.x.y --port 12346 --commands 1
+python run_vibration_haptic_smoke.py --host 192.168.x.y --port 12346 --commands 3,4
+```
+
+脚本只会连接 vibration ESP32、等待 `--startup-settle-seconds`，按顺序发送 newline integer command，写 JSON smoke log，然后退出。默认 log 写到 `data/haptic_smoke/vibration_haptic_smoke_<timestamp>.json`；也可以用 `--out data\haptic_smoke\vibration_01.json` 指定路径。
+
+如果 `vibration.enabled=true` 且 `vibration.required=true`，程序会在 trial 开始前连接 vibration ESP32，并等待 `startup_settle_seconds`。连接失败会明显停止在 trial 前，`run_stop_reason=vibration_haptic_connect_failed`，不会进入 trial。vibration worker 使用 FIFO bounded queue，不做 latest-only replacement；普通命令队列满会记录 `send_status=not_sent`、`not_sent_reason=queue_full`。`slip_end/4\n` 优先级更高，会尽力清掉未发送队列并提交 `4\n`；如果 stop slip 发送失败，会记录 `stop_slip_send_failed` 并关闭 socket，让 ESP32 端 disconnect handler 作为停止 rough slip 的兜底。
+
+Vibration command 映射：
 
 ```text
-contact_enter -> vibration one_shot, protocol_pending
-contact_exit  -> vibration one_shot, protocol_pending
-slip_start    -> vibration state_start, protocol_pending
-slip_end      -> vibration state_end, protocol_pending
+contact_enter -> vibration one_shot   -> 1\n
+contact_exit  -> vibration one_shot   -> 2\n
+slip_start    -> vibration state_start/state_update/state_reassert -> 3\n
+slip_end      -> vibration state_end  -> 4\n
 ```
 
 Slip 开关是分层的：`enable_slip=false` 关闭所有 slip vibration；`PINCH_INSUFFICIENT` 由 `enable_slip_pinch_insufficient` 控制；`TRACK_BLOCKED` 在 target_region 外由 `enable_slip_track_blocked` 控制，在 map 定义的 `target_region` 内由 `enable_slip_track_blocked_in_target_region` 控制。target 判断复用 `trial_config.target_region` 的 box，不新造距离阈值。
+
+当前 vibration ESP32 固件里 one-shot 和 rough slip 不是叠加播放关系：contact/release one-shot 实际会中断 slip。`one_shot_interrupts_slip=false` 不能表示硬件可以叠加，只表示电脑端不做 interrupted-slip 特殊记录和 reassert 逻辑。如果 `one_shot_interrupts_slip=true` 且 `reassert_slip_after_one_shot=true`，电脑端会在后续 frame 仍然 `slip_active=true` 且 slip 配置允许时补发一次 `3\n`，然后清掉 pending 标记；它不会每帧重复发送 `3\n`，也不保证 one-shot 完整播放结束后才恢复 slip。
+
+Matrix blocked direction 和 vibration slip 可以同帧同时生成 command。GUI cue 的显示优先级不会压制 haptic：cue 可以只显示一个主要提示，但 haptic command log 可以同时出现 `matrix_blocked_direction` 和 `vibration_slip`。
 
 live haptic enabled 时会写：
 
@@ -970,7 +1013,7 @@ session/haptic_config.json
 session/haptic_command_log.csv
 ```
 
-summary / session_meta / trial_config / trial_summary 会包含 `haptic_enabled`、`matrix_haptic_enabled`、`vibration_haptic_enabled`、`haptic_mode`、`haptic_count`、`haptic_type_counts`、`effective_haptic_config` 和 `haptic_command_log_path`。`sent_monotonic_ms` 只是电脑端 socket send 完成时间，不代表真实硬件物理 onset 或受试者感知时间。
+summary / session_meta / trial_config / trial_summary 会包含 `haptic_enabled`、`matrix_haptic_enabled`、`vibration_haptic_enabled`、`matrix_haptic_transport`、`vibration_haptic_transport`、`matrix_haptic_startup_connected`、`vibration_haptic_startup_connected`、`matrix_haptic_connect_error`、`vibration_haptic_connect_error`、`haptic_mode`、`haptic_count`、`haptic_type_counts`、`effective_haptic_config` 和 `haptic_command_log_path`。`sent_monotonic_ms` 只是电脑端 socket send 完成时间，不代表真实硬件物理 onset 或受试者感知时间。
 
 TODO: 当前 Matrix ESP32 parser 对 empty payload frame 可能不解析，且 HV507/latch 结构下电脑端不应假设 zero/empty frame 是可靠 hardware clear。如果未来需要硬件级 clear/stop，需要单独修改或确认 ESP32 parser、HV507 blanking、LE/BL 控制或硬件侧安全机制。
 
@@ -1134,7 +1177,7 @@ LatestFrameBuffer
 
 `LiveTrialRunner` 不做 calibration、不验证地图、不画 GUI。它只接收已经准备好的 `TaskCoordinateSystem`、`TrackRegion`、`EngineConfig`、`SessionRecorder`、latest-frame buffer，以及可选的非阻塞 haptic runtime，然后按固定频率推进现有 `TrialController`。这次重构不改 `BlockController` / `TrialController` 的 contact、slip、blocked 语义。
 
-replay/live debug GUI 已经通过 `snapshot_callback(snapshot)` 订阅这层输出，显示层不需要直接调用 `TrialController`。如果 callback 抛异常，runner 会继续运行，并在 summary 中记录 `callback_error_count`、`mean_callback_latency_ms`、`max_callback_latency_ms` 和 warning。Stage 1 Matrix haptic 通过独立 runtime 接入；trial loop 只提交 command，不在 loop 内执行阻塞式 TCP connect/send。
+replay/live debug GUI 已经通过 `snapshot_callback(snapshot)` 订阅这层输出，显示层不需要直接调用 `TrialController`。如果 callback 抛异常，runner 会继续运行，并在 summary 中记录 `callback_error_count`、`mean_callback_latency_ms`、`max_callback_latency_ms` 和 warning。Stage 2 haptic 通过独立 runtime 接入；trial loop 只提交 command，不在 loop 内执行阻塞式 TCP connect/send。
 
 `run_live_integrated_session.py` 的输出仍保持旧字段为主，同时会额外写：
 
@@ -1391,7 +1434,7 @@ python analyze_timing.py --session-dir data\live_integrated_session\debug_01\ses
 
 默认输出 `session/timing_analysis_summary.json` 并向终端打印 JSON。已有输出不会被覆盖，除非传 `--overwrite`；也可以用 `--out` 指定其他路径。summary 包含 median / p95 / max 延迟、各 phase transport 统计、published / consumed / processed / overwritten 计数、`max_no_frame_gap_ms` 和 operator command 到 stop 的延迟。
 
-timing collector 在控制 loop 和 GUI render 中只更新线程安全内存，不做逐帧文件 I/O，run 结束后一次写 CSV。代价是进程硬崩溃时 timing log 可能丢失。本阶段只做 system timing diagnostics，并记录 cue / haptic command；不在线计算受试者 behavioral reaction time。Matrix haptic 的 `sent_monotonic_ms` 只是电脑端发送完成时间，behavioral RT analyzer 仍是后续独立阶段。
+timing collector 在控制 loop 和 GUI render 中只更新线程安全内存，不做逐帧文件 I/O，run 结束后一次写 CSV。代价是进程硬崩溃时 timing log 可能丢失。本阶段只做 system timing diagnostics，并记录 cue / haptic command；不在线计算受试者 behavioral reaction time。haptic 的 `sent_monotonic_ms` 只是电脑端发送完成时间，behavioral RT analyzer 仍是后续独立阶段。
 
 ## `analyze_session.py`
 
@@ -1705,7 +1748,7 @@ large_delta
 
 离线 replay 中如果前几帧在 trial start time 之前，`trial_time` 可能为负数。这通常表示 pre-roll 数据，不是状态机错误。
 
-`haptic.csv` 记录现有状态机产生的逐帧逻辑 haptic 状态，不代表真实硬件已经发送或被受试者感知。`haptic_command_log.csv` 记录 Stage 1 haptic command 与 Matrix TCP 发送状态；`cue_log.csv` 记录通过 cue 配置和限流后进入 sink 的命令级提示。它们适合检查 contact/slip/blocked 提示语义，但不能直接当作 behavioral RT 结果。
+`haptic.csv` 记录现有状态机产生的逐帧逻辑 haptic 状态，不代表真实硬件已经发送或被受试者感知。`haptic_command_log.csv` 记录 Stage 2 haptic command 与 Matrix/vibration TCP 发送状态；`cue_log.csv` 记录通过 cue 配置和限流后进入 sink 的命令级提示。它们适合检查 contact/slip/blocked 提示语义，但不能直接当作 behavioral RT 结果。
 
 ## 怎么看结果
 
@@ -2058,7 +2101,7 @@ pinch_release_threshold = 0.12
 ## 当前限制
 
 - 现有 GUI 是 replay/live debug display，不是正式 experiment lifecycle GUI；实验员和受试者仍共用一个窗口，也没有 Stop / Abort / Pause / Resume 的完整界面控制。
-- 当前只有 Matrix / electrotactile ESP32 的 Stage 1 TCP 输出；vibration 仍是 protocol pending/logging。`haptic.csv` 是逻辑状态，`haptic_command_log.csv` 是 command/发送记录；还没有硬件 acknowledgement 或 behavioral RT analyzer。
+- 当前 haptic Stage 2 已支持 Matrix / electrotactile ESP32 和 vibration ESP32 两个 TCP target。`haptic.csv` 是逻辑状态，`haptic_command_log.csv` 是 command/发送记录；还没有硬件 acknowledgement 或 behavioral RT analyzer，`sent_monotonic_ms` 仍只是电脑端 send 完成时间。
 - `run_live_integrated_session.py` 是单次 trial 的连续标定 + trial 调试流程，仍标记 `is_formal_experiment=false`；target 进入只做诊断，trial 主要由实验员按 `e` 完成。
 - 当前不直接依赖 MANUS/Vive SDK，而是接收 `manus_vive_com` 发送的 combined JSON；也没有完整 MANUS/Vive rotation fusion。
 - 没有正式在线 calibration GUI；当前只有命令行版 live table-line calibration 和 integrated runner。

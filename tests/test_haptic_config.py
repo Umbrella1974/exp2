@@ -17,10 +17,20 @@ def test_default_haptic_config_is_disabled() -> None:
     assert config.matrix.enabled is False
     assert config.matrix.required is True
     assert config.matrix.direction_semantics == "blocked_surface"
+    assert config.matrix.transport == "tcp_magic_v1"
     assert config.matrix.combination_channel_map == {}
     assert config.matrix.missing_combination_policy == "skip"
     assert config.matrix.ignore_direction_axes == ()
     assert config.vibration.enabled is False
+    assert config.vibration.transport == "tcp_line_int_v1"
+    assert config.vibration.required is True
+    assert config.vibration.port == 12346
+    assert config.vibration.command_map == {
+        "contact_enter": 1,
+        "contact_exit": 2,
+        "slip_start": 3,
+        "slip_end": 4,
+    }
 
 
 def test_haptic_config_rejects_unknown_fields() -> None:
@@ -30,10 +40,51 @@ def test_haptic_config_rejects_unknown_fields() -> None:
     with pytest.raises(ValueError, match="unknown matrix haptic config keys"):
         haptic_config_from_dict({"matrix": {"mystery": True}})
 
+    with pytest.raises(ValueError, match="unknown vibration haptic config keys"):
+        haptic_config_from_dict({"vibration": {"mystery": True}})
+
 
 def test_matrix_enabled_requires_host() -> None:
     with pytest.raises(ValueError, match="matrix.host is required"):
         haptic_config_from_dict({"enabled": True, "matrix": {"enabled": True}})
+
+
+def test_vibration_enabled_requires_host_and_validates_command_map() -> None:
+    with pytest.raises(ValueError, match="vibration.host is required"):
+        haptic_config_from_dict({"enabled": True, "vibration": {"enabled": True}})
+
+    config = haptic_config_from_dict(
+        {
+            "enabled": True,
+            "vibration": {
+                "enabled": True,
+                "host": "192.168.1.30",
+                "port": 12346,
+                "command_map": {"contact_enter": 10, "slip_end": 40},
+            },
+        }
+    )
+
+    assert config.vibration_enabled is True
+    assert config.vibration.command_map["contact_enter"] == 10
+    assert config.vibration.command_map["contact_exit"] == 2
+    assert config.vibration.command_map["slip_end"] == 40
+
+    with pytest.raises(ValueError, match="1..255"):
+        haptic_config_from_dict(
+            {"vibration": {"command_map": {"contact_enter": 0}}}
+        )
+
+    with pytest.raises(ValueError, match="unknown labels"):
+        haptic_config_from_dict(
+            {"vibration": {"command_map": {"bad": 1}}}
+        )
+
+
+def test_legacy_vibration_protocol_key_is_transport_alias() -> None:
+    config = haptic_config_from_dict({"vibration": {"protocol": "tcp_line_int_v1"}})
+
+    assert config.vibration.transport == "tcp_line_int_v1"
 
 
 def test_direction_semantics_and_channel_map_are_validated(tmp_path: Path) -> None:

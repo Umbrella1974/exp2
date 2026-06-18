@@ -13,8 +13,13 @@ from typing import Any, Callable
 
 from data_models import Vec3
 from haptic_config import HapticConfig, default_haptic_config, normalize_direction_key
-from haptic_tcp_worker import MatrixHapticConnectionError, MatrixTcpWorker
+from haptic_tcp_worker import MatrixTcpWorker
 from matrix_haptic_protocol import encode_matrix_channel_packet
+from vibration_haptic_protocol import (
+    encode_vibration_line_command,
+    vibration_payload_to_log_string,
+)
+from vibration_tcp_worker import VibrationTcpLineWorker
 
 
 HAPTIC_CSV_FIELDS = [
@@ -24,6 +29,7 @@ HAPTIC_CSV_FIELDS = [
     "cue_sequence_index",
     "trial_id",
     "target_device",
+    "target_transport",
     "source_frame_id",
     "source_frame_index",
     "source_trial_time",
@@ -41,6 +47,10 @@ HAPTIC_CSV_FIELDS = [
     "matrix_direction_semantics",
     "matrix_ignored_direction_axes",
     "channel_list",
+    "vibration_command",
+    "vibration_command_label",
+    "sent_payload",
+    "payload_hex",
     "created_monotonic_ms",
     "queued_monotonic_ms",
     "sent_monotonic_ms",
@@ -64,6 +74,7 @@ class HapticCommandRecord:
     cue_sequence_index: int | None
     trial_id: str | int
     target_device: str
+    target_transport: str | None
     source_frame_id: str | int | None
     source_frame_index: int | None
     source_trial_time: float | None
@@ -81,6 +92,10 @@ class HapticCommandRecord:
     matrix_direction_semantics: str | None = None
     matrix_ignored_direction_axes: str | None = None
     channel_list: list[int] = field(default_factory=list)
+    vibration_command: int | None = None
+    vibration_command_label: str | None = None
+    sent_payload: str | None = None
+    payload_hex: str | None = None
     created_monotonic_ms: float | None = None
     queued_monotonic_ms: float | None = None
     sent_monotonic_ms: float | None = None
@@ -113,6 +128,10 @@ class _FrameContext:
 
 class HapticStartupError(RuntimeError):
     """Raised when required haptic hardware cannot start before trial."""
+
+    def __init__(self, message: str, *, target_device: str = "haptic") -> None:
+        super().__init__(message)
+        self.target_device = target_device
 
 
 @dataclass(frozen=True)
@@ -148,6 +167,7 @@ class HapticRuntime:
         mode: str = "live",
         is_live_haptic_timing: bool = True,
         worker_factory: Callable[..., MatrixTcpWorker] | None = None,
+        vibration_worker_factory: Callable[..., VibrationTcpLineWorker] | None = None,
         monotonic_ms_fn: Callable[[], float] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
     ) -> None:
@@ -157,17 +177,27 @@ class HapticRuntime:
         self.mode = mode
         self.is_live_haptic_timing = bool(is_live_haptic_timing)
         self.worker_factory = worker_factory or MatrixTcpWorker
+        self.vibration_worker_factory = (
+            vibration_worker_factory or VibrationTcpLineWorker
+        )
         self.monotonic_ms_fn = monotonic_ms_fn or (lambda: time.monotonic() * 1000.0)
         self.sleep_fn = sleep_fn or time.sleep
         self.warnings: list[str] = []
         self.connect_error: str | None = None
+        self.matrix_connect_error: str | None = None
+        self.vibration_connect_error: str | None = None
+        self.matrix_startup_connected = False
+        self.vibration_startup_connected = False
         self._records: list[HapticCommandRecord] = []
         self._sequence = 0
         self._matrix_worker: MatrixTcpWorker | None = None
+        self._vibration_worker: VibrationTcpLineWorker | None = None
         self._started = False
         self._session_ended = False
         self._trial_ended = False
         self._previous_slip_signature: tuple[Any, ...] | None = None
+        self._pending_slip_reassert_after_one_shot: tuple[Any, ...] | None = None
+        self._pending_slip_reassert_frame_index: int | None = None
         self._previous_blocked_signature: _MatrixBlockedSignature | None = None
         self._last_matrix_send_monotonic_ms: float | None = None
         self._last_context: _FrameContext | None = None
@@ -192,8 +222,14 @@ class HapticRuntime:
         if self._started:
             return
         self._started = True
-        if not self.matrix_haptic_enabled:
+        if not self.haptic_enabled:
             return
+        if self.matrix_haptic_enabled:
+            self._start_matrix_worker()
+        if self.vibration_haptic_enabled:
+            self._start_vibration_worker()
+
+    def _start_matrix_worker(self) -> None:
         matrix = self.haptic_config.matrix
         try:
             self._matrix_worker = self.worker_factory(
@@ -205,16 +241,42 @@ class HapticRuntime:
                 latest_only=matrix.latest_only,
             )
             self._matrix_worker.start()
+            self.matrix_startup_connected = True
         except Exception as exc:
-            self.connect_error = str(exc)
+            self.matrix_connect_error = str(exc)
+            self.connect_error = self.connect_error or str(exc)
             message = f"matrix haptic connect failed: {exc}"
             if matrix.required:
-                raise HapticStartupError(message) from exc
+                raise HapticStartupError(message, target_device="matrix") from exc
             self.warnings.append(message)
             self._matrix_worker = None
             return
         if matrix.startup_settle_seconds > 0.0:
             self.sleep_fn(matrix.startup_settle_seconds)
+
+    def _start_vibration_worker(self) -> None:
+        vibration = self.haptic_config.vibration
+        try:
+            self._vibration_worker = self.vibration_worker_factory(
+                host=vibration.host,
+                port=vibration.port,
+                connect_timeout_s=vibration.connect_timeout_s,
+                send_timeout_s=vibration.send_timeout_s,
+                max_queue_size=vibration.max_queue_size,
+            )
+            self._vibration_worker.start()
+            self.vibration_startup_connected = True
+        except Exception as exc:
+            self.vibration_connect_error = str(exc)
+            self.connect_error = self.connect_error or str(exc)
+            message = f"vibration haptic connect failed: {exc}"
+            if vibration.required:
+                raise HapticStartupError(message, target_device="vibration") from exc
+            self.warnings.append(message)
+            self._vibration_worker = None
+            return
+        if vibration.startup_settle_seconds > 0.0:
+            self.sleep_fn(vibration.startup_settle_seconds)
 
     def process_frame(
         self,
@@ -254,8 +316,8 @@ class HapticRuntime:
             return ()
 
         before = len(self._records)
-        self._process_contact_events(context, trial_result)
-        self._process_slip_state(context, trial_result)
+        one_shot_sent = self._process_contact_events(context, trial_result)
+        self._process_slip_state(context, trial_result, one_shot_sent=one_shot_sent)
         self._process_blocked_state(context, trial_result)
         return tuple(self._records[before:])
 
@@ -283,6 +345,8 @@ class HapticRuntime:
         self.end_trial(reason="session_ended_no_hardware_clear")
         if self._matrix_worker is not None:
             self._matrix_worker.stop()
+        if self._vibration_worker is not None:
+            self._vibration_worker.stop()
         self._session_ended = True
 
     def records_snapshot(self) -> tuple[dict[str, Any], ...]:
@@ -309,8 +373,19 @@ class HapticRuntime:
             ),
             "haptic_warnings": list(self.warnings),
             "haptic_connect_error": self.connect_error,
+            "matrix_haptic_transport": self.haptic_config.matrix.transport,
+            "vibration_haptic_transport": self.haptic_config.vibration.transport,
+            "matrix_haptic_startup_connected": bool(self.matrix_startup_connected),
+            "vibration_haptic_startup_connected": bool(
+                self.vibration_startup_connected
+            ),
+            "matrix_haptic_connect_error": self.matrix_connect_error,
+            "vibration_haptic_connect_error": self.vibration_connect_error,
             "matrix_haptic_connected": bool(
                 self._matrix_worker is not None and self._matrix_worker.connected
+            ),
+            "vibration_haptic_connected": bool(
+                self._vibration_worker is not None and self._vibration_worker.connected
             ),
         }
 
@@ -328,45 +403,96 @@ class HapticRuntime:
                 writer.writerow({field: record.get(field, "") for field in HAPTIC_CSV_FIELDS})
         return target
 
-    def _process_contact_events(self, context: _FrameContext, trial_result: Any) -> None:
+    def _process_contact_events(self, context: _FrameContext, trial_result: Any) -> bool:
         if not self.vibration_haptic_enabled:
-            return
+            return False
+        one_shot_sent = False
         for event in getattr(trial_result, "events", ()) or ():
             event_type = str(getattr(event, "event_type", "")).lower()
             if event_type == "contact_enter":
                 enabled = self.haptic_config.vibration.enable_contact
-                self._record_vibration_command(
+                interrupted_slip = self._one_shot_would_interrupt_slip()
+                record = self._record_vibration_command(
                     context,
                     cue_type="contact_enter",
                     haptic_type="vibration_contact_enter",
                     haptic_phase="one_shot",
+                    command_label="contact_enter",
                     enabled=enabled,
                     not_sent_reason=None if enabled else "contact_disabled",
-                    details={"source_event_type": "contact_enter"},
+                    details={
+                        "source_event_type": "contact_enter",
+                        "interrupted_slip": interrupted_slip,
+                    },
                 )
+                if _record_was_queued_or_sent(record):
+                    one_shot_sent = True
+                    self._schedule_slip_reassert_after_one_shot(
+                        context,
+                        interrupted_slip=interrupted_slip,
+                    )
             elif event_type == "contact_exit":
                 enabled = self.haptic_config.vibration.enable_release
                 details = getattr(event, "details", {}) or {}
-                self._record_vibration_command(
+                interrupted_slip = self._one_shot_would_interrupt_slip()
+                record = self._record_vibration_command(
                     context,
                     cue_type="contact_exit",
                     haptic_type="vibration_contact_exit",
                     haptic_phase="one_shot",
+                    command_label="contact_exit",
                     enabled=enabled,
                     not_sent_reason=None if enabled else "release_disabled",
                     details={
                         "source_event_type": "contact_exit",
                         "detach_state": details.get("detach_state"),
+                        "interrupted_slip": interrupted_slip,
                     },
                 )
+                if _record_was_queued_or_sent(record):
+                    one_shot_sent = True
+                    self._schedule_slip_reassert_after_one_shot(
+                        context,
+                        interrupted_slip=interrupted_slip,
+                    )
+        return one_shot_sent
 
-    def _process_slip_state(self, context: _FrameContext, trial_result: Any) -> None:
+    def _process_slip_state(
+        self,
+        context: _FrameContext,
+        trial_result: Any,
+        *,
+        one_shot_sent: bool,
+    ) -> None:
         signature = self._slip_signature(trial_result)
         if signature is None:
             if self._previous_slip_signature is not None:
                 self._record_slip_end(context, self._previous_slip_signature, "slip_inactive")
             self._previous_slip_signature = None
+            self._clear_pending_slip_reassert()
             return
+        if one_shot_sent and self.haptic_config.vibration.one_shot_interrupts_slip:
+            if self.haptic_config.vibration.reassert_slip_after_one_shot:
+                self._pending_slip_reassert_after_one_shot = signature
+                self._pending_slip_reassert_frame_index = context.frame_index
+            self._previous_slip_signature = signature
+            return
+        if self._pending_slip_reassert_after_one_shot is not None:
+            pending = self._pending_slip_reassert_after_one_shot
+            if signature == pending:
+                if context.frame_index == self._pending_slip_reassert_frame_index:
+                    self._previous_slip_signature = signature
+                    return
+                self._record_slip_command(
+                    context,
+                    signature,
+                    "state_reassert",
+                    details={"reassert_after_one_shot": True},
+                )
+                self._clear_pending_slip_reassert()
+                self._previous_slip_signature = signature
+                return
+            self._clear_pending_slip_reassert()
         phase = None
         if self._previous_slip_signature is None:
             phase = "state_start"
@@ -408,10 +534,34 @@ class HapticRuntime:
         if self._previous_slip_signature is not None:
             self._record_slip_end(context, self._previous_slip_signature, reason)
             self._previous_slip_signature = None
+            self._clear_pending_slip_reassert()
         if self._previous_blocked_signature is not None:
             self._record_matrix_end(context, self._previous_blocked_signature, reason)
             self._previous_blocked_signature = None
             self._last_matrix_send_monotonic_ms = None
+
+    def _one_shot_would_interrupt_slip(self) -> bool:
+        return bool(
+            self._previous_slip_signature is not None
+            and self.haptic_config.vibration.one_shot_interrupts_slip
+        )
+
+    def _schedule_slip_reassert_after_one_shot(
+        self,
+        context: _FrameContext,
+        *,
+        interrupted_slip: bool,
+    ) -> None:
+        if not interrupted_slip:
+            return
+        if not self.haptic_config.vibration.reassert_slip_after_one_shot:
+            return
+        self._pending_slip_reassert_after_one_shot = self._previous_slip_signature
+        self._pending_slip_reassert_frame_index = context.frame_index
+
+    def _clear_pending_slip_reassert(self) -> None:
+        self._pending_slip_reassert_after_one_shot = None
+        self._pending_slip_reassert_frame_index = None
 
     def _slip_signature(self, trial_result: Any) -> tuple[Any, ...] | None:
         haptic = getattr(trial_result, "haptic_feedback_state", None)
@@ -524,23 +674,29 @@ class HapticRuntime:
         context: _FrameContext,
         signature: tuple[Any, ...],
         phase: str,
+        *,
+        details: dict[str, Any] | None = None,
     ) -> None:
         if not self.vibration_haptic_enabled:
             return
         reason, in_target = signature
         enabled, disabled_reason = self._slip_enabled(str(reason or ""), in_target)
+        command_details = {
+            "slip_reason": reason,
+            "block_center_in_target_region": in_target,
+        }
+        if details:
+            command_details.update(details)
         self._record_vibration_command(
             context,
             cue_type=_slip_cue_type(str(reason or "")),
             haptic_type="vibration_slip",
             haptic_phase=phase,
+            command_label="slip_start",
             enabled=enabled,
             not_sent_reason=disabled_reason,
             direction=None,
-            details={
-                "slip_reason": reason,
-                "block_center_in_target_region": in_target,
-            },
+            details=command_details,
         )
 
     def _record_slip_end(
@@ -558,9 +714,11 @@ class HapticRuntime:
             cue_type=_slip_cue_type(str(slip_reason or "")),
             haptic_type="vibration_slip",
             haptic_phase="state_end",
+            command_label="slip_end",
             enabled=enabled,
             not_sent_reason=disabled_reason,
             direction=None,
+            priority_stop=True,
             details={
                 "slip_reason": slip_reason,
                 "block_center_in_target_region": in_target,
@@ -615,6 +773,7 @@ class HapticRuntime:
         record = self._make_record(
             context,
             target_device="matrix",
+            target_transport=self.haptic_config.matrix.transport,
             cue_type="blocked_directional",
             haptic_type="matrix_blocked_direction",
             haptic_phase=phase,
@@ -670,6 +829,7 @@ class HapticRuntime:
         record = self._make_record(
             context,
             target_device="matrix",
+            target_transport=self.haptic_config.matrix.transport,
             cue_type="blocked_directional",
             haptic_type="matrix_blocked_direction",
             haptic_phase="state_end",
@@ -704,24 +864,46 @@ class HapticRuntime:
         cue_type: str,
         haptic_type: str,
         haptic_phase: str,
+        command_label: str,
         enabled: bool,
         not_sent_reason: str | None,
         direction: str | None = None,
+        priority_stop: bool = False,
         details: dict[str, Any] | None = None,
     ) -> HapticCommandRecord:
+        vibration = self.haptic_config.vibration
+        command = vibration.command_map.get(command_label)
         record = self._make_record(
             context,
             target_device="vibration",
+            target_transport=vibration.transport,
             cue_type=cue_type,
             haptic_type=haptic_type,
             haptic_phase=haptic_phase,
             direction=direction,
+            vibration_command=command,
+            vibration_command_label=command_label,
             details=details or {},
         )
         if not enabled:
             self._finish_not_sent(record, "skipped", not_sent_reason or "disabled")
-        else:
-            self._finish_not_sent(record, "protocol_pending", "not_implemented")
+            return record
+        if command is None:
+            self._finish_not_sent(record, "skipped", "missing_vibration_command")
+            return record
+        try:
+            payload = encode_vibration_line_command(command)
+        except Exception as exc:
+            record.error = str(exc)
+            self._finish_not_sent(record, "skipped", "invalid_vibration_command")
+            return record
+        record.sent_payload = vibration_payload_to_log_string(payload)
+        record.payload_hex = payload.hex()
+        if self._vibration_worker is None:
+            reason = "stop_slip_send_failed" if priority_stop else "vibration_not_connected"
+            self._finish_not_sent(record, "not_connected", reason)
+            return record
+        self._vibration_worker.submit(record, payload, priority_stop=priority_stop)
         return record
 
     def _make_record(
@@ -729,6 +911,7 @@ class HapticRuntime:
         context: _FrameContext,
         *,
         target_device: str,
+        target_transport: str | None,
         cue_type: str,
         haptic_type: str,
         haptic_phase: str,
@@ -743,6 +926,8 @@ class HapticRuntime:
         matrix_direction_semantics: str | None = None,
         matrix_ignored_direction_axes: str | None = None,
         channel_list: list[int] | None = None,
+        vibration_command: int | None = None,
+        vibration_command_label: str | None = None,
         details: dict[str, Any] | None = None,
     ) -> HapticCommandRecord:
         sequence = self._sequence
@@ -754,6 +939,7 @@ class HapticRuntime:
             cue_sequence_index=None,
             trial_id=self.trial_id,
             target_device=target_device,
+            target_transport=target_transport,
             source_frame_id=context.source_frame_id,
             source_frame_index=context.frame_index,
             source_trial_time=context.source_trial_time,
@@ -771,6 +957,8 @@ class HapticRuntime:
             matrix_direction_semantics=matrix_direction_semantics,
             matrix_ignored_direction_axes=matrix_ignored_direction_axes,
             channel_list=list(channel_list or []),
+            vibration_command=vibration_command,
+            vibration_command_label=vibration_command_label,
             created_monotonic_ms=self.monotonic_ms_fn(),
             mode=self.mode,
             is_live_haptic_timing=self.is_live_haptic_timing,
@@ -787,7 +975,7 @@ class HapticRuntime:
     ) -> None:
         record.send_status = status
         record.not_sent_reason = reason
-        record.success = None if status in {"not_sent", "protocol_pending"} else False
+        record.success = None if status == "not_sent" else False
 
 
 def disabled_haptic_summary() -> dict[str, Any]:
@@ -806,8 +994,19 @@ def disabled_haptic_summary() -> dict[str, Any]:
         "haptic_command_log_path": None,
         "haptic_warnings": [],
         "haptic_connect_error": None,
+        "matrix_haptic_transport": config.matrix.transport,
+        "vibration_haptic_transport": config.vibration.transport,
+        "matrix_haptic_startup_connected": False,
+        "vibration_haptic_startup_connected": False,
+        "matrix_haptic_connect_error": None,
+        "vibration_haptic_connect_error": None,
         "matrix_haptic_connected": False,
+        "vibration_haptic_connected": False,
     }
+
+
+def _record_was_queued_or_sent(record: HapticCommandRecord) -> bool:
+    return record.send_status in {"queued", "sent"}
 
 
 def _target_box_from_trial_config(trial_config: dict[str, Any]) -> tuple[Vec3, Vec3] | None:

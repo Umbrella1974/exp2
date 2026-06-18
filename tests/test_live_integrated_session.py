@@ -159,6 +159,41 @@ def test_matrix_haptic_required_connect_failure_stops_before_trial(tmp_path: Pat
     assert validate_session_outputs(session_dir)["status"] == "PASS"
 
 
+def test_vibration_haptic_required_connect_failure_stops_before_trial(tmp_path: Path) -> None:
+    source = FakeLiveSource()
+    haptic_config = haptic_config_from_dict(
+        {
+            "enabled": True,
+            "vibration": {
+                "enabled": True,
+                "required": True,
+                "host": "127.0.0.1",
+                "port": 1,
+                "connect_timeout_s": 0.01,
+                "startup_settle_seconds": 0.0,
+            },
+        }
+    )
+    config = _config(
+        tmp_path,
+        calibration_id="cal_vibration_haptic_fail_fast",
+        max_frames=1,
+        haptic_config=haptic_config,
+    )
+
+    result = run_live_integrated_session(config, source=source, input_fn=_mode_input(source))
+
+    session_dir = Path(result.summary["session_dir"])
+    assert result.summary["run_stop_reason"] == "vibration_haptic_connect_failed"
+    assert result.summary["trial_controller_started"] is False
+    assert result.summary["haptic_enabled"] is True
+    assert result.summary["vibration_haptic_enabled"] is True
+    assert result.summary["vibration_haptic_connect_error"]
+    assert (session_dir / "haptic_config.json").exists()
+    assert (session_dir / "haptic_command_log.csv").exists()
+    assert validate_session_outputs(session_dir)["status"] == "PASS"
+
+
 def test_integrated_session_saves_pinch_threshold_calibration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

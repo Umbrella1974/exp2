@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from cue_feedback import CUE_CSV_FIELDS
+from haptic_config import VIBRATION_COMMAND_LABELS
 from haptic_runtime import HAPTIC_CSV_FIELDS
 
 
@@ -722,6 +723,7 @@ def _validate_haptic_artifacts(
         if expected_trial_id not in (None, "") and str(row.get("trial_id", "")) != str(expected_trial_id):
             errors.append("haptic_command_log.csv trial_id is inconsistent with session trial_id.")
             break
+        _validate_haptic_command_row(row, errors)
     if len(haptic_ids) != len(set(haptic_ids)):
         errors.append("haptic_command_log.csv haptic_id values must be unique.")
 
@@ -740,6 +742,43 @@ def _validate_haptic_artifacts(
                     "haptic_type_counts does not match haptic_command_log.csv: "
                     f"{normalized!r} != {actual_type_counts!r}"
                 )
+
+
+def _validate_haptic_command_row(row: dict[str, Any], errors: list[str]) -> None:
+    target_device = str(row.get("target_device", ""))
+    target_transport = str(row.get("target_transport", ""))
+    if target_device not in {"matrix", "vibration"}:
+        errors.append(
+            f"haptic_command_log.csv contains unknown target_device: {target_device!r}"
+        )
+        return
+    if target_device == "matrix":
+        if target_transport not in {"", "tcp_magic_v1"}:
+            errors.append(
+                "matrix haptic row must use target_transport=tcp_magic_v1."
+            )
+        return
+    if target_transport not in {"", "tcp_line_int_v1"}:
+        errors.append(
+            "vibration haptic row must use target_transport=tcp_line_int_v1."
+        )
+    label = str(row.get("vibration_command_label", ""))
+    if label and label not in set(VIBRATION_COMMAND_LABELS):
+        errors.append(
+            f"haptic_command_log.csv contains unknown vibration_command_label: {label!r}"
+        )
+    command = row.get("vibration_command", "")
+    if command not in (None, ""):
+        try:
+            command_value = int(command)
+        except (TypeError, ValueError):
+            errors.append("vibration_command must be an integer when present.")
+        else:
+            if command_value < 1 or command_value > 255:
+                errors.append("vibration_command must be in 1..255 when present.")
+    sent_payload = str(row.get("sent_payload", ""))
+    if "\n" in sent_payload or "\r" in sent_payload:
+        errors.append("sent_payload must not contain literal newline characters.")
 
 
 def _csv_data_row_count(path: Path, label: str, errors: list[str]) -> int | None:

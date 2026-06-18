@@ -449,8 +449,20 @@ def test_blocked_end_records_state_end_without_clear() -> None:
     assert rows[-1]["not_sent_reason"] == "state_end_no_hardware_clear"
 
 
-def test_vibration_contact_records_are_one_shot_protocol_pending() -> None:
-    runtime = _runtime({"enabled": True, "vibration": {"enabled": True}})
+def test_vibration_contact_records_are_one_shot_line_commands() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "vibration": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+            },
+        },
+        vibration_worker_factory=worker,
+    )
+    runtime.start()
 
     runtime.process_frame(
         frame_index=1,
@@ -466,12 +478,31 @@ def test_vibration_contact_records_are_one_shot_protocol_pending() -> None:
         "vibration_contact_exit",
     ]
     assert all(row["haptic_phase"] == "one_shot" for row in rows)
-    assert all(row["send_status"] == "protocol_pending" for row in rows)
-    assert all(row["not_sent_reason"] == "not_implemented" for row in rows)
+    assert [row["vibration_command_label"] for row in rows] == [
+        "contact_enter",
+        "contact_exit",
+    ]
+    assert [row["vibration_command"] for row in rows] == [1, 2]
+    assert [row["sent_payload"] for row in rows] == ["1\\n", "2\\n"]
+    assert [row["payload_hex"] for row in rows] == ["310a", "320a"]
+    assert all(row["send_status"] == "sent" for row in rows)
+    assert worker.instances[0].packets == [b"1\n", b"2\n"]
 
 
 def test_vibration_slip_start_and_end_are_state_commands() -> None:
-    runtime = _runtime({"enabled": True, "vibration": {"enabled": True}})
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "vibration": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+            },
+        },
+        vibration_worker_factory=worker,
+    )
+    runtime.start()
 
     runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=_trial_result(slip=True, slip_reason="PINCH_INSUFFICIENT"), snapshot=None)
     runtime.process_frame(frame_index=2, source_frame_id=None, sample=_sample(0.1), trial_result=_trial_result(slip=False), snapshot=None)
@@ -479,11 +510,55 @@ def test_vibration_slip_start_and_end_are_state_commands() -> None:
     rows = runtime.records_snapshot()
     assert [row["haptic_phase"] for row in rows] == ["state_start", "state_end"]
     assert all(row["haptic_type"] == "vibration_slip" for row in rows)
+    assert [row["vibration_command_label"] for row in rows] == ["slip_start", "slip_end"]
+    assert [row["sent_payload"] for row in rows] == ["3\\n", "4\\n"]
+    assert worker.instances[0].packets == [b"3\n", b"4\n"]
+
+
+def test_vibration_one_shot_reasserts_active_slip_once_on_next_update() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "vibration": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+            },
+        },
+        vibration_worker_factory=worker,
+    )
+    runtime.start()
+
+    runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=_trial_result(slip=True, slip_reason="PINCH_INSUFFICIENT"), snapshot=None)
+    runtime.process_frame(frame_index=2, source_frame_id=None, sample=_sample(0.1), trial_result=_trial_result(slip=True, slip_reason="PINCH_INSUFFICIENT", events=("contact_enter",)), snapshot=None)
+    runtime.process_frame(frame_index=3, source_frame_id=None, sample=_sample(0.2), trial_result=_trial_result(slip=True, slip_reason="PINCH_INSUFFICIENT"), snapshot=None)
+    runtime.process_frame(frame_index=4, source_frame_id=None, sample=_sample(0.3), trial_result=_trial_result(slip=True, slip_reason="PINCH_INSUFFICIENT"), snapshot=None)
+
+    rows = runtime.records_snapshot()
+    assert [row["haptic_phase"] for row in rows] == [
+        "state_start",
+        "one_shot",
+        "state_reassert",
+    ]
+    assert [row["sent_payload"] for row in rows] == ["3\\n", "1\\n", "3\\n"]
+    assert worker.instances[0].packets == [b"3\n", b"1\n", b"3\n"]
+    contact_details = rows[1]["details_json"]
+    reassert_details = rows[2]["details_json"]
+    assert '"interrupted_slip": true' in contact_details
+    assert '"reassert_after_one_shot": true' in reassert_details
 
 
 def test_slip_global_disable_skips_all_slip_vibration() -> None:
     runtime = _runtime(
-        {"enabled": True, "vibration": {"enabled": True, "enable_slip": False}}
+        {
+            "enabled": True,
+            "vibration": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "enable_slip": False,
+            },
+        }
     )
 
     runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=_trial_result(slip=True, slip_reason="PINCH_INSUFFICIENT"), snapshot=None)
@@ -499,6 +574,7 @@ def test_track_blocked_slip_outside_target_can_be_disabled_without_disabling_pin
             "enabled": True,
             "vibration": {
                 "enabled": True,
+                "host": "127.0.0.1",
                 "enable_slip_track_blocked": False,
             },
         }
@@ -509,7 +585,8 @@ def test_track_blocked_slip_outside_target_can_be_disabled_without_disabling_pin
 
     rows = runtime.records_snapshot()
     assert rows[0]["not_sent_reason"] == "slip_track_blocked_disabled"
-    assert rows[1]["send_status"] == "protocol_pending"
+    assert rows[1]["send_status"] == "not_connected"
+    assert rows[1]["not_sent_reason"] == "vibration_not_connected"
 
 
 def test_track_blocked_slip_inside_target_uses_target_region_flag() -> None:
@@ -518,6 +595,7 @@ def test_track_blocked_slip_inside_target_uses_target_region_flag() -> None:
             "enabled": True,
             "vibration": {
                 "enabled": True,
+                "host": "127.0.0.1",
                 "enable_slip_track_blocked": False,
                 "enable_slip_track_blocked_in_target_region": True,
             },
@@ -527,11 +605,13 @@ def test_track_blocked_slip_inside_target_uses_target_region_flag() -> None:
     runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=_trial_result(slip=True, slip_reason="TRACK_BLOCKED", block_center=Vec3(0.5, 0.5, 0.0)), snapshot=None)
 
     row = runtime.records_snapshot()[0]
-    assert row["send_status"] == "protocol_pending"
-    assert row["not_sent_reason"] == "not_implemented"
+    assert row["send_status"] == "not_connected"
+    assert row["not_sent_reason"] == "vibration_not_connected"
 
 
 def test_matrix_and_vibration_targets_do_not_suppress_each_other() -> None:
+    matrix_worker = _FakeWorkerFactory()
+    vibration_worker = _FakeWorkerFactory()
     runtime = _runtime(
         {
             "enabled": True,
@@ -541,9 +621,14 @@ def test_matrix_and_vibration_targets_do_not_suppress_each_other() -> None:
                 "startup_settle_seconds": 0.0,
                 "direction_channel_map": {"X_NEG": [1]},
             },
-            "vibration": {"enabled": True},
+            "vibration": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+            },
         },
-        worker_factory=_FakeWorkerFactory(),
+        worker_factory=matrix_worker,
+        vibration_worker_factory=vibration_worker,
     )
     runtime.start()
 
@@ -573,6 +658,7 @@ def _runtime(
     payload: dict[str, Any],
     *,
     worker_factory: Any = None,
+    vibration_worker_factory: Any = None,
     monotonic_ms_fn: Any = None,
 ) -> HapticRuntime:
     return HapticRuntime(
@@ -580,6 +666,7 @@ def _runtime(
         haptic_config=haptic_config_from_dict(payload),
         trial_config={"target_region": {"min": [0, 0, -1], "max": [1, 1, 1]}},
         worker_factory=worker_factory,
+        vibration_worker_factory=vibration_worker_factory,
         monotonic_ms_fn=monotonic_ms_fn,
         sleep_fn=lambda _seconds: None,
     )
@@ -640,7 +727,7 @@ class _FakeWorker:
     def start(self) -> None:
         self.connected = True
 
-    def submit(self, record: Any, packet: bytes) -> bool:
+    def submit(self, record: Any, packet: bytes, **_: Any) -> bool:
         self.packets.append(packet)
         record.queued_monotonic_ms = 1.0
         record.sent_monotonic_ms = 2.0
