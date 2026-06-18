@@ -1,0 +1,7 @@
+{
+  "max_trial_duration_seconds": 600.0,
+  "max_detach_count": 100,
+  "manual_completion_enabled": true,
+  "timeout_enabled": true,
+  "detach_limit_enabled": true
+}
