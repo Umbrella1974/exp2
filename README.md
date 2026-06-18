@@ -902,6 +902,7 @@ python run_live_integrated_session.py ^
     "feedback_mode": "latched_once",
     "resend_interval_ms": 100,
     "direction_semantics": "blocked_surface",
+    "ignore_direction_axes": ["Z"],
     "direction_channel_map": {
       "X_NEG": [1, 2, 3],
       "X_POS": [4, 5, 6],
@@ -933,9 +934,11 @@ python run_live_integrated_session.py ^
 }
 ```
 
-`matrix.direction_semantics` 默认是 `blocked_surface`，channel map 表示撞到哪一侧边界，例如 `BLOCKED_X_NEG -> X_NEG`。也可以改成 `correction_direction`，channel map 表示应该往哪个方向退回，例如 `BLOCKED_X_NEG -> X_POS`。haptic log 会同时保存 `primary_blocked_surface`、`correction_direction`、`blocked_surface_set`、`correction_direction_set`、`matrix_direction_used` 和 `matrix_direction_semantics`。
+`matrix.direction_semantics` 默认是 `blocked_surface`，channel map 表示撞到哪一侧边界，例如 `BLOCKED_X_NEG -> X_NEG`。也可以改成 `correction_direction`，channel map 表示应该往哪个方向退回，例如 `BLOCKED_X_NEG -> X_POS`。haptic log 会同时保存 `primary_blocked_surface`、`correction_direction`、`blocked_surface_set`、`correction_direction_set`、`matrix_filtered_blocked_surface_set`、`matrix_filtered_correction_direction_set`、`matrix_direction_used`、`matrix_direction_semantics` 和 `matrix_ignored_direction_axes`。
 
 单方向 blocked 继续查 `direction_channel_map`。多方向 blocked 会按 X/Y/Z 轴顺序规范化成组合 key，例如 `X_POS+Y_POS`，然后查 `combination_channel_map`。默认 `missing_combination_policy=skip`，组合缺失时不会把 `X_POS` 和 `Y_POS` 的通道相加，而是在 `haptic_command_log.csv` 中记录 `send_status=not_sent`、`not_sent_reason=missing_combination_mapping`。如需调试并集行为，可以显式设置 `missing_combination_policy=union_single_directions`，但正式实验建议为每个组合单独配置硬件通道。
+
+`matrix.ignore_direction_axes` 只影响 Matrix haptic 输出，不改变 TrialController、BlockController、轨道/target 判定、GUI cue、`processed_frames.csv` 或 `events.csv`。XY 平面实验里可以设为 `["Z"]`：原始几何 blocked set 仍记录为 `X_POS+Y_NEG+Z_POS`，但 Matrix 实际查表使用过滤后的 `X_POS+Y_NEG`。如果过滤后为空，例如 `Z_POS` 且忽略 `Z`，则不发送 Matrix command，并记录 `send_status=skipped`、`not_sent_reason=direction_filtered_empty`。
 
 Matrix `feedback_mode=latched_once` 时，blocked start 或方向变化才发送一次 channel frame；blocked 持续且方向不变不重复发送。`continuous_resend` 会在 blocked active 期间按 `resend_interval_ms` 重发当前方向。blocked end、trial end、invalid、abort 只记录 `state_end`，不发送 `clear_all`、`stop_all` 或默认 zero-channel frame。
 

@@ -35,8 +35,11 @@ HAPTIC_CSV_FIELDS = [
     "correction_direction",
     "blocked_surface_set",
     "correction_direction_set",
+    "matrix_filtered_blocked_surface_set",
+    "matrix_filtered_correction_direction_set",
     "matrix_direction_used",
     "matrix_direction_semantics",
+    "matrix_ignored_direction_axes",
     "channel_list",
     "created_monotonic_ms",
     "queued_monotonic_ms",
@@ -72,8 +75,11 @@ class HapticCommandRecord:
     correction_direction: str | None = None
     blocked_surface_set: str | None = None
     correction_direction_set: str | None = None
+    matrix_filtered_blocked_surface_set: str | None = None
+    matrix_filtered_correction_direction_set: str | None = None
     matrix_direction_used: str | None = None
     matrix_direction_semantics: str | None = None
+    matrix_ignored_direction_axes: str | None = None
     channel_list: list[int] = field(default_factory=list)
     created_monotonic_ms: float | None = None
     queued_monotonic_ms: float | None = None
@@ -116,6 +122,9 @@ class _MatrixBlockedSignature:
     primary_correction: str | None
     blocked_surface_set: str | None
     correction_direction_set: str | None
+    filtered_blocked_surface_set: str | None
+    filtered_correction_direction_set: str | None
+    ignored_direction_axes: str | None
     semantics: str
     track_state: str
     channels: tuple[int, ...]
@@ -432,17 +441,38 @@ class HapticRuntime:
         primary_correction = _opposite_direction(primary_surface)
         blocked_surface_set = _direction_key(surface_names)
         correction_direction_set = _direction_key(correction_names)
+        ignored_axes = self.haptic_config.matrix.ignore_direction_axes
+        filtered_surface_names = _filter_directions_by_axes(surface_names, ignored_axes)
+        filtered_correction_names = tuple(
+            correction
+            for correction in (_opposite_direction(surface) for surface in filtered_surface_names)
+            if correction
+        )
+        filtered_blocked_surface_set = _direction_key(filtered_surface_names)
+        filtered_correction_direction_set = _direction_key(filtered_correction_names)
+        ignored_direction_axes = _axis_key(ignored_axes)
         semantics = self.haptic_config.matrix.direction_semantics
-        direction_names = surface_names if semantics == "blocked_surface" else correction_names
+        direction_names = (
+            filtered_surface_names
+            if semantics == "blocked_surface"
+            else filtered_correction_names
+        )
         direction_key = _direction_key(direction_names)
         track_state = _name(getattr(feedback, "track_state", None))
-        channels, missing_reason = self._matrix_channels_for_direction(direction_key)
+        channels, missing_reason = self._matrix_channels_for_direction(
+            direction_key,
+            filtered=True,
+            original_surface_names=surface_names,
+        )
         return _MatrixBlockedSignature(
             direction_key=direction_key,
             primary_surface=primary_surface or None,
             primary_correction=primary_correction,
             blocked_surface_set=blocked_surface_set,
             correction_direction_set=correction_direction_set,
+            filtered_blocked_surface_set=filtered_blocked_surface_set,
+            filtered_correction_direction_set=filtered_correction_direction_set,
+            ignored_direction_axes=ignored_direction_axes,
             semantics=semantics,
             track_state=track_state,
             channels=tuple(channels),
@@ -452,8 +482,13 @@ class HapticRuntime:
     def _matrix_channels_for_direction(
         self,
         direction_key: str | None,
+        *,
+        filtered: bool = False,
+        original_surface_names: tuple[str, ...] = (),
     ) -> tuple[list[int], str | None]:
         if not direction_key:
+            if filtered and original_surface_names:
+                return [], "direction_filtered_empty"
             return [], None
         parts = direction_key.split("+")
         if len(parts) == 1:
@@ -571,8 +606,11 @@ class HapticRuntime:
             "correction_direction": correction,
             "blocked_surface_set": signature.blocked_surface_set,
             "correction_direction_set": signature.correction_direction_set,
+            "matrix_filtered_blocked_surface_set": signature.filtered_blocked_surface_set,
+            "matrix_filtered_correction_direction_set": signature.filtered_correction_direction_set,
             "matrix_direction_used": direction,
             "matrix_direction_semantics": semantics,
+            "matrix_ignored_direction_axes": signature.ignored_direction_axes,
         }
         record = self._make_record(
             context,
@@ -585,11 +623,17 @@ class HapticRuntime:
             correction_direction=str(correction) if correction else None,
             blocked_surface_set=signature.blocked_surface_set,
             correction_direction_set=signature.correction_direction_set,
+            matrix_filtered_blocked_surface_set=signature.filtered_blocked_surface_set,
+            matrix_filtered_correction_direction_set=signature.filtered_correction_direction_set,
             matrix_direction_used=str(direction) if direction else None,
             matrix_direction_semantics=str(semantics) if semantics else None,
+            matrix_ignored_direction_axes=signature.ignored_direction_axes,
             channel_list=channels,
             details=details,
         )
+        if signature.missing_reason == "direction_filtered_empty":
+            self._finish_not_sent(record, "skipped", "direction_filtered_empty")
+            return
         if not direction:
             self._finish_not_sent(record, "skipped", "missing_direction")
             return
@@ -634,13 +678,19 @@ class HapticRuntime:
             correction_direction=str(correction) if correction else None,
             blocked_surface_set=signature.blocked_surface_set,
             correction_direction_set=signature.correction_direction_set,
+            matrix_filtered_blocked_surface_set=signature.filtered_blocked_surface_set,
+            matrix_filtered_correction_direction_set=signature.filtered_correction_direction_set,
             matrix_direction_used=str(direction) if direction else None,
             matrix_direction_semantics=str(semantics) if semantics else None,
+            matrix_ignored_direction_axes=signature.ignored_direction_axes,
             channel_list=list(signature.channels),
             details={
                 "track_state": track_state,
                 "blocked_surface_set": signature.blocked_surface_set,
                 "correction_direction_set": signature.correction_direction_set,
+                "matrix_filtered_blocked_surface_set": signature.filtered_blocked_surface_set,
+                "matrix_filtered_correction_direction_set": signature.filtered_correction_direction_set,
+                "matrix_ignored_direction_axes": signature.ignored_direction_axes,
                 "end_reason": reason,
                 "hardware_clear_assumed": False,
             },
@@ -687,8 +737,11 @@ class HapticRuntime:
         correction_direction: str | None = None,
         blocked_surface_set: str | None = None,
         correction_direction_set: str | None = None,
+        matrix_filtered_blocked_surface_set: str | None = None,
+        matrix_filtered_correction_direction_set: str | None = None,
         matrix_direction_used: str | None = None,
         matrix_direction_semantics: str | None = None,
+        matrix_ignored_direction_axes: str | None = None,
         channel_list: list[int] | None = None,
         details: dict[str, Any] | None = None,
     ) -> HapticCommandRecord:
@@ -712,8 +765,11 @@ class HapticRuntime:
             correction_direction=correction_direction,
             blocked_surface_set=blocked_surface_set,
             correction_direction_set=correction_direction_set,
+            matrix_filtered_blocked_surface_set=matrix_filtered_blocked_surface_set,
+            matrix_filtered_correction_direction_set=matrix_filtered_correction_direction_set,
             matrix_direction_used=matrix_direction_used,
             matrix_direction_semantics=matrix_direction_semantics,
+            matrix_ignored_direction_axes=matrix_ignored_direction_axes,
             channel_list=list(channel_list or []),
             created_monotonic_ms=self.monotonic_ms_fn(),
             mode=self.mode,
@@ -820,6 +876,22 @@ def _canonical_direction_names(values: list[str]) -> tuple[str, ...]:
         return ()
     key = normalize_direction_key("+".join(values), name="blocked direction set")
     return tuple(key.split("+"))
+
+
+def _filter_directions_by_axes(
+    values: tuple[str, ...],
+    ignored_axes: tuple[str, ...],
+) -> tuple[str, ...]:
+    if not values or not ignored_axes:
+        return values
+    ignored = set(ignored_axes)
+    return tuple(value for value in values if value.split("_", 1)[0] not in ignored)
+
+
+def _axis_key(values: tuple[str, ...]) -> str | None:
+    if not values:
+        return None
+    return "+".join(values)
 
 
 def _direction_key(values: tuple[str, ...]) -> str | None:

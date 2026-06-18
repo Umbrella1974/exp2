@@ -19,6 +19,7 @@ def test_default_haptic_config_is_disabled() -> None:
     assert config.matrix.direction_semantics == "blocked_surface"
     assert config.matrix.combination_channel_map == {}
     assert config.matrix.missing_combination_policy == "skip"
+    assert config.matrix.ignore_direction_axes == ()
     assert config.vibration.enabled is False
 
 
@@ -94,6 +95,20 @@ def test_combination_channel_map_rejects_invalid_keys() -> None:
         haptic_config_from_dict(
             {"matrix": {"combination_channel_map": {"X_POS+X_NEG": [1]}}}
         )
+
+
+def test_ignore_direction_axes_are_validated_and_normalized() -> None:
+    config = haptic_config_from_dict(
+        {"matrix": {"ignore_direction_axes": ["z", "X", "Z"]}}
+    )
+
+    assert config.matrix.ignore_direction_axes == ("X", "Z")
+
+    with pytest.raises(ValueError, match="one of"):
+        haptic_config_from_dict({"matrix": {"ignore_direction_axes": ["A"]}})
+
+    with pytest.raises(ValueError, match="list of axes"):
+        haptic_config_from_dict({"matrix": {"ignore_direction_axes": "Z"}})
 
 
 def test_channel_range_validation() -> None:

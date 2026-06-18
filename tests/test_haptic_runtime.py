@@ -189,6 +189,160 @@ def test_matrix_combination_can_use_correction_direction_semantics() -> None:
     assert row["channel_list"] == "[40]"
 
 
+def test_matrix_ignore_direction_axes_filters_before_lookup() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "ignore_direction_axes": ["Z"],
+                "combination_channel_map": {"X_POS+Y_NEG": [21]},
+            },
+        },
+        worker_factory=worker,
+    )
+    runtime.start()
+
+    runtime.process_frame(
+        frame_index=1,
+        source_frame_id=None,
+        sample=_sample(),
+        trial_result=_trial_result(
+            blocked=True,
+            primary_surface="X_POS",
+            track_state="BLOCKED_X_POS",
+            blocked_surfaces=("X_POS", "Y_NEG", "Z_POS"),
+        ),
+        snapshot=None,
+    )
+
+    row = runtime.records_snapshot()[0]
+    assert row["blocked_surface_set"] == "X_POS+Y_NEG+Z_POS"
+    assert row["correction_direction_set"] == "X_NEG+Y_POS+Z_NEG"
+    assert row["matrix_filtered_blocked_surface_set"] == "X_POS+Y_NEG"
+    assert row["matrix_filtered_correction_direction_set"] == "X_NEG+Y_POS"
+    assert row["matrix_ignored_direction_axes"] == "Z"
+    assert row["matrix_direction_used"] == "X_POS+Y_NEG"
+    assert row["channel_list"] == "[21]"
+    assert row["send_status"] == "sent"
+    assert worker.instances[0].packets
+
+
+def test_matrix_ignore_direction_axes_empty_after_filter_skips_without_fallback() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "ignore_direction_axes": ["Z"],
+                "direction_channel_map": {"X_POS": [1], "Z_POS": [9]},
+            },
+        },
+        worker_factory=worker,
+    )
+    runtime.start()
+
+    runtime.process_frame(
+        frame_index=1,
+        source_frame_id=None,
+        sample=_sample(),
+        trial_result=_trial_result(
+            blocked=True,
+            primary_surface="Z_POS",
+            track_state="BLOCKED_Z_POS",
+            blocked_surfaces=("Z_POS",),
+        ),
+        snapshot=None,
+    )
+
+    row = runtime.records_snapshot()[0]
+    assert row["blocked_surface_set"] == "Z_POS"
+    assert row["matrix_filtered_blocked_surface_set"] is None
+    assert row["matrix_direction_used"] is None
+    assert row["send_status"] == "skipped"
+    assert row["not_sent_reason"] == "direction_filtered_empty"
+    assert worker.instances[0].packets == []
+
+
+def test_matrix_without_ignore_direction_axes_keeps_full_3d_key_requirement() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "combination_channel_map": {"X_POS+Y_NEG": [21]},
+            },
+        },
+        worker_factory=worker,
+    )
+    runtime.start()
+
+    runtime.process_frame(
+        frame_index=1,
+        source_frame_id=None,
+        sample=_sample(),
+        trial_result=_trial_result(
+            blocked=True,
+            primary_surface="X_POS",
+            track_state="BLOCKED_X_POS",
+            blocked_surfaces=("X_POS", "Y_NEG", "Z_POS"),
+        ),
+        snapshot=None,
+    )
+
+    row = runtime.records_snapshot()[0]
+    assert row["matrix_direction_used"] == "X_POS+Y_NEG+Z_POS"
+    assert row["send_status"] == "not_sent"
+    assert row["not_sent_reason"] == "missing_combination_mapping"
+    assert worker.instances[0].packets == []
+
+
+def test_matrix_ignore_direction_axes_filters_before_correction_direction() -> None:
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "direction_semantics": "correction_direction",
+                "ignore_direction_axes": ["Z"],
+                "combination_channel_map": {"X_NEG+Y_POS": [41]},
+            },
+        },
+        worker_factory=_FakeWorkerFactory(),
+    )
+    runtime.start()
+
+    runtime.process_frame(
+        frame_index=1,
+        source_frame_id=None,
+        sample=_sample(),
+        trial_result=_trial_result(
+            blocked=True,
+            primary_surface="X_POS",
+            track_state="BLOCKED_X_POS",
+            blocked_surfaces=("X_POS", "Y_NEG", "Z_POS"),
+        ),
+        snapshot=None,
+    )
+
+    row = runtime.records_snapshot()[0]
+    assert row["correction_direction_set"] == "X_NEG+Y_POS+Z_NEG"
+    assert row["matrix_filtered_correction_direction_set"] == "X_NEG+Y_POS"
+    assert row["matrix_direction_used"] == "X_NEG+Y_POS"
+    assert row["channel_list"] == "[41]"
+
+
 def test_missing_channel_mapping_is_skipped_without_send() -> None:
     worker = _FakeWorkerFactory()
     runtime = _runtime(

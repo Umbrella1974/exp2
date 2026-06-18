@@ -10,6 +10,7 @@ from typing import Any
 
 
 DIRECTION_KEYS = ("X_NEG", "X_POS", "Y_NEG", "Y_POS", "Z_NEG", "Z_POS")
+AXIS_KEYS = ("X", "Y", "Z")
 MATRIX_FEEDBACK_MODES = ("latched_once", "continuous_resend")
 MATRIX_DIRECTION_SEMANTICS = ("blocked_surface", "correction_direction")
 MATRIX_MISSING_COMBINATION_POLICIES = ("skip", "union_single_directions")
@@ -37,6 +38,7 @@ class MatrixHapticConfig:
     )
     combination_channel_map: dict[str, list[int]] = field(default_factory=dict)
     missing_combination_policy: str = "skip"
+    ignore_direction_axes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _bool_value(self.enabled, "matrix.enabled")
@@ -98,6 +100,11 @@ class MatrixHapticConfig:
                 "matrix.missing_combination_policy must be one of: "
                 + ", ".join(MATRIX_MISSING_COMBINATION_POLICIES)
             )
+        object.__setattr__(
+            self,
+            "ignore_direction_axes",
+            _axis_list(self.ignore_direction_axes, "matrix.ignore_direction_axes"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -230,6 +237,7 @@ def _matrix_config_from_dict(payload: dict[str, Any]) -> MatrixHapticConfig:
         "direction_channel_map",
         "combination_channel_map",
         "missing_combination_policy",
+        "ignore_direction_axes",
     }
     unknown = sorted(set(payload) - allowed)
     if unknown:
@@ -269,6 +277,7 @@ def _matrix_config_from_dict(payload: dict[str, Any]) -> MatrixHapticConfig:
                 MatrixHapticConfig.missing_combination_policy,
             )
         ),
+        ignore_direction_axes=payload.get("ignore_direction_axes", ()),
     )
 
 
@@ -377,6 +386,27 @@ def _combination_channel_map(value: Any) -> dict[str, list[int]]:
             for ch in raw_channels
         ]
     return normalized
+
+
+def _axis_list(value: Any, name: str) -> tuple[str, ...]:
+    if value is None:
+        value = ()
+    if isinstance(value, str):
+        raise ValueError(f"{name} must be a list of axes.")
+    try:
+        raw_axes = list(value)
+    except TypeError as exc:
+        raise ValueError(f"{name} must be a list of axes.") from exc
+    axes: list[str] = []
+    for raw_axis in raw_axes:
+        if not isinstance(raw_axis, str):
+            raise ValueError(f"{name} axes must be strings.")
+        axis = raw_axis.strip().upper()
+        if axis not in AXIS_KEYS:
+            raise ValueError(f"{name} axes must be one of: " + ", ".join(AXIS_KEYS))
+        if axis not in axes:
+            axes.append(axis)
+    return tuple(sorted(axes, key=AXIS_KEYS.index))
 
 
 def normalize_direction_key(value: Any, *, name: str = "direction key") -> str:
