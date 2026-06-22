@@ -198,6 +198,11 @@ class FeedbackState:
     hand_delta: Vec3 | None = None
     candidate_block_center: Vec3 | None = None
     blocked_info: BlockedInfo | None = None
+    boundary_lock_active: bool = False
+    boundary_lock_surface: Surface | None = None
+    boundary_lock_escape_progress: float = 0.0
+    boundary_lock_unlock_delta_m: float | None = None
+    boundary_lock_event: str = "none"
 
 
 @dataclass(frozen=True)

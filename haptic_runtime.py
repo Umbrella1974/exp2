@@ -126,6 +126,12 @@ class _FrameContext:
     source_sample_time: float | None
 
 
+@dataclass(frozen=True)
+class _VibrationOneShotFrameState:
+    one_shot_sent: bool = False
+    contact_exit_queued: bool = False
+
+
 class HapticStartupError(RuntimeError):
     """Raised when required haptic hardware cannot start before trial."""
 
@@ -196,6 +202,7 @@ class HapticRuntime:
         self._session_ended = False
         self._trial_ended = False
         self._previous_slip_signature: tuple[Any, ...] | None = None
+        self._previous_gated_slip_signature: tuple[Any, ...] | None = None
         self._pending_slip_reassert_after_one_shot: tuple[Any, ...] | None = None
         self._pending_slip_reassert_frame_index: int | None = None
         self._previous_blocked_signature: _MatrixBlockedSignature | None = None
@@ -203,6 +210,8 @@ class HapticRuntime:
         self._last_context: _FrameContext | None = None
         self._target_box = _target_box_from_trial_config(self.trial_config)
         self._warned_missing_target_region = False
+        self._has_valid_grab_history = False
+        self._need_pinch_requires_valid_grab_count = 0
 
     @property
     def haptic_enabled(self) -> bool:
@@ -222,6 +231,7 @@ class HapticRuntime:
         if self._started:
             return
         self._started = True
+        self._clear_valid_grab_history()
         if not self.haptic_enabled:
             return
         if self.matrix_haptic_enabled:
@@ -316,8 +326,9 @@ class HapticRuntime:
             return ()
 
         before = len(self._records)
-        one_shot_sent = self._process_contact_events(context, trial_result)
-        self._process_slip_state(context, trial_result, one_shot_sent=one_shot_sent)
+        self._observe_valid_grab(output)
+        one_shot_state = self._process_contact_events(context, trial_result)
+        self._process_slip_state(context, trial_result, one_shot_state=one_shot_state)
         self._process_blocked_state(context, trial_result)
         return tuple(self._records[before:])
 
@@ -365,6 +376,9 @@ class HapticRuntime:
             "is_live_haptic_timing": self.is_live_haptic_timing,
             "haptic_count": len(records),
             "haptic_type_counts": dict(type_counts),
+            "need_pinch_requires_valid_grab_count": int(
+                self._need_pinch_requires_valid_grab_count
+            ),
             "effective_haptic_config": self.haptic_config.to_dict(),
             "haptic_command_log_path": (
                 str(haptic_log_path)
@@ -403,12 +417,18 @@ class HapticRuntime:
                 writer.writerow({field: record.get(field, "") for field in HAPTIC_CSV_FIELDS})
         return target
 
-    def _process_contact_events(self, context: _FrameContext, trial_result: Any) -> bool:
+    def _process_contact_events(
+        self,
+        context: _FrameContext,
+        trial_result: Any,
+    ) -> _VibrationOneShotFrameState:
         if not self.vibration_haptic_enabled:
-            return False
+            self._clear_valid_grab_history_for_events(trial_result)
+            return _VibrationOneShotFrameState()
         one_shot_sent = False
+        contact_exit_queued = False
         for event in getattr(trial_result, "events", ()) or ():
-            event_type = str(getattr(event, "event_type", "")).lower()
+            event_type = _event_type_name(getattr(event, "event_type", ""))
             if event_type == "contact_enter":
                 enabled = self.haptic_config.vibration.enable_contact
                 interrupted_slip = self._one_shot_would_interrupt_slip()
@@ -451,27 +471,65 @@ class HapticRuntime:
                 )
                 if _record_was_queued_or_sent(record):
                     one_shot_sent = True
+                    contact_exit_queued = True
                     self._schedule_slip_reassert_after_one_shot(
                         context,
                         interrupted_slip=interrupted_slip,
                     )
-        return one_shot_sent
+                self._clear_valid_grab_history()
+            elif event_type in {"active_release", "forced_detach", "unexpected_detach"}:
+                self._clear_valid_grab_history()
+        return _VibrationOneShotFrameState(
+            one_shot_sent=one_shot_sent,
+            contact_exit_queued=contact_exit_queued,
+        )
 
     def _process_slip_state(
         self,
         context: _FrameContext,
         trial_result: Any,
         *,
-        one_shot_sent: bool,
+        one_shot_state: _VibrationOneShotFrameState,
     ) -> None:
         signature = self._slip_signature(trial_result)
         if signature is None:
             if self._previous_slip_signature is not None:
-                self._record_slip_end(context, self._previous_slip_signature, "slip_inactive")
+                self._record_slip_end(
+                    context,
+                    self._previous_slip_signature,
+                    "slip_inactive",
+                    covered_by_contact_exit=one_shot_state.contact_exit_queued,
+                )
             self._previous_slip_signature = None
+            self._previous_gated_slip_signature = None
             self._clear_pending_slip_reassert()
             return
-        if one_shot_sent and self.haptic_config.vibration.one_shot_interrupts_slip:
+        if self._slip_requires_valid_grab_gate(signature):
+            if self._previous_slip_signature is not None:
+                self._record_slip_end(
+                    context,
+                    self._previous_slip_signature,
+                    "need_pinch_requires_valid_grab",
+                    covered_by_contact_exit=one_shot_state.contact_exit_queued,
+                )
+            self._previous_slip_signature = None
+            self._clear_pending_slip_reassert()
+            phase = None
+            if self._previous_gated_slip_signature is None:
+                phase = "state_start"
+            elif signature != self._previous_gated_slip_signature:
+                phase = "state_update"
+            if phase is not None:
+                self._record_slip_command(
+                    context,
+                    signature,
+                    phase,
+                    gated_by_valid_grab=True,
+                )
+            self._previous_gated_slip_signature = signature
+            return
+        self._previous_gated_slip_signature = None
+        if one_shot_state.one_shot_sent and self.haptic_config.vibration.one_shot_interrupts_slip:
             if self.haptic_config.vibration.reassert_slip_after_one_shot:
                 self._pending_slip_reassert_after_one_shot = signature
                 self._pending_slip_reassert_frame_index = context.frame_index
@@ -535,10 +593,12 @@ class HapticRuntime:
             self._record_slip_end(context, self._previous_slip_signature, reason)
             self._previous_slip_signature = None
             self._clear_pending_slip_reassert()
+        self._previous_gated_slip_signature = None
         if self._previous_blocked_signature is not None:
             self._record_matrix_end(context, self._previous_blocked_signature, reason)
             self._previous_blocked_signature = None
             self._last_matrix_send_monotonic_ms = None
+        self._clear_valid_grab_history()
 
     def _one_shot_would_interrupt_slip(self) -> bool:
         return bool(
@@ -676,9 +736,10 @@ class HapticRuntime:
         phase: str,
         *,
         details: dict[str, Any] | None = None,
-    ) -> None:
+        gated_by_valid_grab: bool = False,
+    ) -> HapticCommandRecord | None:
         if not self.vibration_haptic_enabled:
-            return
+            return None
         reason, in_target = signature
         enabled, disabled_reason = self._slip_enabled(str(reason or ""), in_target)
         command_details = {
@@ -687,7 +748,20 @@ class HapticRuntime:
         }
         if details:
             command_details.update(details)
-        self._record_vibration_command(
+        if gated_by_valid_grab:
+            enabled = False
+            disabled_reason = "need_pinch_requires_valid_grab"
+            self._need_pinch_requires_valid_grab_count += 1
+            command_details.update(
+                {
+                    "need_pinch_active": True,
+                    "pinch_insufficient_slip_policy": (
+                        self.haptic_config.vibration.pinch_insufficient_slip_policy
+                    ),
+                    "has_valid_grab_history": bool(self._has_valid_grab_history),
+                }
+            )
+        return self._record_vibration_command(
             context,
             cue_type=_slip_cue_type(str(reason or "")),
             haptic_type="vibration_slip",
@@ -704,11 +778,34 @@ class HapticRuntime:
         context: _FrameContext,
         signature: tuple[Any, ...],
         reason: str,
+        *,
+        covered_by_contact_exit: bool = False,
     ) -> None:
         if not self.vibration_haptic_enabled:
             return
         slip_reason, in_target = signature
         enabled, disabled_reason = self._slip_enabled(str(slip_reason or ""), in_target)
+        if covered_by_contact_exit:
+            record = self._make_record(
+                context,
+                target_device="vibration",
+                target_transport=self.haptic_config.vibration.transport,
+                cue_type=_slip_cue_type(str(slip_reason or "")),
+                haptic_type="vibration_slip",
+                haptic_phase="state_end",
+                direction=None,
+                vibration_command=self.haptic_config.vibration.command_map.get("slip_end"),
+                vibration_command_label="slip_end",
+                details={
+                    "slip_reason": slip_reason,
+                    "block_center_in_target_region": in_target,
+                    "end_reason": reason,
+                    "covered_by_contact_exit": True,
+                    "coverage_basis": "queued",
+                },
+            )
+            self._finish_not_sent(record, "skipped", "covered_by_contact_exit")
+            return
         self._record_vibration_command(
             context,
             cue_type=_slip_cue_type(str(slip_reason or "")),
@@ -743,6 +840,37 @@ class HapticRuntime:
                 return True, None
             return False, "slip_track_blocked_disabled"
         return False, "unsupported_slip_reason"
+
+    def _slip_requires_valid_grab_gate(self, signature: tuple[Any, ...]) -> bool:
+        reason, _in_target = signature
+        vibration = self.haptic_config.vibration
+        return bool(
+            str(reason or "") == "PINCH_INSUFFICIENT"
+            and vibration.pinch_insufficient_slip_policy == "requires_prior_grab"
+            and not self._has_valid_grab_history
+        )
+
+    def _observe_valid_grab(self, output: Any) -> None:
+        if (
+            _name(getattr(output, "contact_state", None)) == "INSIDE_BLOCK"
+            and _name(getattr(output, "pinch_state", None)) == "PINCH_VALID"
+        ):
+            self._has_valid_grab_history = True
+
+    def _clear_valid_grab_history_for_events(self, trial_result: Any) -> None:
+        for event in getattr(trial_result, "events", ()) or ():
+            event_type = _event_type_name(getattr(event, "event_type", ""))
+            if event_type in {
+                "contact_exit",
+                "active_release",
+                "forced_detach",
+                "unexpected_detach",
+            }:
+                self._clear_valid_grab_history()
+                return
+
+    def _clear_valid_grab_history(self) -> None:
+        self._has_valid_grab_history = False
 
     def _record_matrix_command(
         self,
@@ -990,6 +1118,7 @@ def disabled_haptic_summary() -> dict[str, Any]:
         "is_live_haptic_timing": None,
         "haptic_count": 0,
         "haptic_type_counts": {},
+        "need_pinch_requires_valid_grab_count": 0,
         "effective_haptic_config": config.to_dict(),
         "haptic_command_log_path": None,
         "haptic_warnings": [],
@@ -1117,6 +1246,10 @@ def _slip_cue_type(reason: str) -> str:
     if reason == "TRACK_BLOCKED":
         return "slip_track_blocked"
     return "slip"
+
+
+def _event_type_name(value: Any) -> str:
+    return _name(value).lower()
 
 
 def _name(value: Any) -> str:

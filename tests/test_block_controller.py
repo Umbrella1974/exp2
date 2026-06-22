@@ -67,12 +67,14 @@ def make_input(
     time: float,
     x: float,
     *,
+    y: float = 0.0,
+    z: float = 0.0,
     distance: float = 0.01,
     tracker_valid: bool = True,
 ) -> FrameInput:
     return FrameInput(
         time=time,
-        pinch_center_task=Vec3(x, 0.0, 0.0),
+        pinch_center_task=Vec3(x, y, z),
         pinch_distance=distance,
         tracker_valid=tracker_valid,
     )
@@ -168,6 +170,45 @@ def test_blocked_then_hand_moves_back_can_resume_moving() -> None:
     output = controller.update(make_input(2.0, 0.9))
     assert output.block_state.motion_state == BlockMotionState.GRABBED_MOVING
     assert output.block_state.center.x == pytest.approx(0.8, abs=1e-4)
+
+
+def test_boundary_lock_freezes_until_valid_reverse_cumulative_motion_unlocks() -> None:
+    controller = BlockController(
+        make_config(
+            boundary_lock_enabled=True,
+            boundary_lock_unlock_delta_m=0.005,
+            boundary_lock_contact_tolerance_m=0.0,
+        ),
+        make_track(size=2.0),
+        Vec3(0.7, 0.0, 0.0),
+    )
+    controller.update(make_input(0.0, 0.7))
+
+    locked_enter = controller.update(make_input(1.0, 1.1))
+    assert locked_enter.block_state.center.x == pytest.approx(1.0, abs=1e-4)
+    assert locked_enter.feedback_state.boundary_lock_active is True
+    assert locked_enter.feedback_state.boundary_lock_event == "lock_enter"
+    assert locked_enter.feedback_state.boundary_lock_surface == Surface.X_POS
+
+    tangent = controller.update(make_input(2.0, 1.1, y=0.1))
+    assert tangent.block_state.center == locked_enter.block_state.center
+    assert tangent.feedback_state.boundary_lock_event == "locked"
+    assert tangent.feedback_state.boundary_lock_escape_progress == pytest.approx(0.0)
+
+    small_reverse = controller.update(make_input(3.0, 1.096, y=0.1))
+    assert small_reverse.block_state.center == locked_enter.block_state.center
+    assert small_reverse.feedback_state.boundary_lock_event == "locked"
+    assert small_reverse.feedback_state.boundary_lock_escape_progress == pytest.approx(0.004)
+
+    unlock = controller.update(make_input(4.0, 1.094, y=0.1))
+    assert unlock.block_state.center == locked_enter.block_state.center
+    assert unlock.feedback_state.boundary_lock_active is False
+    assert unlock.feedback_state.boundary_lock_event == "unlock"
+    assert unlock.feedback_state.boundary_lock_escape_progress == pytest.approx(0.006)
+
+    resumed = controller.update(make_input(5.0, 0.9, y=0.1))
+    assert resumed.block_state.motion_state == BlockMotionState.GRABBED_MOVING
+    assert resumed.block_state.center.x == pytest.approx(0.806, abs=1e-4)
 
 
 def test_large_hand_delta_stops_motion() -> None:

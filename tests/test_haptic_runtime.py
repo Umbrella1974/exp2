@@ -515,6 +515,65 @@ def test_vibration_slip_start_and_end_are_state_commands() -> None:
     assert worker.instances[0].packets == [b"3\n", b"4\n"]
 
 
+def test_vibration_contact_exit_covers_same_frame_slip_end_when_release_queued() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "vibration": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+            },
+        },
+        vibration_worker_factory=worker,
+    )
+    runtime.start()
+
+    runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=_trial_result(slip=True, slip_reason="PINCH_INSUFFICIENT"), snapshot=None)
+    runtime.process_frame(frame_index=2, source_frame_id=None, sample=_sample(0.1), trial_result=_trial_result(slip=False, events=("contact_exit",)), snapshot=None)
+
+    rows = runtime.records_snapshot()
+    assert [row["vibration_command_label"] for row in rows] == [
+        "slip_start",
+        "contact_exit",
+        "slip_end",
+    ]
+    assert rows[-1]["send_status"] == "skipped"
+    assert rows[-1]["not_sent_reason"] == "covered_by_contact_exit"
+    assert '"covered_by_contact_exit": true' in rows[-1]["details_json"]
+    assert '"coverage_basis": "queued"' in rows[-1]["details_json"]
+    assert worker.instances[0].packets == [b"3\n", b"2\n"]
+
+
+def test_vibration_contact_exit_does_not_cover_slip_end_when_release_disabled() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "vibration": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "enable_release": False,
+            },
+        },
+        vibration_worker_factory=worker,
+    )
+    runtime.start()
+
+    runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=_trial_result(slip=True, slip_reason="PINCH_INSUFFICIENT"), snapshot=None)
+    runtime.process_frame(frame_index=2, source_frame_id=None, sample=_sample(0.1), trial_result=_trial_result(slip=False, events=("contact_exit",)), snapshot=None)
+
+    rows = runtime.records_snapshot()
+    assert rows[1]["vibration_command_label"] == "contact_exit"
+    assert rows[1]["send_status"] == "skipped"
+    assert rows[1]["not_sent_reason"] == "release_disabled"
+    assert rows[2]["vibration_command_label"] == "slip_end"
+    assert rows[2]["send_status"] == "sent"
+    assert worker.instances[0].packets == [b"3\n", b"4\n"]
+
+
 def test_vibration_one_shot_reasserts_active_slip_once_on_next_update() -> None:
     worker = _FakeWorkerFactory()
     runtime = _runtime(
@@ -566,6 +625,92 @@ def test_slip_global_disable_skips_all_slip_vibration() -> None:
     row = runtime.records_snapshot()[0]
     assert row["send_status"] == "skipped"
     assert row["not_sent_reason"] == "slip_disabled"
+
+
+def test_pinch_insufficient_slip_requires_prior_valid_grab_policy_skips_loose_touch() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "vibration": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "pinch_insufficient_slip_policy": "requires_prior_grab",
+            },
+        },
+        vibration_worker_factory=worker,
+    )
+    runtime.start()
+
+    for frame_index in (1, 2):
+        runtime.process_frame(
+            frame_index=frame_index,
+            source_frame_id=None,
+            sample=_sample(),
+            trial_result=_trial_result(
+                slip=True,
+                slip_reason="PINCH_INSUFFICIENT",
+                contact_state="INSIDE_BLOCK",
+                pinch_state="PINCH_INSUFFICIENT",
+            ),
+            snapshot=None,
+        )
+
+    rows = runtime.records_snapshot()
+    assert len(rows) == 1
+    assert rows[0]["send_status"] == "skipped"
+    assert rows[0]["not_sent_reason"] == "need_pinch_requires_valid_grab"
+    assert '"need_pinch_active": true' in rows[0]["details_json"]
+    assert runtime.summary()["need_pinch_requires_valid_grab_count"] == 1
+    assert worker.instances[0].packets == []
+
+
+def test_pinch_insufficient_slip_requires_prior_valid_grab_policy_allows_after_valid_grab() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "vibration": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "pinch_insufficient_slip_policy": "requires_prior_grab",
+            },
+        },
+        vibration_worker_factory=worker,
+    )
+    runtime.start()
+
+    runtime.process_frame(
+        frame_index=1,
+        source_frame_id=None,
+        sample=_sample(),
+        trial_result=_trial_result(
+            slip=False,
+            contact_state="INSIDE_BLOCK",
+            pinch_state="PINCH_VALID",
+        ),
+        snapshot=None,
+    )
+    runtime.process_frame(
+        frame_index=2,
+        source_frame_id=None,
+        sample=_sample(0.1),
+        trial_result=_trial_result(
+            slip=True,
+            slip_reason="PINCH_INSUFFICIENT",
+            contact_state="INSIDE_BLOCK",
+            pinch_state="PINCH_INSUFFICIENT",
+        ),
+        snapshot=None,
+    )
+
+    rows = runtime.records_snapshot()
+    assert len(rows) == 1
+    assert rows[0]["send_status"] == "sent"
+    assert rows[0]["vibration_command_label"] == "slip_start"
+    assert worker.instances[0].packets == [b"3\n"]
 
 
 def test_track_blocked_slip_outside_target_can_be_disabled_without_disabling_pinch_slip() -> None:
@@ -682,6 +827,8 @@ def _trial_result(
     events: tuple[str, ...] = (),
     block_center: Vec3 = Vec3(0.0, 0.0, 0.0),
     blocked_surfaces: tuple[str, ...] = (),
+    contact_state: str = "OUTSIDE_BLOCK",
+    pinch_state: str = "PINCH_UNKNOWN",
 ) -> Any:
     return SimpleNamespace(
         time_since_prompt=0.1,
@@ -696,6 +843,8 @@ def _trial_result(
             force_magnitude=0.0,
         ),
         frame_output=SimpleNamespace(
+            contact_state=contact_state,
+            pinch_state=pinch_state,
             feedback_state=SimpleNamespace(
                 tracking_valid=True,
                 recovery_frame=False,

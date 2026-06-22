@@ -29,6 +29,10 @@ class EngineConfig:
     min_x_axis_length: float = 0.1
     record_frames: bool = True
     record_events: bool = True
+    boundary_lock_enabled: bool = False
+    boundary_lock_unlock_delta_m: float = 0.005
+    boundary_lock_contact_tolerance_m: float = 0.0
+    boundary_lock_surface_mode: str = "primary"
 
     @property
     def block_size(self) -> Vec3:

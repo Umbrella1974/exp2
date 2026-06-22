@@ -629,6 +629,7 @@ def _engine_config_from_trial_config(
         )
     mode = str(session_meta.get("mode", trial_config.get("mode", "")))
     default_max_delta = 10.0 if mode.startswith("offline_") else defaults.max_hand_delta_per_frame
+    boundary_lock = _boundary_lock_config_from_trial_config(trial_config)
     return EngineConfig(
         block_size_x=block_size.x,
         block_size_y=block_size.y,
@@ -639,7 +640,36 @@ def _engine_config_from_trial_config(
         trial_timeout_seconds=float(trial_config.get("trial_timeout_seconds", 1e9)),
         max_detach_count=int(trial_config.get("max_detach_count", 1_000_000_000)),
         max_hand_delta_per_frame=float(trial_config.get("max_hand_delta_per_frame", default_max_delta)),
+        boundary_lock_enabled=bool(boundary_lock.get("enabled", defaults.boundary_lock_enabled)),
+        boundary_lock_unlock_delta_m=float(
+            boundary_lock.get(
+                "unlock_delta_m",
+                defaults.boundary_lock_unlock_delta_m,
+            )
+        ),
+        boundary_lock_contact_tolerance_m=float(
+            boundary_lock.get(
+                "contact_tolerance_m",
+                defaults.boundary_lock_contact_tolerance_m,
+            )
+        ),
+        boundary_lock_surface_mode=str(
+            boundary_lock.get(
+                "surface_mode",
+                defaults.boundary_lock_surface_mode,
+            )
+        ),
     )
+
+
+def _boundary_lock_config_from_trial_config(trial_config: dict[str, Any]) -> dict[str, Any]:
+    interaction = trial_config.get("effective_interaction_config")
+    if not isinstance(interaction, dict):
+        interaction = trial_config.get("interaction_config")
+    if not isinstance(interaction, dict):
+        return {}
+    boundary_lock = interaction.get("boundary_lock")
+    return boundary_lock if isinstance(boundary_lock, dict) else {}
 
 
 def _sleep_for_replay_timing(

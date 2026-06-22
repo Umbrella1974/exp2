@@ -1,0 +1,8 @@
+{
+  "boundary_lock": {
+    "enabled": true,
+    "unlock_delta_m": 0.005,
+    "contact_tolerance_m": 0.0,
+    "surface_mode": "primary"
+  }
+}

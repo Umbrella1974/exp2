@@ -781,6 +781,44 @@ python run_live_integrated_session.py ^
 
 也支持 `.yaml` / `.yml`，但会 lazy import `PyYAML`；如果没安装，会给出明确的安装提示。最终生效的配置会写入 `out_dir/session/termination_config.json`，并同时进入 `summary.json`、`session_meta.json`、`trial_config.json` 和 `trial_summary.json`。`--duration-seconds` 是 debug 外层运行时长上限，结果是 `trial_outcome=DURATION_REACHED`、`end_reason=duration_reached`；它和保护性 `max_trial_duration_seconds` 的 `trial_outcome=FAILED_TIMEOUT`、`end_reason=trial_timeout` 严格分开。
 
+### Interaction Boundary Lock
+
+`interaction_config` 控制交互物理层行为，不属于 cue/haptic 输出层，也不改变 TrialController 的 trial lifecycle。当前只有 `boundary_lock`：第一次撞到 track 边界后锁住 block position 和 primary blocked surface；lock 期间切向移动不移动物块，只有 `PINCH_VALID` 且 pinch center 相对 lock 进入点朝反方向累计移动超过阈值时才解锁。解锁帧不会立刻移动物块，会先 reset `previous_pinch_center`，避免下一帧出现大跳。
+
+默认关闭；可以用示例配置开启：
+
+```powershell
+python run_live_integrated_session.py ^
+  --map-config maps\examples\xoy_turn.json ^
+  --host 127.0.0.1 ^
+  --port 8888 ^
+  --out-dir data\live_integrated_session\boundary_lock_01 ^
+  --interaction-config configs\interaction_boundary_lock.example.json
+```
+
+也可以用 CLI 覆盖配置文件中的单项：
+
+```powershell
+--enable-boundary-lock --boundary-lock-unlock-delta-m 0.005 --boundary-lock-contact-tolerance-m 0.0
+```
+
+优先级是：默认值 < `--interaction-config` 文件 < 显式 CLI 参数。最终生效配置会写入 `session/interaction_config.json`，并进入 `summary.json`、`session_meta.json`、`trial_config.json` 和 `trial_summary.json`。第一版 `surface_mode` 只支持 `primary`：角落或多方向 blocked 时只锁 primary surface；这和 Matrix 多方向组合反馈是两层不同逻辑，Matrix 仍可按 all blocked surfaces 查组合 channel。
+
+配置结构：
+
+```json
+{
+  "boundary_lock": {
+    "enabled": true,
+    "unlock_delta_m": 0.005,
+    "contact_tolerance_m": 0.0,
+    "surface_mode": "primary"
+  }
+}
+```
+
+`contact_tolerance_m` 只在 `boundary_lock_active=true` 时用于维持 lock/contact，不扩大普通 contact enter/exit 判定。逐帧诊断看 `processed_frames.csv` 的 `boundary_lock_active`、`boundary_lock_surface`、`boundary_lock_escape_progress`、`boundary_lock_unlock_delta_m`、`boundary_lock_event`；事件值为 `none`、`lock_enter`、`locked`、`unlock`。
+
 ### Cue / Haptic Abstraction
 
 cue 层只做非硬件提示；haptic Stage 2 是独立输出层。两者都观察现有 `TrialController` / `BlockController` 输出，不修改 contact、slip、blocked、detach 或 trial outcome 逻辑。cue priority 只影响 GUI/console 显示一个主要提示；haptic 不复用 cue priority，`matrix` 和 `vibration` 两个 target 可以同时生成 command。
@@ -957,7 +995,8 @@ python run_live_integrated_session.py ^
     "enable_slip": true,
     "enable_slip_pinch_insufficient": true,
     "enable_slip_track_blocked": true,
-    "enable_slip_track_blocked_in_target_region": true
+    "enable_slip_track_blocked_in_target_region": true,
+    "pinch_insufficient_slip_policy": "allow_loose_touch"
   }
 }
 ```
@@ -1002,7 +1041,11 @@ slip_end      -> vibration state_end  -> 4\n
 
 Slip 开关是分层的：`enable_slip=false` 关闭所有 slip vibration；`PINCH_INSUFFICIENT` 由 `enable_slip_pinch_insufficient` 控制；`TRACK_BLOCKED` 在 target_region 外由 `enable_slip_track_blocked` 控制，在 map 定义的 `target_region` 内由 `enable_slip_track_blocked_in_target_region` 控制。target 判断复用 `trial_config.target_region` 的 box，不新造距离阈值。
 
+`vibration.pinch_insufficient_slip_policy` 只影响 `PINCH_INSUFFICIENT` 是否发 vibration rough slip，不改变核心 `slip_active`、`slip_reason`、`events.csv`、`processed_frames.csv`、cue 或 Matrix。默认 `allow_loose_touch` 保持旧行为；`requires_prior_grab` 表示当前连续 contact 内必须先观察到 `contact_state=INSIDE_BLOCK` 且 `pinch_state=PINCH_VALID`，之后松开导致的 `PINCH_INSUFFICIENT` 才会发 `3\n`。如果没有先有效抓住，只在 `haptic_command_log.csv` 记录 `not_sent_reason=need_pinch_requires_valid_grab`，summary 中 `need_pinch_requires_valid_grab_count` 会计数。
+
 当前 vibration ESP32 固件里 one-shot 和 rough slip 不是叠加播放关系：contact/release one-shot 实际会中断 slip。`one_shot_interrupts_slip=false` 不能表示硬件可以叠加，只表示电脑端不做 interrupted-slip 特殊记录和 reassert 逻辑。如果 `one_shot_interrupts_slip=true` 且 `reassert_slip_after_one_shot=true`，电脑端会在后续 frame 仍然 `slip_active=true` 且 slip 配置允许时补发一次 `3\n`，然后清掉 pending 标记；它不会每帧重复发送 `3\n`，也不保证 one-shot 完整播放结束后才恢复 slip。
+
+如果同一帧 `contact_exit` 和 `slip_end` 同时发生，并且 `contact_exit/2\n` 已经成功进入 vibration worker 队列或已发送，则电脑端不再额外发送 `slip_end/4\n`，避免 release one-shot 被 stop slip 立刻覆盖。日志仍会写一条 `vibration_slip` / `state_end`，`send_status=skipped`、`not_sent_reason=covered_by_contact_exit`、`details_json.coverage_basis=queued`。如果 release 被禁用、未连接、队列满或未成功入队，`slip_end/4\n` 仍会按 priority stop 尝试发送。
 
 Matrix blocked direction 和 vibration slip 可以同帧同时生成 command。GUI cue 的显示优先级不会压制 haptic：cue 可以只显示一个主要提示，但 haptic command log 可以同时出现 `matrix_blocked_direction` 和 `vibration_slip`。
 
@@ -1013,7 +1056,7 @@ session/haptic_config.json
 session/haptic_command_log.csv
 ```
 
-summary / session_meta / trial_config / trial_summary 会包含 `haptic_enabled`、`matrix_haptic_enabled`、`vibration_haptic_enabled`、`matrix_haptic_transport`、`vibration_haptic_transport`、`matrix_haptic_startup_connected`、`vibration_haptic_startup_connected`、`matrix_haptic_connect_error`、`vibration_haptic_connect_error`、`haptic_mode`、`haptic_count`、`haptic_type_counts`、`effective_haptic_config` 和 `haptic_command_log_path`。`sent_monotonic_ms` 只是电脑端 socket send 完成时间，不代表真实硬件物理 onset 或受试者感知时间。
+summary / session_meta / trial_config / trial_summary 会包含 `haptic_enabled`、`matrix_haptic_enabled`、`vibration_haptic_enabled`、`matrix_haptic_transport`、`vibration_haptic_transport`、`matrix_haptic_startup_connected`、`vibration_haptic_startup_connected`、`matrix_haptic_connect_error`、`vibration_haptic_connect_error`、`haptic_mode`、`haptic_count`、`haptic_type_counts`、`need_pinch_requires_valid_grab_count`、`effective_haptic_config` 和 `haptic_command_log_path`。`sent_monotonic_ms` 只是电脑端 socket send 完成时间，不代表真实硬件物理 onset 或受试者感知时间。
 
 TODO: 当前 Matrix ESP32 parser 对 empty payload frame 可能不解析，且 HV507/latch 结构下电脑端不应假设 zero/empty frame 是可靠 hardware clear。如果未来需要硬件级 clear/stop，需要单独修改或确认 ESP32 parser、HV507 blanking、LE/BL 控制或硬件侧安全机制。
 
@@ -1092,6 +1135,7 @@ out_dir/session/cue_config.json              新 live session 始终写入
 out_dir/session/cue_log.csv                 仅 cue sink 非 none 时写入
 out_dir/session/haptic_config.json          新 live session 始终写入
 out_dir/session/haptic_command_log.csv      仅 haptic enabled 时写入
+out_dir/session/interaction_config.json     新 live session 始终写入
 out_dir/session/trial_summary.json
 out_dir/session/timing_diagnostics.csv      live integrated 默认始终写入
 out_dir/session/gui_diagnostics.csv       仅 --gui 时，优先写入这里
@@ -1701,6 +1745,9 @@ live integrated session 还会根据运行配置生成：
 termination_config.json
 cue_config.json                 新 live session 始终写入
 cue_log.csv                    cue sink 非 none 时写入
+haptic_config.json             新 live session 始终写入
+haptic_command_log.csv         仅 haptic enabled 时写入
+interaction_config.json        新 live session 始终写入
 timing_diagnostics.csv         live integrated 默认始终写入
 gui_diagnostics.csv            仅 --gui 时写入
 ```
@@ -1739,6 +1786,11 @@ pinch_state
 block_motion_state
 stop_reason
 track_state
+boundary_lock_active
+boundary_lock_surface
+boundary_lock_escape_progress
+boundary_lock_unlock_delta_m
+boundary_lock_event
 detach_state
 slip_active
 slip_reason
@@ -1862,6 +1914,12 @@ GRABBED_BLOCKED 或 stop_reason=TRACK_BLOCKED
 ```
 
 表示通道约束阻挡了移动。
+
+```text
+boundary_lock_active=True + boundary_lock_event=locked
+```
+
+表示 boundary lock 正在冻结物块位置。此时 block 不会跟随切向移动或继续向墙内移动；`boundary_lock_escape_progress` 达到 `boundary_lock_unlock_delta_m` 且 pinch 有效后，下一条 `boundary_lock_event=unlock` 表示解锁帧。解锁帧本身不立刻移动物块，后续帧才恢复正常增量移动。
 
 `task_trajectory_range` 是输入点在 task 坐标系下的范围，不是物块轨迹。物块轨迹看 `block_center_task_x/y/z` 或 `block_displacement_task`。
 
@@ -2102,6 +2160,7 @@ pinch_release_threshold = 0.12
 
 - 现有 GUI 是 replay/live debug display，不是正式 experiment lifecycle GUI；实验员和受试者仍共用一个窗口，也没有 Stop / Abort / Pause / Resume 的完整界面控制。
 - 当前 haptic Stage 2 已支持 Matrix / electrotactile ESP32 和 vibration ESP32 两个 TCP target。`haptic.csv` 是逻辑状态，`haptic_command_log.csv` 是 command/发送记录；还没有硬件 acknowledgement 或 behavioral RT analyzer，`sent_monotonic_ms` 仍只是电脑端 send 完成时间。
+- `boundary_lock.surface_mode` 第一版只支持 `primary`，角落/多方向 blocked 时只锁 primary surface；它不等同于 Matrix haptic 的多方向 combination channel 映射。
 - `run_live_integrated_session.py` 是单次 trial 的连续标定 + trial 调试流程，仍标记 `is_formal_experiment=false`；target 进入只做诊断，trial 主要由实验员按 `e` 完成。
 - 当前不直接依赖 MANUS/Vive SDK，而是接收 `manus_vive_com` 发送的 combined JSON；也没有完整 MANUS/Vive rotation fusion。
 - 没有正式在线 calibration GUI；当前只有命令行版 live table-line calibration 和 integrated runner。

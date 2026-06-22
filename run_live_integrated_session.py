@@ -30,6 +30,11 @@ from dashboard_snapshot import build_compact_status_line
 from device_frame_models import DeviceAdapterConfig
 from haptic_config import HapticConfig, default_haptic_config, load_haptic_config
 from haptic_runtime import HapticRuntime, HapticStartupError, disabled_haptic_summary
+from interaction_config import (
+    InteractionConfig,
+    default_interaction_config,
+    load_interaction_config,
+)
 from latest_frame_buffer import LatestFrameBuffer, LatestFramePump
 from live_raw_stream import LiveRawFrame, LiveRawStreamServer
 from live_session_state import LiveSessionPhase, LiveSessionStatus
@@ -119,6 +124,8 @@ class LiveIntegratedSessionConfig:
     cue_config_path: Path | None = None
     haptic_config: HapticConfig = field(default_factory=default_haptic_config)
     haptic_config_path: Path | None = None
+    interaction_config: InteractionConfig = field(default_factory=default_interaction_config)
+    interaction_config_path: Path | None = None
     visual_profile: str = "debug_all"
     status_panel: str = "auto"
     show_axes: str = "auto"
@@ -431,6 +438,7 @@ def run_live_integrated_session(
         _write_json(session_dir / "termination_config.json", config.termination_config.to_dict())
         _write_json(session_dir / "cue_config.json", config.cue_config.to_dict())
         _write_json(session_dir / "haptic_config.json", config.haptic_config.to_dict())
+        _write_json(session_dir / "interaction_config.json", config.interaction_config.to_dict())
         cue_log_path = session_dir / "cue_log.csv"
         cue_runtime = CueRuntime(
             trial_id=config.trial_id,
@@ -1018,6 +1026,12 @@ def _engine_config(config: LiveIntegratedSessionConfig, block_size: Any) -> Engi
             if termination.detach_limit_enabled
             else 1_000_000_000
         ),
+        boundary_lock_enabled=config.interaction_config.boundary_lock.enabled,
+        boundary_lock_unlock_delta_m=config.interaction_config.boundary_lock.unlock_delta_m,
+        boundary_lock_contact_tolerance_m=(
+            config.interaction_config.boundary_lock.contact_tolerance_m
+        ),
+        boundary_lock_surface_mode=config.interaction_config.boundary_lock.surface_mode,
     )
 
 
@@ -1109,6 +1123,17 @@ def _haptic_settings_payload(config: LiveIntegratedSessionConfig) -> dict[str, A
     }
 
 
+def _interaction_settings_payload(config: LiveIntegratedSessionConfig) -> dict[str, Any]:
+    return {
+        "effective_interaction_config": config.interaction_config.to_dict(),
+        "requested_interaction_config_path": (
+            str(config.interaction_config_path)
+            if config.interaction_config_path is not None
+            else None
+        ),
+    }
+
+
 def _any_haptic_hardware_enabled(config: LiveIntegratedSessionConfig) -> bool:
     return bool(
         config.haptic_config.matrix_enabled or config.haptic_config.vibration_enabled
@@ -1157,6 +1182,7 @@ def _trial_config_payload(
             "timing_is_live_latency": True,
             "haptic_hardware_enabled": _any_haptic_hardware_enabled(config),
             **_haptic_settings_payload(config),
+            **_interaction_settings_payload(config),
             "cue_sink": config.cue_sink,
             "cue_enabled": config.cue_sink != "none",
             "cue_mode": "live",
@@ -1210,6 +1236,7 @@ def _session_meta(
         "map_anchor_mode": map_anchor["mode"],
         "haptic_hardware_enabled": _any_haptic_hardware_enabled(config),
         **_haptic_settings_payload(config),
+        **_interaction_settings_payload(config),
         "pinch_position_mode": config.pinch_position_mode,
         "termination_config": config.termination_config.to_dict(),
         "termination_config_path": (
@@ -1318,6 +1345,7 @@ def _build_summary(
         "no_frame_timeout_seconds": config.no_frame_timeout_seconds,
         **disabled_haptic_summary(),
         **_haptic_settings_payload(config),
+        **_interaction_settings_payload(config),
         "cue_enabled": config.cue_sink != "none",
         "cue_sink": config.cue_sink,
         "cue_mode": "live",
@@ -1873,6 +1901,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--cue-sink", choices=CUE_SINK_CHOICES, default="logging")
     parser.add_argument("--cue-config", default=None, help="JSON/YAML cue generation config.")
     parser.add_argument("--haptic-config", default=None, help="JSON/YAML Stage 1 haptic config.")
+    parser.add_argument("--interaction-config", default=None, help="JSON/YAML interaction behavior config.")
+    parser.set_defaults(boundary_lock_enabled=None)
+    parser.add_argument("--enable-boundary-lock", dest="boundary_lock_enabled", action="store_true")
+    parser.add_argument("--disable-boundary-lock", dest="boundary_lock_enabled", action="store_false")
+    parser.add_argument("--boundary-lock-unlock-delta-m", default=None, type=float)
+    parser.add_argument("--boundary-lock-contact-tolerance-m", default=None, type=float)
+    parser.add_argument("--boundary-lock-surface-mode", choices=("primary",), default=None)
     parser.add_argument("--visual-profile", choices=VISUAL_PROFILE_CHOICES, default="debug_all")
     parser.add_argument("--status-panel", choices=DISPLAY_CONTROL_CHOICES, default="auto")
     parser.add_argument("--show-axes", choices=DISPLAY_CONTROL_CHOICES, default="auto")
@@ -1917,6 +1952,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--gui-fps must be > 0.")
     if args.task_z_half_extent <= 0.0:
         parser.error("--task-z-half-extent must be > 0.")
+    if args.boundary_lock_unlock_delta_m is not None and args.boundary_lock_unlock_delta_m <= 0.0:
+        parser.error("--boundary-lock-unlock-delta-m must be > 0.")
+    if args.boundary_lock_contact_tolerance_m is not None and args.boundary_lock_contact_tolerance_m < 0.0:
+        parser.error("--boundary-lock-contact-tolerance-m must be >= 0.")
     if args.anchor_timeout_seconds <= 0.0:
         parser.error("--anchor-timeout-seconds must be > 0.")
     if args.stream_wait_timeout_seconds <= 0.0:
@@ -1937,6 +1976,29 @@ def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
     cue_config = load_cue_config(cue_config_path)
     haptic_config_path = Path(args.haptic_config) if args.haptic_config is not None else None
     haptic_config = load_haptic_config(haptic_config_path)
+    interaction_config_path = (
+        Path(args.interaction_config) if args.interaction_config is not None else None
+    )
+    interaction_config = load_interaction_config(interaction_config_path)
+    boundary_lock_updates: dict[str, Any] = {}
+    if args.boundary_lock_enabled is not None:
+        boundary_lock_updates["enabled"] = bool(args.boundary_lock_enabled)
+    if args.boundary_lock_unlock_delta_m is not None:
+        boundary_lock_updates["unlock_delta_m"] = float(args.boundary_lock_unlock_delta_m)
+    if args.boundary_lock_contact_tolerance_m is not None:
+        boundary_lock_updates["contact_tolerance_m"] = float(
+            args.boundary_lock_contact_tolerance_m
+        )
+    if args.boundary_lock_surface_mode is not None:
+        boundary_lock_updates["surface_mode"] = str(args.boundary_lock_surface_mode)
+    if boundary_lock_updates:
+        interaction_config = replace(
+            interaction_config,
+            boundary_lock=replace(
+                interaction_config.boundary_lock,
+                **boundary_lock_updates,
+            ),
+        )
     pinch_threshold_config_path = (
         Path(args.pinch_threshold_config) if args.pinch_threshold_config is not None else None
     )
@@ -1995,6 +2057,8 @@ def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
         cue_config_path=cue_config_path,
         haptic_config=haptic_config,
         haptic_config_path=haptic_config_path,
+        interaction_config=interaction_config,
+        interaction_config_path=interaction_config_path,
         visual_profile=args.visual_profile,
         status_panel=args.status_panel,
         show_axes=args.show_axes,

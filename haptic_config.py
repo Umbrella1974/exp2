@@ -17,6 +17,10 @@ MATRIX_DIRECTION_SEMANTICS = ("blocked_surface", "correction_direction")
 MATRIX_MISSING_COMBINATION_POLICIES = ("skip", "union_single_directions")
 VIBRATION_TRANSPORTS = ("tcp_line_int_v1", "disabled")
 VIBRATION_COMMAND_LABELS = ("contact_enter", "contact_exit", "slip_start", "slip_end")
+VIBRATION_PINCH_INSUFFICIENT_SLIP_POLICIES = (
+    "allow_loose_touch",
+    "requires_prior_grab",
+)
 DEFAULT_VIBRATION_COMMAND_MAP = {
     "contact_enter": 1,
     "contact_exit": 2,
@@ -149,6 +153,7 @@ class VibrationHapticConfig:
     enable_slip_pinch_insufficient: bool = True
     enable_slip_track_blocked: bool = True
     enable_slip_track_blocked_in_target_region: bool = True
+    pinch_insufficient_slip_policy: str = "allow_loose_touch"
 
     def __post_init__(self) -> None:
         for name in (
@@ -201,6 +206,11 @@ class VibrationHapticConfig:
             "command_map",
             _vibration_command_map(self.command_map),
         )
+        if self.pinch_insufficient_slip_policy not in VIBRATION_PINCH_INSUFFICIENT_SLIP_POLICIES:
+            raise ValueError(
+                "vibration.pinch_insufficient_slip_policy must be one of: "
+                + ", ".join(VIBRATION_PINCH_INSUFFICIENT_SLIP_POLICIES)
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -371,6 +381,7 @@ def _vibration_config_from_dict(payload: dict[str, Any]) -> VibrationHapticConfi
         "enable_slip_pinch_insufficient",
         "enable_slip_track_blocked",
         "enable_slip_track_blocked_in_target_region",
+        "pinch_insufficient_slip_policy",
     }
     unknown = sorted(set(payload) - allowed)
     if unknown:
@@ -445,6 +456,12 @@ def _vibration_config_from_dict(payload: dict[str, Any]) -> VibrationHapticConfi
                 VibrationHapticConfig.enable_slip_track_blocked_in_target_region,
             ),
             "vibration.enable_slip_track_blocked_in_target_region",
+        ),
+        pinch_insufficient_slip_policy=str(
+            payload.get(
+                "pinch_insufficient_slip_policy",
+                VibrationHapticConfig.pinch_insufficient_slip_policy,
+            )
         ),
     )
 

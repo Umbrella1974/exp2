@@ -49,6 +49,11 @@ class DashboardSnapshot:
     status_line: str
     main_state_label: str
     pinch_label: str
+    boundary_lock_active: bool = False
+    boundary_lock_surface: str = ""
+    boundary_lock_escape_progress: float | None = None
+    boundary_lock_unlock_delta_m: float | None = None
+    boundary_lock_event: str = "none"
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe dictionary."""
@@ -83,6 +88,14 @@ def build_dashboard_snapshot(
     block_motion_state = _name(block_state.motion_state)
     stop_reason = _name(feedback.stop_reason) or "NONE"
     track_state = _name(feedback.track_state) or "INSIDE_TRACK"
+    boundary_lock_surface = _name(getattr(feedback, "boundary_lock_surface", None))
+    boundary_lock_escape_progress = _optional_float_or_none(
+        getattr(feedback, "boundary_lock_escape_progress", None)
+    )
+    boundary_lock_unlock_delta_m = _optional_float_or_none(
+        getattr(feedback, "boundary_lock_unlock_delta_m", None)
+    )
+    boundary_lock_event = str(getattr(feedback, "boundary_lock_event", "none") or "none")
     pinch_state = _name(output.pinch_state)
     detach_state = _name(feedback.detach_state) or "NONE"
     slip_reason = _name(haptic.slip_reason)
@@ -137,6 +150,11 @@ def build_dashboard_snapshot(
         block_visible=bool(block_state.visible),
         stop_reason=stop_reason,
         track_state=track_state,
+        boundary_lock_active=bool(getattr(feedback, "boundary_lock_active", False)),
+        boundary_lock_surface=boundary_lock_surface,
+        boundary_lock_escape_progress=boundary_lock_escape_progress,
+        boundary_lock_unlock_delta_m=boundary_lock_unlock_delta_m,
+        boundary_lock_event=boundary_lock_event,
         pinch_state=pinch_state,
         detach_state=detach_state,
         large_delta=large_delta,
@@ -335,6 +353,15 @@ def _optional_float(value: Any) -> float | None:
     if value in (None, ""):
         return None
     return float(value)
+
+
+def _optional_float_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _format_point(point: Any) -> str:

@@ -49,6 +49,7 @@
     "enable_slip": true,
     "enable_slip_pinch_insufficient": true,
     "enable_slip_track_blocked": true,
-    "enable_slip_track_blocked_in_target_region": true
+    "enable_slip_track_blocked_in_target_region": true,
+    "pinch_insufficient_slip_policy": "allow_loose_touch"
   }
 }

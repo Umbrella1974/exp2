@@ -31,6 +31,7 @@ def test_default_haptic_config_is_disabled() -> None:
         "slip_start": 3,
         "slip_end": 4,
     }
+    assert config.vibration.pinch_insufficient_slip_policy == "allow_loose_touch"
 
 
 def test_haptic_config_rejects_unknown_fields() -> None:
@@ -85,6 +86,19 @@ def test_legacy_vibration_protocol_key_is_transport_alias() -> None:
     config = haptic_config_from_dict({"vibration": {"protocol": "tcp_line_int_v1"}})
 
     assert config.vibration.transport == "tcp_line_int_v1"
+
+
+def test_vibration_pinch_insufficient_slip_policy_is_validated() -> None:
+    config = haptic_config_from_dict(
+        {"vibration": {"pinch_insufficient_slip_policy": "requires_prior_grab"}}
+    )
+
+    assert config.vibration.pinch_insufficient_slip_policy == "requires_prior_grab"
+
+    with pytest.raises(ValueError, match="pinch_insufficient_slip_policy"):
+        haptic_config_from_dict(
+            {"vibration": {"pinch_insufficient_slip_policy": "sometimes"}}
+        )
 
 
 def test_direction_semantics_and_channel_map_are_validated(tmp_path: Path) -> None:
