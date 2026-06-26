@@ -9,11 +9,12 @@ import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable
 
 from data_models import Vec3
 from haptic_config import HapticConfig, default_haptic_config, normalize_direction_key
-from haptic_tcp_worker import MatrixTcpWorker
+from haptic_tcp_worker import MatrixSendStep, MatrixTcpWorker
 from matrix_haptic_protocol import encode_matrix_channel_packet
 from vibration_haptic_protocol import (
     encode_vibration_line_command,
@@ -46,6 +47,9 @@ HAPTIC_CSV_FIELDS = [
     "matrix_direction_used",
     "matrix_direction_semantics",
     "matrix_ignored_direction_axes",
+    "matrix_output_key",
+    "previous_matrix_output_key",
+    "next_matrix_output_key",
     "channel_list",
     "vibration_command",
     "vibration_command_label",
@@ -91,6 +95,9 @@ class HapticCommandRecord:
     matrix_direction_used: str | None = None
     matrix_direction_semantics: str | None = None
     matrix_ignored_direction_axes: str | None = None
+    matrix_output_key: str | None = None
+    previous_matrix_output_key: str | None = None
+    next_matrix_output_key: str | None = None
     channel_list: list[int] = field(default_factory=list)
     vibration_command: int | None = None
     vibration_command_label: str | None = None
@@ -156,6 +163,16 @@ class _MatrixBlockedSignature:
     missing_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class _MatrixMainOutput:
+    output_key: str | None
+    cue_type: str
+    haptic_type: str
+    channels: tuple[int, ...]
+    missing_reason: str | None = None
+    blocked: _MatrixBlockedSignature | None = None
+
+
 class HapticRuntime:
     """Observe existing trial states and route haptic commands.
 
@@ -205,7 +222,9 @@ class HapticRuntime:
         self._previous_gated_slip_signature: tuple[Any, ...] | None = None
         self._pending_slip_reassert_after_one_shot: tuple[Any, ...] | None = None
         self._pending_slip_reassert_frame_index: int | None = None
-        self._previous_blocked_signature: _MatrixBlockedSignature | None = None
+        self._active_matrix_output: _MatrixMainOutput | None = None
+        self._previous_matrix_output_key: str | None = None
+        self._matrix_output_key_lock = Lock()
         self._last_matrix_send_monotonic_ms: float | None = None
         self._last_context: _FrameContext | None = None
         self._target_box = _target_box_from_trial_config(self.trial_config)
@@ -329,7 +348,7 @@ class HapticRuntime:
         self._observe_valid_grab(output)
         one_shot_state = self._process_contact_events(context, trial_result)
         self._process_slip_state(context, trial_result, one_shot_state=one_shot_state)
-        self._process_blocked_state(context, trial_result)
+        self._process_matrix_state(context, trial_result)
         return tuple(self._records[before:])
 
     def handle_input_error(self, reason: str = "invalid_before_haptic") -> None:
@@ -560,21 +579,20 @@ class HapticRuntime:
             self._record_slip_command(context, signature, phase)
         self._previous_slip_signature = signature
 
-    def _process_blocked_state(self, context: _FrameContext, trial_result: Any) -> None:
-        signature = self._blocked_signature(trial_result)
-        if signature is None:
-            if self._previous_blocked_signature is not None:
-                self._record_matrix_end(context, self._previous_blocked_signature, "blocked_inactive_no_clear")
-            self._previous_blocked_signature = None
-            self._last_matrix_send_monotonic_ms = None
+    def _process_matrix_state(self, context: _FrameContext, trial_result: Any) -> None:
+        if not self.matrix_haptic_enabled:
+            return
+        output = self._resolve_matrix_main_output(trial_result)
+        if output is None:
+            self._end_matrix_state(context, "matrix_output_inactive")
             return
 
         now_ms = self.monotonic_ms_fn()
         mode = self.haptic_config.matrix.feedback_mode
         phase: str | None = None
-        if self._previous_blocked_signature is None:
+        if self._active_matrix_output is None:
             phase = "state_start"
-        elif signature != self._previous_blocked_signature:
+        elif output != self._active_matrix_output:
             phase = "state_update"
         elif mode == "continuous_resend":
             last = self._last_matrix_send_monotonic_ms
@@ -583,9 +601,68 @@ class HapticRuntime:
                 phase = "state_update"
 
         if phase is not None:
-            self._record_matrix_command(context, signature, phase)
+            self._queue_matrix_main_output(context, output, phase)
             self._last_matrix_send_monotonic_ms = now_ms
-        self._previous_blocked_signature = signature
+        self._active_matrix_output = output
+
+    def _resolve_matrix_main_output(self, trial_result: Any) -> _MatrixMainOutput | None:
+        blocked = self._blocked_signature(trial_result)
+        if blocked is not None:
+            output_key = (
+                f"blocked:{blocked.direction_key}"
+                if blocked.direction_key
+                else None
+            )
+            return _MatrixMainOutput(
+                output_key=output_key,
+                cue_type="blocked_directional",
+                haptic_type="matrix_blocked_direction",
+                channels=blocked.channels,
+                missing_reason=blocked.missing_reason,
+                blocked=blocked,
+            )
+
+        output = getattr(trial_result, "frame_output", None)
+        contact_state = _name(getattr(output, "contact_state", None))
+        pinch_state = _name(getattr(output, "pinch_state", None))
+        matrix = self.haptic_config.matrix
+        if (
+            contact_state == "INSIDE_BLOCK"
+            and pinch_state == "PINCH_INSUFFICIENT"
+            and matrix.pinch_insufficient_feedback.enabled
+        ):
+            channels = tuple(matrix.pinch_insufficient_feedback.channel_list)
+            return _MatrixMainOutput(
+                output_key="pinch_insufficient",
+                cue_type="pinch_insufficient",
+                haptic_type="matrix_pinch_insufficient",
+                channels=channels,
+                missing_reason=None if channels else "no_channel_mapping",
+            )
+        if (
+            contact_state == "INSIDE_BLOCK"
+            and pinch_state == "PINCH_VALID"
+            and matrix.contact_valid_feedback.enabled
+        ):
+            channels = tuple(matrix.contact_valid_feedback.channel_list)
+            return _MatrixMainOutput(
+                output_key="contact_valid",
+                cue_type="contact_valid",
+                haptic_type="matrix_contact_valid",
+                channels=channels,
+                missing_reason=None if channels else "no_channel_mapping",
+            )
+        return None
+
+    def _end_matrix_state(self, context: _FrameContext, reason: str) -> None:
+        if self._active_matrix_output is None:
+            return
+        self._record_matrix_end(context, self._active_matrix_output, reason)
+        reset_config = self.haptic_config.matrix.reset_before_output_change
+        if reset_config.enabled and reset_config.apply_on_transition_to_none:
+            self._queue_matrix_reset_to_none(context)
+        self._active_matrix_output = None
+        self._last_matrix_send_monotonic_ms = None
 
     def _end_active_states(self, *, reason: str) -> None:
         context = self._last_context or _FrameContext(None, None, None, None)
@@ -594,10 +671,7 @@ class HapticRuntime:
             self._previous_slip_signature = None
             self._clear_pending_slip_reassert()
         self._previous_gated_slip_signature = None
-        if self._previous_blocked_signature is not None:
-            self._record_matrix_end(context, self._previous_blocked_signature, reason)
-            self._previous_blocked_signature = None
-            self._last_matrix_send_monotonic_ms = None
+        self._end_matrix_state(context, reason)
         self._clear_valid_grab_history()
 
     def _one_shot_would_interrupt_slip(self) -> bool:
@@ -872,118 +946,349 @@ class HapticRuntime:
     def _clear_valid_grab_history(self) -> None:
         self._has_valid_grab_history = False
 
-    def _record_matrix_command(
+    def _queue_matrix_main_output(
         self,
         context: _FrameContext,
-        signature: _MatrixBlockedSignature,
+        output: _MatrixMainOutput,
         phase: str,
-    ) -> None:
+    ) -> bool:
         if not self.matrix_haptic_enabled:
-            return
-        direction = signature.direction_key
-        primary = signature.primary_surface
-        correction = signature.primary_correction
-        semantics = signature.semantics
-        track_state = signature.track_state
-        channels = list(signature.channels)
-        details = {
-            "track_state": track_state,
-            "primary_blocked_surface": primary,
-            "correction_direction": correction,
-            "blocked_surface_set": signature.blocked_surface_set,
-            "correction_direction_set": signature.correction_direction_set,
-            "matrix_filtered_blocked_surface_set": signature.filtered_blocked_surface_set,
-            "matrix_filtered_correction_direction_set": signature.filtered_correction_direction_set,
-            "matrix_direction_used": direction,
-            "matrix_direction_semantics": semantics,
-            "matrix_ignored_direction_axes": signature.ignored_direction_axes,
-        }
-        record = self._make_record(
-            context,
-            target_device="matrix",
-            target_transport=self.haptic_config.matrix.transport,
-            cue_type="blocked_directional",
-            haptic_type="matrix_blocked_direction",
-            haptic_phase=phase,
-            direction=str(direction) if direction else None,
-            primary_blocked_surface=str(primary) if primary else None,
-            correction_direction=str(correction) if correction else None,
-            blocked_surface_set=signature.blocked_surface_set,
-            correction_direction_set=signature.correction_direction_set,
-            matrix_filtered_blocked_surface_set=signature.filtered_blocked_surface_set,
-            matrix_filtered_correction_direction_set=signature.filtered_correction_direction_set,
-            matrix_direction_used=str(direction) if direction else None,
-            matrix_direction_semantics=str(semantics) if semantics else None,
-            matrix_ignored_direction_axes=signature.ignored_direction_axes,
-            channel_list=channels,
-            details=details,
-        )
-        if signature.missing_reason == "direction_filtered_empty":
-            self._finish_not_sent(record, "skipped", "direction_filtered_empty")
-            return
-        if not direction:
-            self._finish_not_sent(record, "skipped", "missing_direction")
-            return
-        if signature.missing_reason == "missing_combination_mapping":
-            self._finish_not_sent(record, "not_sent", "missing_combination_mapping")
-            return
-        if not channels:
-            self._finish_not_sent(record, "skipped", "no_channel_mapping")
-            return
+            return False
+        invalid_status, invalid_reason = self._matrix_main_output_validation(output)
+        if invalid_reason is not None:
+            record = self._make_matrix_main_record(
+                context,
+                output,
+                phase,
+                previous_key=self._get_previous_matrix_output_key(),
+                next_key=output.output_key,
+            )
+            self._finish_not_sent(record, invalid_status, invalid_reason)
+            return False
+
+        assert output.output_key is not None
         try:
-            packet = encode_matrix_channel_packet(channels)
+            main_packet = encode_matrix_channel_packet(list(output.channels))
         except Exception as exc:
+            record = self._make_matrix_main_record(
+                context,
+                output,
+                phase,
+                previous_key=self._get_previous_matrix_output_key(),
+                next_key=output.output_key,
+            )
             record.error = str(exc)
             self._finish_not_sent(record, "skipped", "invalid_channel_list")
+            return False
+
+        previous_key = self._get_previous_matrix_output_key()
+        reset_config = self.haptic_config.matrix.reset_before_output_change
+        reset_required = bool(
+            reset_config.enabled
+            and previous_key is not None
+            and previous_key != output.output_key
+        )
+        if not reset_required:
+            main_record = self._make_matrix_main_record(
+                context,
+                output,
+                phase,
+                previous_key=previous_key,
+                next_key=output.output_key,
+            )
+            return self._submit_matrix_sequence(
+                previous_key=previous_key,
+                next_key=output.output_key,
+                steps=(MatrixSendStep(main_record, main_packet, role="main"),),
+                has_reset=False,
+            )
+
+        reset_entry = reset_config.reset_map.get(previous_key)
+        reset_channels = tuple(reset_entry.channel_list) if reset_entry is not None else ()
+        if not reset_channels:
+            reset_record = self._make_matrix_reset_record(
+                context,
+                previous_key=previous_key,
+                next_key=output.output_key,
+                channels=(),
+            )
+            main_record = self._make_matrix_main_record(
+                context,
+                output,
+                phase,
+                previous_key=previous_key,
+                next_key=output.output_key,
+            )
+            if reset_config.missing_reset_policy == "skip_reset":
+                self._finish_not_sent(
+                    reset_record,
+                    "skipped",
+                    "missing_matrix_reset_mapping",
+                )
+                return self._submit_matrix_sequence(
+                    previous_key=previous_key,
+                    next_key=output.output_key,
+                    steps=(MatrixSendStep(main_record, main_packet, role="main"),),
+                    has_reset=False,
+                )
+            self._finish_not_sent(
+                reset_record,
+                "error",
+                "missing_matrix_reset_mapping",
+            )
+            self._finish_not_sent(
+                main_record,
+                "skipped",
+                "missing_matrix_reset_mapping",
+            )
+            return False
+
+        reset_record = self._make_matrix_reset_record(
+            context,
+            previous_key=previous_key,
+            next_key=output.output_key,
+            channels=reset_channels,
+        )
+        main_record = self._make_matrix_main_record(
+            context,
+            output,
+            phase,
+            previous_key=previous_key,
+            next_key=output.output_key,
+        )
+        try:
+            reset_packet = encode_matrix_channel_packet(list(reset_channels))
+        except Exception as exc:
+            reset_record.error = str(exc)
+            self._finish_not_sent(reset_record, "error", "invalid_matrix_reset_channels")
+            self._finish_not_sent(main_record, "skipped", "reset_failed")
+            return False
+        return self._submit_matrix_sequence(
+            previous_key=previous_key,
+            next_key=output.output_key,
+            steps=(
+                MatrixSendStep(reset_record, reset_packet, role="reset"),
+                MatrixSendStep(main_record, main_packet, role="main"),
+            ),
+            has_reset=True,
+        )
+
+    def _submit_matrix_sequence(
+        self,
+        *,
+        previous_key: str | None,
+        next_key: str,
+        steps: tuple[MatrixSendStep, ...],
+        has_reset: bool,
+    ) -> bool:
+        if self._matrix_worker is None:
+            if has_reset:
+                self._finish_not_sent(steps[0].record, "not_connected", "matrix_not_connected")
+                self._finish_not_sent(steps[-1].record, "skipped", "reset_failed")
+            else:
+                self._finish_not_sent(steps[-1].record, "not_connected", "matrix_not_connected")
+            return False
+
+        with self._matrix_output_key_lock:
+            self._previous_matrix_output_key = next_key
+            submit_sequence = getattr(self._matrix_worker, "submit_sequence", None)
+            if callable(submit_sequence):
+                accepted = submit_sequence(
+                    steps,
+                    on_reset_failure=(
+                        (
+                            lambda: self._rollback_matrix_output_key(
+                                expected_key=next_key,
+                                previous_key=previous_key,
+                            )
+                        )
+                        if has_reset
+                        else None
+                    ),
+                )
+            elif not has_reset and len(steps) == 1:
+                accepted = self._matrix_worker.submit(steps[0].record, steps[0].packet)
+            else:
+                self._finish_not_sent(
+                    steps[0].record,
+                    "error",
+                    "matrix_worker_sequence_unsupported",
+                )
+                self._finish_not_sent(steps[-1].record, "skipped", "reset_failed")
+                accepted = False
+            if not accepted:
+                self._previous_matrix_output_key = previous_key
+            return bool(accepted)
+
+    def _queue_matrix_reset_to_none(self, context: _FrameContext) -> None:
+        previous_key = self._get_previous_matrix_output_key()
+        if previous_key is None:
+            return
+        reset_config = self.haptic_config.matrix.reset_before_output_change
+        reset_entry = reset_config.reset_map.get(previous_key)
+        channels = tuple(reset_entry.channel_list) if reset_entry is not None else ()
+        record = self._make_matrix_reset_record(
+            context,
+            previous_key=previous_key,
+            next_key=None,
+            channels=channels,
+        )
+        if not channels:
+            status = "skipped" if reset_config.missing_reset_policy == "skip_reset" else "error"
+            self._finish_not_sent(record, status, "missing_matrix_reset_mapping")
+            return
+        try:
+            packet = encode_matrix_channel_packet(list(channels))
+        except Exception as exc:
+            record.error = str(exc)
+            self._finish_not_sent(record, "error", "invalid_matrix_reset_channels")
             return
         if self._matrix_worker is None:
             self._finish_not_sent(record, "not_connected", "matrix_not_connected")
             return
-        self._matrix_worker.submit(record, packet)
+        self._matrix_worker.submit_sequence(
+            (MatrixSendStep(record, packet, role="reset"),),
+        )
 
     def _record_matrix_end(
         self,
         context: _FrameContext,
-        signature: _MatrixBlockedSignature,
+        output: _MatrixMainOutput,
         reason: str,
     ) -> None:
         if not self.matrix_haptic_enabled:
             return
-        direction = signature.direction_key
-        primary = signature.primary_surface
-        correction = signature.primary_correction
-        semantics = signature.semantics
-        track_state = signature.track_state
-        record = self._make_record(
+        record = self._make_matrix_main_record(
             context,
-            target_device="matrix",
-            target_transport=self.haptic_config.matrix.transport,
-            cue_type="blocked_directional",
-            haptic_type="matrix_blocked_direction",
-            haptic_phase="state_end",
-            direction=str(direction) if direction else None,
-            primary_blocked_surface=str(primary) if primary else None,
-            correction_direction=str(correction) if correction else None,
-            blocked_surface_set=signature.blocked_surface_set,
-            correction_direction_set=signature.correction_direction_set,
-            matrix_filtered_blocked_surface_set=signature.filtered_blocked_surface_set,
-            matrix_filtered_correction_direction_set=signature.filtered_correction_direction_set,
-            matrix_direction_used=str(direction) if direction else None,
-            matrix_direction_semantics=str(semantics) if semantics else None,
-            matrix_ignored_direction_axes=signature.ignored_direction_axes,
-            channel_list=list(signature.channels),
+            output,
+            "state_end",
+            previous_key=self._get_previous_matrix_output_key(),
+            next_key=None,
             details={
-                "track_state": track_state,
-                "blocked_surface_set": signature.blocked_surface_set,
-                "correction_direction_set": signature.correction_direction_set,
-                "matrix_filtered_blocked_surface_set": signature.filtered_blocked_surface_set,
-                "matrix_filtered_correction_direction_set": signature.filtered_correction_direction_set,
-                "matrix_ignored_direction_axes": signature.ignored_direction_axes,
                 "end_reason": reason,
                 "hardware_clear_assumed": False,
             },
         )
         self._finish_not_sent(record, "not_sent", "state_end_no_hardware_clear")
+
+    def _make_matrix_main_record(
+        self,
+        context: _FrameContext,
+        output: _MatrixMainOutput,
+        phase: str,
+        *,
+        previous_key: str | None,
+        next_key: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> HapticCommandRecord:
+        blocked = output.blocked
+        direction = blocked.direction_key if blocked is not None else None
+        record_details: dict[str, Any] = {
+            "matrix_output_key": output.output_key,
+            "previous_matrix_output_key": previous_key,
+            "next_matrix_output_key": next_key,
+        }
+        if blocked is not None:
+            record_details.update(
+                {
+                    "track_state": blocked.track_state,
+                    "primary_blocked_surface": blocked.primary_surface,
+                    "correction_direction": blocked.primary_correction,
+                    "blocked_surface_set": blocked.blocked_surface_set,
+                    "correction_direction_set": blocked.correction_direction_set,
+                    "matrix_filtered_blocked_surface_set": blocked.filtered_blocked_surface_set,
+                    "matrix_filtered_correction_direction_set": blocked.filtered_correction_direction_set,
+                    "matrix_direction_used": blocked.direction_key,
+                    "matrix_direction_semantics": blocked.semantics,
+                    "matrix_ignored_direction_axes": blocked.ignored_direction_axes,
+                }
+            )
+        if details:
+            record_details.update(details)
+        return self._make_record(
+            context,
+            target_device="matrix",
+            target_transport=self.haptic_config.matrix.transport,
+            cue_type=output.cue_type,
+            haptic_type=output.haptic_type,
+            haptic_phase=phase,
+            direction=direction,
+            primary_blocked_surface=(blocked.primary_surface if blocked is not None else None),
+            correction_direction=(blocked.primary_correction if blocked is not None else None),
+            blocked_surface_set=(blocked.blocked_surface_set if blocked is not None else None),
+            correction_direction_set=(blocked.correction_direction_set if blocked is not None else None),
+            matrix_filtered_blocked_surface_set=(
+                blocked.filtered_blocked_surface_set if blocked is not None else None
+            ),
+            matrix_filtered_correction_direction_set=(
+                blocked.filtered_correction_direction_set if blocked is not None else None
+            ),
+            matrix_direction_used=direction,
+            matrix_direction_semantics=(blocked.semantics if blocked is not None else None),
+            matrix_ignored_direction_axes=(blocked.ignored_direction_axes if blocked is not None else None),
+            matrix_output_key=output.output_key,
+            previous_matrix_output_key=previous_key,
+            next_matrix_output_key=next_key,
+            channel_list=list(output.channels),
+            details=record_details,
+        )
+
+    def _make_matrix_reset_record(
+        self,
+        context: _FrameContext,
+        *,
+        previous_key: str,
+        next_key: str | None,
+        channels: tuple[int, ...],
+    ) -> HapticCommandRecord:
+        return self._make_record(
+            context,
+            target_device="matrix",
+            target_transport=self.haptic_config.matrix.transport,
+            cue_type="matrix_reset_before_output_change",
+            haptic_type="matrix_reset_before_output_change",
+            haptic_phase="reset",
+            direction=None,
+            matrix_output_key=None,
+            previous_matrix_output_key=previous_key,
+            next_matrix_output_key=next_key,
+            channel_list=list(channels),
+            details={
+                "previous_matrix_output_key": previous_key,
+                "next_matrix_output_key": next_key,
+                "reset_channel_list": list(channels),
+                "hold_ms": 0.0,
+                "hardware_reset_semantics_assumed": False,
+            },
+        )
+
+    def _matrix_main_output_validation(
+        self,
+        output: _MatrixMainOutput,
+    ) -> tuple[str, str | None]:
+        if output.missing_reason == "direction_filtered_empty":
+            return "skipped", "direction_filtered_empty"
+        if output.output_key is None:
+            return "skipped", "missing_direction"
+        if output.missing_reason == "missing_combination_mapping":
+            return "not_sent", "missing_combination_mapping"
+        if not output.channels or output.missing_reason == "no_channel_mapping":
+            return "skipped", "no_channel_mapping"
+        return "", None
+
+    def _get_previous_matrix_output_key(self) -> str | None:
+        with self._matrix_output_key_lock:
+            return self._previous_matrix_output_key
+
+    def _rollback_matrix_output_key(
+        self,
+        *,
+        expected_key: str,
+        previous_key: str | None,
+    ) -> None:
+        with self._matrix_output_key_lock:
+            if self._previous_matrix_output_key == expected_key:
+                self._previous_matrix_output_key = previous_key
 
     def _record_vibration_command(
         self,
@@ -1053,6 +1358,9 @@ class HapticRuntime:
         matrix_direction_used: str | None = None,
         matrix_direction_semantics: str | None = None,
         matrix_ignored_direction_axes: str | None = None,
+        matrix_output_key: str | None = None,
+        previous_matrix_output_key: str | None = None,
+        next_matrix_output_key: str | None = None,
         channel_list: list[int] | None = None,
         vibration_command: int | None = None,
         vibration_command_label: str | None = None,
@@ -1084,6 +1392,9 @@ class HapticRuntime:
             matrix_direction_used=matrix_direction_used,
             matrix_direction_semantics=matrix_direction_semantics,
             matrix_ignored_direction_axes=matrix_ignored_direction_axes,
+            matrix_output_key=matrix_output_key,
+            previous_matrix_output_key=previous_matrix_output_key,
+            next_matrix_output_key=next_matrix_output_key,
             channel_list=list(channel_list or []),
             vibration_command=vibration_command,
             vibration_command_label=vibration_command_label,

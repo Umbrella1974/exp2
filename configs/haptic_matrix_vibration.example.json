@@ -24,7 +24,25 @@
       "Z_POS": []
     },
     "combination_channel_map": {},
-    "missing_combination_policy": "skip"
+    "missing_combination_policy": "skip",
+    "contact_valid_feedback": {
+      "enabled": false,
+      "channel_list": []
+    },
+    "pinch_insufficient_feedback": {
+      "enabled": false,
+      "channel_list": []
+    },
+    "reset_before_output_change": {
+      "enabled": false,
+      "missing_reset_policy": "skip_reset",
+      "apply_on_transition_to_none": false,
+      "reset_map": {
+        "contact_valid": {"channel_list": [], "hold_ms": 0},
+        "pinch_insufficient": {"channel_list": [], "hold_ms": 0},
+        "blocked:X_POS": {"channel_list": [], "hold_ms": 0}
+      }
+    }
   },
   "vibration": {
     "enabled": true,

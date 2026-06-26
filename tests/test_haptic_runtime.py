@@ -449,6 +449,337 @@ def test_blocked_end_records_state_end_without_clear() -> None:
     assert rows[-1]["not_sent_reason"] == "state_end_no_hardware_clear"
 
 
+def test_matrix_contact_valid_and_pinch_insufficient_are_single_main_outputs() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "contact_valid_feedback": {
+                    "enabled": True,
+                    "channel_list": [1],
+                },
+                "pinch_insufficient_feedback": {
+                    "enabled": True,
+                    "channel_list": [2],
+                },
+                "reset_before_output_change": {
+                    "enabled": True,
+                    "reset_map": {
+                        "contact_valid": {"channel_list": [10]},
+                    },
+                },
+            },
+        },
+        worker_factory=worker,
+    )
+    runtime.start()
+
+    runtime.process_frame(
+        frame_index=1,
+        source_frame_id=None,
+        sample=_sample(),
+        trial_result=_trial_result(
+            contact_state="INSIDE_BLOCK",
+            pinch_state="PINCH_VALID",
+        ),
+        snapshot=None,
+    )
+    runtime.process_frame(
+        frame_index=2,
+        source_frame_id=None,
+        sample=_sample(0.1),
+        trial_result=_trial_result(
+            contact_state="INSIDE_BLOCK",
+            pinch_state="PINCH_INSUFFICIENT",
+            slip=False,
+        ),
+        snapshot=None,
+    )
+
+    rows = runtime.records_snapshot()
+    assert [row["haptic_type"] for row in rows] == [
+        "matrix_contact_valid",
+        "matrix_reset_before_output_change",
+        "matrix_pinch_insufficient",
+    ]
+    assert [row["channel_list"] for row in rows] == ["[1]", "[10]", "[2]"]
+    assert rows[1]["previous_matrix_output_key"] == "contact_valid"
+    assert rows[1]["next_matrix_output_key"] == "pinch_insufficient"
+    assert rows[2]["matrix_output_key"] == "pinch_insufficient"
+    assert [len(sequence) for sequence in worker.instances[0].sequences] == [1, 2]
+    assert runtime._previous_matrix_output_key == "pinch_insufficient"
+
+
+def test_matrix_priority_selects_blocked_without_channel_union_or_fallback() -> None:
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "contact_valid_feedback": {"enabled": True, "channel_list": [1]},
+                "pinch_insufficient_feedback": {"enabled": True, "channel_list": [2]},
+                "direction_channel_map": {"X_POS": [3]},
+            },
+        },
+        worker_factory=_FakeWorkerFactory(),
+    )
+    runtime.start()
+
+    runtime.process_frame(
+        frame_index=1,
+        source_frame_id=None,
+        sample=_sample(),
+        trial_result=_trial_result(
+            blocked=True,
+            primary_surface="X_POS",
+            track_state="BLOCKED_X_POS",
+            contact_state="INSIDE_BLOCK",
+            pinch_state="PINCH_INSUFFICIENT",
+        ),
+        snapshot=None,
+    )
+
+    rows = runtime.records_snapshot()
+    assert len(rows) == 1
+    assert rows[0]["haptic_type"] == "matrix_blocked_direction"
+    assert rows[0]["matrix_output_key"] == "blocked:X_POS"
+    assert rows[0]["channel_list"] == "[3]"
+
+    no_mapping = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "contact_valid_feedback": {"enabled": True, "channel_list": [1]},
+            },
+        }
+    )
+    no_mapping.process_frame(
+        frame_index=1,
+        source_frame_id=None,
+        sample=_sample(),
+        trial_result=_trial_result(
+            blocked=True,
+            primary_surface="X_POS",
+            track_state="BLOCKED_X_POS",
+            contact_state="INSIDE_BLOCK",
+            pinch_state="PINCH_VALID",
+        ),
+        snapshot=None,
+    )
+    missing_row = no_mapping.records_snapshot()[0]
+    assert missing_row["haptic_type"] == "matrix_blocked_direction"
+    assert missing_row["not_sent_reason"] == "no_channel_mapping"
+
+
+def test_matrix_missing_reset_skip_policy_sends_main_and_empty_mapping_is_not_packet() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "contact_valid_feedback": {"enabled": True, "channel_list": [1]},
+                "pinch_insufficient_feedback": {"enabled": True, "channel_list": [2]},
+                "reset_before_output_change": {
+                    "enabled": True,
+                    "missing_reset_policy": "skip_reset",
+                    "reset_map": {
+                        "contact_valid": {"channel_list": []},
+                    },
+                },
+            },
+        },
+        worker_factory=worker,
+    )
+    runtime.start()
+    runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=_trial_result(contact_state="INSIDE_BLOCK", pinch_state="PINCH_VALID"), snapshot=None)
+    runtime.process_frame(frame_index=2, source_frame_id=None, sample=_sample(0.1), trial_result=_trial_result(contact_state="INSIDE_BLOCK", pinch_state="PINCH_INSUFFICIENT"), snapshot=None)
+
+    rows = runtime.records_snapshot()
+    reset_row, main_row = rows[-2:]
+    assert reset_row["haptic_type"] == "matrix_reset_before_output_change"
+    assert reset_row["channel_list"] == "[]"
+    assert reset_row["send_status"] == "skipped"
+    assert reset_row["not_sent_reason"] == "missing_matrix_reset_mapping"
+    assert main_row["send_status"] == "sent"
+    assert len(worker.instances[0].sequences[-1]) == 1
+    assert runtime._previous_matrix_output_key == "pinch_insufficient"
+
+
+def test_matrix_missing_reset_error_skips_main_and_preserves_previous_key() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "contact_valid_feedback": {"enabled": True, "channel_list": [1]},
+                "pinch_insufficient_feedback": {"enabled": True, "channel_list": [2]},
+                "reset_before_output_change": {
+                    "enabled": True,
+                    "missing_reset_policy": "error",
+                },
+            },
+        },
+        worker_factory=worker,
+    )
+    runtime.start()
+    runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=_trial_result(contact_state="INSIDE_BLOCK", pinch_state="PINCH_VALID"), snapshot=None)
+    runtime.process_frame(frame_index=2, source_frame_id=None, sample=_sample(0.1), trial_result=_trial_result(contact_state="INSIDE_BLOCK", pinch_state="PINCH_INSUFFICIENT"), snapshot=None)
+
+    reset_row, main_row = runtime.records_snapshot()[-2:]
+    assert reset_row["send_status"] == "error"
+    assert reset_row["not_sent_reason"] == "missing_matrix_reset_mapping"
+    assert main_row["send_status"] == "skipped"
+    assert main_row["not_sent_reason"] == "missing_matrix_reset_mapping"
+    assert runtime._previous_matrix_output_key == "contact_valid"
+    assert len(worker.instances[0].sequences) == 1
+
+
+def test_matrix_reset_send_failure_aborts_main_and_rolls_back_previous_key() -> None:
+    worker = _FakeWorkerFactory(fail_reset=True)
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "contact_valid_feedback": {"enabled": True, "channel_list": [1]},
+                "pinch_insufficient_feedback": {"enabled": True, "channel_list": [2]},
+                "reset_before_output_change": {
+                    "enabled": True,
+                    "reset_map": {
+                        "contact_valid": {"channel_list": [10]},
+                    },
+                },
+            },
+        },
+        worker_factory=worker,
+    )
+    runtime.start()
+    runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=_trial_result(contact_state="INSIDE_BLOCK", pinch_state="PINCH_VALID"), snapshot=None)
+    runtime.process_frame(frame_index=2, source_frame_id=None, sample=_sample(0.1), trial_result=_trial_result(contact_state="INSIDE_BLOCK", pinch_state="PINCH_INSUFFICIENT"), snapshot=None)
+
+    assert runtime._previous_matrix_output_key == "pinch_insufficient"
+    worker.instances[0].trigger_reset_failure()
+
+    reset_row, main_row = runtime.records_snapshot()[-2:]
+    assert reset_row["send_status"] == "send_failed"
+    assert reset_row["not_sent_reason"] == "reset_send_failed"
+    assert main_row["send_status"] == "skipped"
+    assert main_row["not_sent_reason"] == "reset_failed"
+    assert runtime._previous_matrix_output_key == "contact_valid"
+
+
+def test_matrix_same_output_continuous_resend_does_not_reset() -> None:
+    clock = _Clock(0.0)
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "feedback_mode": "continuous_resend",
+                "resend_interval_ms": 100.0,
+                "contact_valid_feedback": {"enabled": True, "channel_list": [1]},
+                "reset_before_output_change": {
+                    "enabled": True,
+                    "reset_map": {
+                        "contact_valid": {"channel_list": [10]},
+                    },
+                },
+            },
+        },
+        worker_factory=_FakeWorkerFactory(),
+        monotonic_ms_fn=clock.now,
+    )
+    runtime.start()
+    frame = _trial_result(contact_state="INSIDE_BLOCK", pinch_state="PINCH_VALID")
+    runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=frame, snapshot=None)
+    clock.value = 120.0
+    runtime.process_frame(frame_index=2, source_frame_id=None, sample=_sample(0.1), trial_result=frame, snapshot=None)
+
+    rows = runtime.records_snapshot()
+    assert [row["haptic_type"] for row in rows] == [
+        "matrix_contact_valid",
+        "matrix_contact_valid",
+    ]
+
+
+def test_matrix_previous_key_updates_only_when_main_sequence_is_queued() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "contact_valid_feedback": {"enabled": True, "channel_list": [1]},
+                "pinch_insufficient_feedback": {"enabled": True, "channel_list": [2]},
+            },
+        },
+        worker_factory=worker,
+    )
+    runtime.start()
+    runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=_trial_result(contact_state="INSIDE_BLOCK", pinch_state="PINCH_VALID"), snapshot=None)
+    assert runtime._previous_matrix_output_key == "contact_valid"
+
+    worker.instances[0].reject_sequence = True
+    runtime.process_frame(frame_index=2, source_frame_id=None, sample=_sample(0.1), trial_result=_trial_result(contact_state="INSIDE_BLOCK", pinch_state="PINCH_INSUFFICIENT"), snapshot=None)
+
+    assert runtime.records_snapshot()[-1]["send_status"] == "queue_full"
+    assert runtime._previous_matrix_output_key == "contact_valid"
+
+
+def test_matrix_transition_to_none_can_queue_reset_without_empty_main_packet() -> None:
+    worker = _FakeWorkerFactory()
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "contact_valid_feedback": {"enabled": True, "channel_list": [1]},
+                "reset_before_output_change": {
+                    "enabled": True,
+                    "apply_on_transition_to_none": True,
+                    "reset_map": {
+                        "contact_valid": {"channel_list": [10]},
+                    },
+                },
+            },
+        },
+        worker_factory=worker,
+    )
+    runtime.start()
+    runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=_trial_result(contact_state="INSIDE_BLOCK", pinch_state="PINCH_VALID"), snapshot=None)
+    runtime.process_frame(frame_index=2, source_frame_id=None, sample=_sample(0.1), trial_result=_trial_result(contact_state="OUTSIDE_BLOCK", pinch_state="PINCH_VALID"), snapshot=None)
+
+    rows = runtime.records_snapshot()
+    assert rows[-2]["haptic_phase"] == "state_end"
+    assert rows[-1]["haptic_type"] == "matrix_reset_before_output_change"
+    assert rows[-1]["next_matrix_output_key"] is None
+    assert rows[-1]["channel_list"] == "[10]"
+    assert len(worker.instances[0].sequences[-1]) == 1
+    assert runtime._previous_matrix_output_key == "contact_valid"
+
+
 def test_vibration_contact_records_are_one_shot_line_commands() -> None:
     worker = _FakeWorkerFactory()
     runtime = _runtime(
@@ -869,9 +1200,13 @@ class _Clock:
 
 
 class _FakeWorker:
-    def __init__(self, **_: Any) -> None:
+    def __init__(self, *, fail_reset: bool = False, reject_sequence: bool = False, **_: Any) -> None:
         self.connected = False
         self.packets: list[bytes] = []
+        self.sequences: list[list[bytes]] = []
+        self.fail_reset = fail_reset
+        self.reject_sequence = reject_sequence
+        self._pending_reset_failure: tuple[Any, ...] | None = None
 
     def start(self) -> None:
         self.connected = True
@@ -885,16 +1220,66 @@ class _FakeWorker:
         record.not_sent_reason = None
         return True
 
+    def submit_sequence(
+        self,
+        steps: tuple[Any, ...],
+        *,
+        on_reset_failure: Any = None,
+    ) -> bool:
+        self.sequences.append([step.packet for step in steps])
+        if self.reject_sequence:
+            for step in steps:
+                step.record.success = False
+                step.record.send_status = "queue_full"
+                step.record.not_sent_reason = "queue_full"
+            return False
+        if self.fail_reset and any(step.role == "reset" for step in steps):
+            for step in steps:
+                step.record.send_status = "queued"
+                step.record.not_sent_reason = None
+            self._pending_reset_failure = (steps, on_reset_failure)
+            return True
+        for step in steps:
+            self.submit(step.record, step.packet)
+        return True
+
+    def trigger_reset_failure(self) -> None:
+        assert self._pending_reset_failure is not None
+        steps, callback = self._pending_reset_failure
+        reset_step = next(step for step in steps if step.role == "reset")
+        reset_step.record.success = False
+        reset_step.record.send_status = "send_failed"
+        reset_step.record.not_sent_reason = "reset_send_failed"
+        reset_step.record.error = "fake reset failure"
+        for step in steps:
+            if step.role == "main":
+                step.record.success = False
+                step.record.send_status = "skipped"
+                step.record.not_sent_reason = "reset_failed"
+        if callback is not None:
+            callback()
+        self._pending_reset_failure = None
+
     def stop(self) -> None:
         self.connected = False
 
 
 class _FakeWorkerFactory:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fail_reset: bool = False,
+        reject_sequence: bool = False,
+    ) -> None:
         self.instances: list[_FakeWorker] = []
+        self.fail_reset = fail_reset
+        self.reject_sequence = reject_sequence
 
     def __call__(self, **kwargs: Any) -> _FakeWorker:
         del kwargs
-        worker = _FakeWorker()
+        worker = _FakeWorker(
+            fail_reset=self.fail_reset,
+            reject_sequence=self.reject_sequence,
+        )
         self.instances.append(worker)
         return worker

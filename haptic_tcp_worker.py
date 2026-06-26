@@ -7,7 +7,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 class MutableHapticRecord(Protocol):
@@ -20,11 +20,20 @@ class MutableHapticRecord(Protocol):
 
 
 @dataclass(frozen=True)
-class MatrixSendTask:
-    """One queued Matrix packet and its mutable log record."""
+class MatrixSendStep:
+    """One ordered packet within an atomic Matrix queue task."""
 
     record: MutableHapticRecord
     packet: bytes
+    role: str = "main"
+
+
+@dataclass(frozen=True)
+class MatrixSendTask:
+    """One atomic ordered Matrix packet sequence."""
+
+    steps: tuple[MatrixSendStep, ...]
+    on_reset_failure: Callable[[], None] | None = None
 
 
 class MatrixHapticConnectionError(RuntimeError):
@@ -89,31 +98,46 @@ class MatrixTcpWorker:
     def submit(self, record: MutableHapticRecord, packet: bytes) -> bool:
         """Queue a packet without blocking the trial loop."""
 
-        record.queued_monotonic_ms = time.monotonic() * 1000.0
-        task = MatrixSendTask(record=record, packet=packet)
+        return self.submit_sequence((MatrixSendStep(record=record, packet=packet),))
+
+    def submit_sequence(
+        self,
+        steps: tuple[MatrixSendStep, ...],
+        *,
+        on_reset_failure: Callable[[], None] | None = None,
+    ) -> bool:
+        """Queue an ordered packet sequence as one latest-only unit."""
+
+        if not steps:
+            raise ValueError("Matrix send sequence must contain at least one step.")
+        task = MatrixSendTask(
+            steps=tuple(steps),
+            on_reset_failure=on_reset_failure,
+        )
         try:
             self._queue.put_nowait(task)
-            record.send_status = "queued"
+            _mark_task_queued(task)
             return True
         except queue.Full:
             if not self.latest_only:
-                _mark_not_sent(record, "queue_full", "queue_full")
+                _mark_task_not_sent(task, "queue_full", "queue_full")
                 return False
             try:
                 dropped = self._queue.get_nowait()
-                _mark_not_sent(
-                    dropped.record,
+                _mark_task_not_sent(
+                    dropped,
                     "replaced",
                     "queue_replaced_by_latest",
                 )
+                self._queue.task_done()
             except queue.Empty:
                 pass
             try:
                 self._queue.put_nowait(task)
-                record.send_status = "queued"
+                _mark_task_queued(task)
                 return True
             except queue.Full:
-                _mark_not_sent(record, "queue_full", "queue_full")
+                _mark_task_not_sent(task, "queue_full", "queue_full")
                 return False
 
     def stop(self, timeout_s: float = 1.0) -> None:
@@ -146,21 +170,46 @@ class MatrixTcpWorker:
     def _send_task(self, task: MatrixSendTask) -> None:
         sock = self._socket
         if sock is None:
-            _mark_not_sent(task.record, "not_connected", "not_connected")
+            if task.steps[0].role == "reset":
+                _mark_not_sent(
+                    task.steps[0].record,
+                    "not_connected",
+                    "reset_send_failed",
+                )
+                for remaining in task.steps[1:]:
+                    _mark_not_sent(remaining.record, "skipped", "reset_failed")
+                if task.on_reset_failure is not None:
+                    try:
+                        task.on_reset_failure()
+                    except Exception:
+                        pass
+            else:
+                _mark_task_not_sent(task, "not_connected", "not_connected")
             return
-        try:
-            sock.sendall(task.packet)
-        except Exception as exc:
-            task.record.success = False
-            task.record.send_status = "send_failed"
-            task.record.not_sent_reason = "send_failed"
-            task.record.error = str(exc)
-            return
-        task.record.sent_monotonic_ms = time.monotonic() * 1000.0
-        task.record.success = True
-        task.record.send_status = "sent"
-        task.record.not_sent_reason = None
-        task.record.error = None
+        for index, step in enumerate(task.steps):
+            try:
+                sock.sendall(step.packet)
+            except Exception as exc:
+                step.record.success = False
+                step.record.send_status = "send_failed"
+                step.record.not_sent_reason = (
+                    "reset_send_failed" if step.role == "reset" else "send_failed"
+                )
+                step.record.error = str(exc)
+                if step.role == "reset":
+                    for remaining in task.steps[index + 1 :]:
+                        _mark_not_sent(remaining.record, "skipped", "reset_failed")
+                    if task.on_reset_failure is not None:
+                        try:
+                            task.on_reset_failure()
+                        except Exception:
+                            pass
+                return
+            step.record.sent_monotonic_ms = time.monotonic() * 1000.0
+            step.record.success = True
+            step.record.send_status = "sent"
+            step.record.not_sent_reason = None
+            step.record.error = None
 
 
 def _mark_not_sent(
@@ -171,3 +220,16 @@ def _mark_not_sent(
     record.success = False
     record.send_status = status
     record.not_sent_reason = reason
+
+
+def _mark_task_queued(task: MatrixSendTask) -> None:
+    queued_ms = time.monotonic() * 1000.0
+    for step in task.steps:
+        step.record.queued_monotonic_ms = queued_ms
+        step.record.send_status = "queued"
+        step.record.not_sent_reason = None
+
+
+def _mark_task_not_sent(task: MatrixSendTask, status: str, reason: str) -> None:
+    for step in task.steps:
+        _mark_not_sent(step.record, status, reason)

@@ -21,6 +21,12 @@ def test_default_haptic_config_is_disabled() -> None:
     assert config.matrix.combination_channel_map == {}
     assert config.matrix.missing_combination_policy == "skip"
     assert config.matrix.ignore_direction_axes == ()
+    assert config.matrix.contact_valid_feedback.enabled is False
+    assert config.matrix.contact_valid_feedback.channel_list == ()
+    assert config.matrix.pinch_insufficient_feedback.enabled is False
+    assert config.matrix.reset_before_output_change.enabled is False
+    assert config.matrix.reset_before_output_change.missing_reset_policy == "skip_reset"
+    assert config.matrix.reset_before_output_change.reset_map == {}
     assert config.vibration.enabled is False
     assert config.vibration.transport == "tcp_line_int_v1"
     assert config.vibration.required is True
@@ -98,6 +104,77 @@ def test_vibration_pinch_insufficient_slip_policy_is_validated() -> None:
     with pytest.raises(ValueError, match="pinch_insufficient_slip_policy"):
         haptic_config_from_dict(
             {"vibration": {"pinch_insufficient_slip_policy": "sometimes"}}
+        )
+
+
+def test_matrix_state_feedback_and_reset_config_are_normalized() -> None:
+    config = haptic_config_from_dict(
+        {
+            "matrix": {
+                "contact_valid_feedback": {
+                    "enabled": True,
+                    "channel_list": [1, 2],
+                },
+                "pinch_insufficient_feedback": {
+                    "enabled": True,
+                    "channel_list": [3],
+                },
+                "reset_before_output_change": {
+                    "enabled": True,
+                    "missing_reset_policy": "error",
+                    "apply_on_transition_to_none": True,
+                    "reset_map": {
+                        "contact_valid": {"channel_list": [10], "hold_ms": 0},
+                        "blocked:Y_NEG+X_POS": {"channel_list": [11]},
+                    },
+                },
+            }
+        }
+    )
+
+    assert config.matrix.contact_valid_feedback.channel_list == (1, 2)
+    assert config.matrix.pinch_insufficient_feedback.channel_list == (3,)
+    reset = config.matrix.reset_before_output_change
+    assert reset.missing_reset_policy == "error"
+    assert reset.apply_on_transition_to_none is True
+    assert set(reset.reset_map) == {"contact_valid", "blocked:X_POS+Y_NEG"}
+    assert reset.reset_map["blocked:X_POS+Y_NEG"].channel_list == (11,)
+
+
+def test_matrix_reset_config_rejects_invalid_keys_and_nonzero_hold() -> None:
+    with pytest.raises(ValueError, match="matrix reset_map key"):
+        haptic_config_from_dict(
+            {
+                "matrix": {
+                    "reset_before_output_change": {
+                        "reset_map": {"mystery": {"channel_list": [1]}}
+                    }
+                }
+            }
+        )
+
+    with pytest.raises(ValueError, match="hold_ms must be 0"):
+        haptic_config_from_dict(
+            {
+                "matrix": {
+                    "reset_before_output_change": {
+                        "reset_map": {
+                            "contact_valid": {"channel_list": [1], "hold_ms": 5}
+                        }
+                    }
+                }
+            }
+        )
+
+    with pytest.raises(ValueError, match="missing_reset_policy"):
+        haptic_config_from_dict(
+            {
+                "matrix": {
+                    "reset_before_output_change": {
+                        "missing_reset_policy": "clear_all"
+                    }
+                }
+            }
         )
 
 

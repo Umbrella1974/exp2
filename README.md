@@ -901,7 +901,7 @@ GUI 的 `displayed_monotonic_ms` 表示一次 GUI refresh 已应用文本，受 
 
 ### Haptic TCP Stage 2
 
-Haptic 层是独立输出层，只观察现有 `TrialController` / `BlockController` 结果，不修改 contact、slip、blocked、detach 或 trial outcome 逻辑。Stage 2 支持两个独立 ESP32 target：Matrix / electrotactile 用于 blocked direction，vibration motor 用于 contact/release/slip。两个 target 可以独立启用、独立连接、独立 smoke test。replay 默认 `haptic_enabled=false`，不会向真实硬件发送。
+Haptic 层是独立输出层，只观察现有 `TrialController` / `BlockController` 结果，不修改 contact、slip、blocked、detach 或 trial outcome 逻辑。Stage 2 支持两个独立 ESP32 target：Matrix / electrotactile 可输出 blocked direction、pinch insufficient 或 valid contact 三类单一状态反馈，vibration motor 用于 contact/release/slip。两个 target 可以独立启用、独立连接、独立 smoke test。replay 默认 `haptic_enabled=false`，不会向真实硬件发送。
 
 Matrix ESP32 packet:
 
@@ -970,7 +970,25 @@ python run_live_integrated_session.py ^
       "X_NEG+Y_POS": [26, 27, 28],
       "X_NEG+Y_NEG": [29, 30, 31]
     },
-    "missing_combination_policy": "skip"
+    "missing_combination_policy": "skip",
+    "contact_valid_feedback": {
+      "enabled": false,
+      "channel_list": []
+    },
+    "pinch_insufficient_feedback": {
+      "enabled": false,
+      "channel_list": []
+    },
+    "reset_before_output_change": {
+      "enabled": false,
+      "missing_reset_policy": "skip_reset",
+      "apply_on_transition_to_none": false,
+      "reset_map": {
+        "contact_valid": {"channel_list": [], "hold_ms": 0},
+        "pinch_insufficient": {"channel_list": [], "hold_ms": 0},
+        "blocked:X_POS": {"channel_list": [], "hold_ms": 0}
+      }
+    }
   },
   "vibration": {
     "enabled": true,
@@ -1001,13 +1019,37 @@ python run_live_integrated_session.py ^
 }
 ```
 
+Matrix 第一版同时只允许一个正式 main output active，不会把多个状态的 channel list 相加。统一优先级是：
+
+```text
+blocked_direction > pinch_insufficient > contact_valid > none
+```
+
+`contact_valid_feedback` 在 `contact_state=INSIDE_BLOCK` 且 `pinch_state=PINCH_VALID` 时生效。`pinch_insufficient_feedback` 在 `contact_state=INSIDE_BLOCK` 且 `pinch_state=PINCH_INSUFFICIENT` 时生效，不依赖 `slip_active` 或运动阈值。blocked 状态即使没有可用 direction/channel mapping，也仍然压制低优先级输出，不回退成 contact 或 pinch-insufficient feedback。两个新增效果默认关闭。
+
+稳定的正式输出 key 是：
+
+```text
+contact_valid
+pinch_insufficient
+blocked:<matrix_direction_used>
+```
+
+例如 `blocked:X_POS+Y_NEG`。blocked key 使用经过 `direction_semantics`、`ignore_direction_axes` 和组合方向规范化后真正用于 Matrix 查表的方向。
+
+`reset_before_output_change` 不是给受试者设计的过渡刺激，而是 Matrix 正式输出变化前的 state-dependent hardware reset。程序用 `previous_matrix_output_key` 查 `reset_map`，并把 reset packet 与 next main packet 作为一个原子 sequence task 入队；`latest_only` 只能替换整个 sequence，不能拆开 reset/main。发送顺序始终是 reset 后 main；如果 reset 发送失败，该 sequence 立即终止，main 记录 `send_status=skipped`、`not_sent_reason=reset_failed`，previous key 回滚并保持旧值。
+
+`missing_reset_policy=skip_reset` 时，缺少 reset mapping 会记录 `missing_matrix_reset_mapping`，然后继续发送 main；`error` 时 reset 记录 error、main 记录 skipped，二者都不发送，previous key 不更新。空 `channel_list` 不编码、不发送，也不代表 clear/blank/stop；空 reset channel list 按缺少 reset mapping 处理。`apply_on_transition_to_none=false` 是默认值，不在状态结束时自动 reset。第一版只允许 `hold_ms=0`，trial loop 中不会 sleep。
+
+`haptic_command_log.csv` 中正式输出分别使用 `matrix_contact_valid`、`matrix_pinch_insufficient`、`matrix_blocked_direction`；reset 使用 `matrix_reset_before_output_change` 和 `haptic_phase=reset`。`matrix_output_key`、`previous_matrix_output_key`、`next_matrix_output_key` 与 `haptic_sequence_index` 可以重建 reset/main 的决策和顺序。`previous_matrix_output_key` 只在 main output 成功进入 worker queue 后更新；queue full、not connected、缺少 mapping 或 reset error 都不会更新。
+
 `matrix.direction_semantics` 默认是 `blocked_surface`，channel map 表示撞到哪一侧边界，例如 `BLOCKED_X_NEG -> X_NEG`。也可以改成 `correction_direction`，channel map 表示应该往哪个方向退回，例如 `BLOCKED_X_NEG -> X_POS`。haptic log 会同时保存 `primary_blocked_surface`、`correction_direction`、`blocked_surface_set`、`correction_direction_set`、`matrix_filtered_blocked_surface_set`、`matrix_filtered_correction_direction_set`、`matrix_direction_used`、`matrix_direction_semantics` 和 `matrix_ignored_direction_axes`。
 
 单方向 blocked 继续查 `direction_channel_map`。多方向 blocked 会按 X/Y/Z 轴顺序规范化成组合 key，例如 `X_POS+Y_POS`，然后查 `combination_channel_map`。默认 `missing_combination_policy=skip`，组合缺失时不会把 `X_POS` 和 `Y_POS` 的通道相加，而是在 `haptic_command_log.csv` 中记录 `send_status=not_sent`、`not_sent_reason=missing_combination_mapping`。如需调试并集行为，可以显式设置 `missing_combination_policy=union_single_directions`，但正式实验建议为每个组合单独配置硬件通道。
 
 `matrix.ignore_direction_axes` 只影响 Matrix haptic 输出，不改变 TrialController、BlockController、轨道/target 判定、GUI cue、`processed_frames.csv` 或 `events.csv`。XY 平面实验里可以设为 `["Z"]`：原始几何 blocked set 仍记录为 `X_POS+Y_NEG+Z_POS`，但 Matrix 实际查表使用过滤后的 `X_POS+Y_NEG`。如果过滤后为空，例如 `Z_POS` 且忽略 `Z`，则不发送 Matrix command，并记录 `send_status=skipped`、`not_sent_reason=direction_filtered_empty`。
 
-Matrix `feedback_mode=latched_once` 时，blocked start 或方向变化才发送一次 channel frame；blocked 持续且方向不变不重复发送。`continuous_resend` 会在 blocked active 期间按 `resend_interval_ms` 重发当前方向。blocked end、trial end、invalid、abort 只记录 `state_end`，不发送 `clear_all`、`stop_all` 或默认 zero-channel frame。
+Matrix `feedback_mode=latched_once` 时，正式 output start 或 key/通道变化才发送一次 channel frame；状态持续且 output 不变时不重复发送。`continuous_resend` 会按 `resend_interval_ms` 重发同一个 main output，但同 key resend 不触发 reset。状态结束、trial end、invalid、abort 默认只记录 `state_end`，不发送 `clear_all`、`stop_all` 或默认 zero-channel frame；只有显式启用 `apply_on_transition_to_none` 才按 previous key 尝试配置好的 reset。
 
 如果只想测试 Matrix ESP32 硬件链路，不依赖 MANUS/Vive、trial、地图或 blocked 状态，可以运行独立 smoke：
 

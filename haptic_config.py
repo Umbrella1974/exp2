@@ -15,6 +15,7 @@ MATRIX_FEEDBACK_MODES = ("latched_once", "continuous_resend")
 MATRIX_TRANSPORTS = ("tcp_magic_v1", "disabled")
 MATRIX_DIRECTION_SEMANTICS = ("blocked_surface", "correction_direction")
 MATRIX_MISSING_COMBINATION_POLICIES = ("skip", "union_single_directions")
+MATRIX_MISSING_RESET_POLICIES = ("skip_reset", "error")
 VIBRATION_TRANSPORTS = ("tcp_line_int_v1", "disabled")
 VIBRATION_COMMAND_LABELS = ("contact_enter", "contact_exit", "slip_start", "slip_end")
 VIBRATION_PINCH_INSUFFICIENT_SLIP_POLICIES = (
@@ -27,6 +28,82 @@ DEFAULT_VIBRATION_COMMAND_MAP = {
     "slip_start": 3,
     "slip_end": 4,
 }
+
+
+@dataclass(frozen=True)
+class MatrixStateFeedbackConfig:
+    """One non-directional Matrix main-output state."""
+
+    enabled: bool = False
+    channel_list: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        _bool_value(self.enabled, "matrix state feedback.enabled")
+        object.__setattr__(
+            self,
+            "channel_list",
+            _channel_list(self.channel_list, "matrix state feedback.channel_list"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"enabled": self.enabled, "channel_list": list(self.channel_list)}
+
+
+@dataclass(frozen=True)
+class MatrixResetEntryConfig:
+    """Configured hardware-reset packet for one previous output key."""
+
+    channel_list: tuple[int, ...] = ()
+    hold_ms: float = 0.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "channel_list",
+            _channel_list(self.channel_list, "matrix reset channel_list"),
+        )
+        hold_ms = _non_negative_float(self.hold_ms, "matrix reset hold_ms")
+        if hold_ms != 0.0:
+            raise ValueError("matrix reset hold_ms must be 0 in the first implementation.")
+        object.__setattr__(self, "hold_ms", hold_ms)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"channel_list": list(self.channel_list), "hold_ms": self.hold_ms}
+
+
+@dataclass(frozen=True)
+class MatrixResetBeforeOutputChangeConfig:
+    """State-dependent hardware reset before a Matrix main-output change."""
+
+    enabled: bool = False
+    missing_reset_policy: str = "skip_reset"
+    apply_on_transition_to_none: bool = False
+    reset_map: dict[str, MatrixResetEntryConfig] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _bool_value(self.enabled, "matrix.reset_before_output_change.enabled")
+        _bool_value(
+            self.apply_on_transition_to_none,
+            "matrix.reset_before_output_change.apply_on_transition_to_none",
+        )
+        if self.missing_reset_policy not in MATRIX_MISSING_RESET_POLICIES:
+            raise ValueError(
+                "matrix.reset_before_output_change.missing_reset_policy must be one of: "
+                + ", ".join(MATRIX_MISSING_RESET_POLICIES)
+            )
+        if not isinstance(self.reset_map, dict):
+            raise ValueError("matrix.reset_before_output_change.reset_map must be an object.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "missing_reset_policy": self.missing_reset_policy,
+            "apply_on_transition_to_none": self.apply_on_transition_to_none,
+            "reset_map": {
+                key: entry.to_dict()
+                for key, entry in self.reset_map.items()
+            },
+        }
 
 
 @dataclass(frozen=True)
@@ -52,6 +129,15 @@ class MatrixHapticConfig:
     combination_channel_map: dict[str, list[int]] = field(default_factory=dict)
     missing_combination_policy: str = "skip"
     ignore_direction_axes: tuple[str, ...] = ()
+    contact_valid_feedback: MatrixStateFeedbackConfig = field(
+        default_factory=MatrixStateFeedbackConfig
+    )
+    pinch_insufficient_feedback: MatrixStateFeedbackConfig = field(
+        default_factory=MatrixStateFeedbackConfig
+    )
+    reset_before_output_change: MatrixResetBeforeOutputChangeConfig = field(
+        default_factory=MatrixResetBeforeOutputChangeConfig
+    )
 
     def __post_init__(self) -> None:
         _bool_value(self.enabled, "matrix.enabled")
@@ -126,7 +212,11 @@ class MatrixHapticConfig:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["contact_valid_feedback"] = self.contact_valid_feedback.to_dict()
+        payload["pinch_insufficient_feedback"] = self.pinch_insufficient_feedback.to_dict()
+        payload["reset_before_output_change"] = self.reset_before_output_change.to_dict()
+        return payload
 
 
 @dataclass(frozen=True)
@@ -316,6 +406,9 @@ def _matrix_config_from_dict(payload: dict[str, Any]) -> MatrixHapticConfig:
         "combination_channel_map",
         "missing_combination_policy",
         "ignore_direction_axes",
+        "contact_valid_feedback",
+        "pinch_insufficient_feedback",
+        "reset_before_output_change",
     }
     unknown = sorted(set(payload) - allowed)
     if unknown:
@@ -357,6 +450,94 @@ def _matrix_config_from_dict(payload: dict[str, Any]) -> MatrixHapticConfig:
             )
         ),
         ignore_direction_axes=payload.get("ignore_direction_axes", ()),
+        contact_valid_feedback=_matrix_state_feedback_from_dict(
+            _object_value(
+                payload.get("contact_valid_feedback", {}),
+                "matrix.contact_valid_feedback",
+            ),
+            "matrix.contact_valid_feedback",
+        ),
+        pinch_insufficient_feedback=_matrix_state_feedback_from_dict(
+            _object_value(
+                payload.get("pinch_insufficient_feedback", {}),
+                "matrix.pinch_insufficient_feedback",
+            ),
+            "matrix.pinch_insufficient_feedback",
+        ),
+        reset_before_output_change=_matrix_reset_before_output_change_from_dict(
+            _object_value(
+                payload.get("reset_before_output_change", {}),
+                "matrix.reset_before_output_change",
+            )
+        ),
+    )
+
+
+def _matrix_state_feedback_from_dict(
+    payload: dict[str, Any],
+    name: str,
+) -> MatrixStateFeedbackConfig:
+    allowed = {"enabled", "channel_list"}
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError(f"unknown {name} keys: {', '.join(unknown)}")
+    return MatrixStateFeedbackConfig(
+        enabled=_bool_value(payload.get("enabled", False), f"{name}.enabled"),
+        channel_list=_channel_list(
+            payload.get("channel_list", ()),
+            f"{name}.channel_list",
+        ),
+    )
+
+
+def _matrix_reset_before_output_change_from_dict(
+    payload: dict[str, Any],
+) -> MatrixResetBeforeOutputChangeConfig:
+    name = "matrix.reset_before_output_change"
+    allowed = {
+        "enabled",
+        "missing_reset_policy",
+        "apply_on_transition_to_none",
+        "reset_map",
+    }
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError(f"unknown {name} keys: {', '.join(unknown)}")
+    reset_map_payload = _object_value(payload.get("reset_map", {}), f"{name}.reset_map")
+    reset_map: dict[str, MatrixResetEntryConfig] = {}
+    for raw_key, raw_entry in reset_map_payload.items():
+        key = _normalize_matrix_output_key(raw_key)
+        if key in reset_map:
+            raise ValueError(
+                f"{name}.reset_map has duplicate key after normalization: {key}"
+            )
+        entry_payload = _object_value(raw_entry, f"{name}.reset_map.{key}")
+        entry_allowed = {"channel_list", "hold_ms"}
+        entry_unknown = sorted(set(entry_payload) - entry_allowed)
+        if entry_unknown:
+            raise ValueError(
+                f"unknown {name}.reset_map.{key} keys: {', '.join(entry_unknown)}"
+            )
+        reset_map[key] = MatrixResetEntryConfig(
+            channel_list=_channel_list(
+                entry_payload.get("channel_list", ()),
+                f"{name}.reset_map.{key}.channel_list",
+            ),
+            hold_ms=entry_payload.get("hold_ms", 0.0),
+        )
+    return MatrixResetBeforeOutputChangeConfig(
+        enabled=_bool_value(payload.get("enabled", False), f"{name}.enabled"),
+        missing_reset_policy=str(
+            payload.get(
+                "missing_reset_policy",
+                MatrixResetBeforeOutputChangeConfig.missing_reset_policy,
+            )
+        ),
+        apply_on_transition_to_none=_bool_value(
+            payload.get("apply_on_transition_to_none", False),
+            f"{name}.apply_on_transition_to_none",
+        ),
+        reset_map=reset_map,
     )
 
 
@@ -573,12 +754,48 @@ def normalize_direction_key(value: Any, *, name: str = "direction key") -> str:
     return "+".join(sorted(parts, key=_direction_sort_key))
 
 
+def _normalize_matrix_output_key(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("matrix reset_map key must be a string.")
+    key = value.strip()
+    if key in {"contact_valid", "pinch_insufficient"}:
+        return key
+    prefix = "blocked:"
+    if key.startswith(prefix):
+        direction = normalize_direction_key(
+            key.removeprefix(prefix),
+            name="matrix reset_map blocked direction",
+        )
+        return f"{prefix}{direction}"
+    raise ValueError(
+        "matrix reset_map key must be contact_valid, pinch_insufficient, "
+        "or blocked:<direction key>."
+    )
+
+
 def _direction_sort_key(direction: str) -> tuple[int, int]:
     axis = direction.split("_", 1)[0]
     sign = direction.split("_", 1)[1]
     axis_order = {"X": 0, "Y": 1, "Z": 2}
     sign_order = {"POS": 0, "NEG": 1}
     return axis_order[axis], sign_order[sign]
+
+
+def _channel_list(value: Any, name: str) -> tuple[int, ...]:
+    if isinstance(value, str):
+        raise ValueError(f"{name} must be a list.")
+    try:
+        raw_channels = list(value)
+    except TypeError as exc:
+        raise ValueError(f"{name} must be a list.") from exc
+    normalized: list[int] = []
+    for channel in raw_channels:
+        if not isinstance(channel, int):
+            raise ValueError(f"{name} channels must be integers.")
+        if channel < 0 or channel > 127:
+            raise ValueError(f"{name} channel must be in 0..127.")
+        normalized.append(channel)
+    return tuple(normalized)
 
 
 def _channel_value(
