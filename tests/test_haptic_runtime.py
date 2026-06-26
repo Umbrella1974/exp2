@@ -577,6 +577,7 @@ def test_matrix_priority_selects_blocked_without_channel_union_or_fallback() -> 
     missing_row = no_mapping.records_snapshot()[0]
     assert missing_row["haptic_type"] == "matrix_blocked_direction"
     assert missing_row["not_sent_reason"] == "no_channel_mapping"
+    assert no_mapping._active_matrix_output is None
 
 
 def test_matrix_missing_reset_skip_policy_sends_main_and_empty_mapping_is_not_packet() -> None:
@@ -614,6 +615,8 @@ def test_matrix_missing_reset_skip_policy_sends_main_and_empty_mapping_is_not_pa
     assert main_row["send_status"] == "sent"
     assert len(worker.instances[0].sequences[-1]) == 1
     assert runtime._previous_matrix_output_key == "pinch_insufficient"
+    assert runtime._active_matrix_output is not None
+    assert runtime._active_matrix_output.output_key == "pinch_insufficient"
 
 
 def test_matrix_missing_reset_error_skips_main_and_preserves_previous_key() -> None:
@@ -645,6 +648,8 @@ def test_matrix_missing_reset_error_skips_main_and_preserves_previous_key() -> N
     assert main_row["send_status"] == "skipped"
     assert main_row["not_sent_reason"] == "missing_matrix_reset_mapping"
     assert runtime._previous_matrix_output_key == "contact_valid"
+    assert runtime._active_matrix_output is not None
+    assert runtime._active_matrix_output.output_key == "contact_valid"
     assert len(worker.instances[0].sequences) == 1
 
 
@@ -682,6 +687,8 @@ def test_matrix_reset_send_failure_aborts_main_and_rolls_back_previous_key() -> 
     assert main_row["send_status"] == "skipped"
     assert main_row["not_sent_reason"] == "reset_failed"
     assert runtime._previous_matrix_output_key == "contact_valid"
+    assert runtime._active_matrix_output is not None
+    assert runtime._active_matrix_output.output_key == "contact_valid"
 
 
 def test_matrix_same_output_continuous_resend_does_not_reset() -> None:
@@ -744,6 +751,8 @@ def test_matrix_previous_key_updates_only_when_main_sequence_is_queued() -> None
 
     assert runtime.records_snapshot()[-1]["send_status"] == "queue_full"
     assert runtime._previous_matrix_output_key == "contact_valid"
+    assert runtime._active_matrix_output is not None
+    assert runtime._active_matrix_output.output_key == "contact_valid"
 
 
 def test_matrix_transition_to_none_can_queue_reset_without_empty_main_packet() -> None:
@@ -777,7 +786,42 @@ def test_matrix_transition_to_none_can_queue_reset_without_empty_main_packet() -
     assert rows[-1]["next_matrix_output_key"] is None
     assert rows[-1]["channel_list"] == "[10]"
     assert len(worker.instances[0].sequences[-1]) == 1
+    assert runtime._previous_matrix_output_key is None
+    assert runtime._active_matrix_output is None
+
+
+def test_matrix_transition_to_none_reset_failure_restores_previous_key_and_active_output() -> None:
+    worker = _FakeWorkerFactory(fail_reset=True)
+    runtime = _runtime(
+        {
+            "enabled": True,
+            "matrix": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "startup_settle_seconds": 0.0,
+                "contact_valid_feedback": {"enabled": True, "channel_list": [1]},
+                "reset_before_output_change": {
+                    "enabled": True,
+                    "apply_on_transition_to_none": True,
+                    "reset_map": {
+                        "contact_valid": {"channel_list": [10]},
+                    },
+                },
+            },
+        },
+        worker_factory=worker,
+    )
+    runtime.start()
+    runtime.process_frame(frame_index=1, source_frame_id=None, sample=_sample(), trial_result=_trial_result(contact_state="INSIDE_BLOCK", pinch_state="PINCH_VALID"), snapshot=None)
+    runtime.process_frame(frame_index=2, source_frame_id=None, sample=_sample(0.1), trial_result=_trial_result(contact_state="OUTSIDE_BLOCK", pinch_state="PINCH_VALID"), snapshot=None)
+
+    assert runtime._previous_matrix_output_key is None
+    assert runtime._active_matrix_output is None
+    worker.instances[0].trigger_reset_failure()
+
     assert runtime._previous_matrix_output_key == "contact_valid"
+    assert runtime._active_matrix_output is not None
+    assert runtime._active_matrix_output.output_key == "contact_valid"
 
 
 def test_vibration_contact_records_are_one_shot_line_commands() -> None:

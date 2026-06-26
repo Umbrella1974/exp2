@@ -1,0 +1,50 @@
+{
+  "enabled": true,
+  "matrix": {
+    "enabled": true,
+    "transport": "tcp_magic_v1",
+    "required": true,
+    "host": "192.168.x.x",
+    "port": 12345,
+    "connect_timeout_s": 3.0,
+    "send_timeout_s": 0.05,
+    "startup_settle_seconds": 7.0,
+    "max_queue_size": 8,
+    "latest_only": true,
+    "feedback_mode": "latched_once",
+    "resend_interval_ms": 100.0,
+    "direction_semantics": "blocked_surface",
+    "ignore_direction_axes": ["Z"],
+    "direction_channel_map": {
+      "X_NEG": [],
+      "X_POS": [],
+      "Y_NEG": [],
+      "Y_POS": [],
+      "Z_NEG": [],
+      "Z_POS": []
+    },
+    "combination_channel_map": {},
+    "missing_combination_policy": "skip",
+    "contact_valid_feedback": {
+      "enabled": true,
+      "channel_list": [1]
+    },
+    "pinch_insufficient_feedback": {
+      "enabled": true,
+      "channel_list": [2]
+    },
+    "reset_before_output_change": {
+      "enabled": true,
+      "missing_reset_policy": "skip_reset",
+      "apply_on_transition_to_none": true,
+      "reset_map": {
+        "contact_valid": {"channel_list": [10], "hold_ms": 0},
+        "pinch_insufficient": {"channel_list": [11], "hold_ms": 0},
+        "blocked:X_POS": {"channel_list": [12], "hold_ms": 0}
+      }
+    }
+  },
+  "vibration": {
+    "enabled": false
+  }
+}

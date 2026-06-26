@@ -934,7 +934,7 @@ python run_live_integrated_session.py ^
   --haptic-config configs\haptic_matrix_vibration.example.json
 ```
 
-运行前请把示例配置里的 `192.168.x.x` / `192.168.x.y` 改成现场 Matrix / vibration ESP32 的真实 IP；如果只测试其中一个 target，把另一个 target 的 `enabled` 改成 `false`。
+运行前请把示例配置里的 `192.168.x.x` / `192.168.x.y` 改成现场 Matrix / vibration ESP32 的真实 IP；如果只测试其中一个 target，把另一个 target 的 `enabled` 改成 `false`。如果只想预检 Matrix 的 `contact_valid -> reset(contact_valid) -> pinch_insufficient` 顺序，可以从 `configs/haptic_matrix_sequence_pretest.example.json` 复制一份改 IP 和通道。
 
 示例配置：
 
@@ -1037,11 +1037,11 @@ blocked:<matrix_direction_used>
 
 例如 `blocked:X_POS+Y_NEG`。blocked key 使用经过 `direction_semantics`、`ignore_direction_axes` 和组合方向规范化后真正用于 Matrix 查表的方向。
 
-`reset_before_output_change` 不是给受试者设计的过渡刺激，而是 Matrix 正式输出变化前的 state-dependent hardware reset。程序用 `previous_matrix_output_key` 查 `reset_map`，并把 reset packet 与 next main packet 作为一个原子 sequence task 入队；`latest_only` 只能替换整个 sequence，不能拆开 reset/main。发送顺序始终是 reset 后 main；如果 reset 发送失败，该 sequence 立即终止，main 记录 `send_status=skipped`、`not_sent_reason=reset_failed`，previous key 回滚并保持旧值。
+`reset_before_output_change` 不是给受试者设计的过渡刺激，而是 Matrix 正式输出变化前的 state-dependent hardware reset。程序用 `previous_matrix_output_key` 查 `reset_map`，并把 reset packet 与 next main packet 作为一个原子 sequence task 入队；`latest_only` 只能替换整个 sequence，不能拆开 reset/main。发送顺序始终是 reset 后 main；如果 reset 发送失败，该 sequence 立即终止，main 记录 `send_status=skipped`、`not_sent_reason=reset_failed`，previous key 和 active output 回滚并保持旧状态。
 
-`missing_reset_policy=skip_reset` 时，缺少 reset mapping 会记录 `missing_matrix_reset_mapping`，然后继续发送 main；`error` 时 reset 记录 error、main 记录 skipped，二者都不发送，previous key 不更新。空 `channel_list` 不编码、不发送，也不代表 clear/blank/stop；空 reset channel list 按缺少 reset mapping 处理。`apply_on_transition_to_none=false` 是默认值，不在状态结束时自动 reset。第一版只允许 `hold_ms=0`，trial loop 中不会 sleep。
+`missing_reset_policy=skip_reset` 时，缺少 reset mapping 会记录 `missing_matrix_reset_mapping`，然后继续发送 main；`error` 时 reset 记录 error、main 记录 skipped，二者都不发送，previous key 和 active output 不更新。空 `channel_list` 不编码、不发送，也不代表 clear/blank/stop；空 reset channel list 按缺少 reset mapping 处理。`apply_on_transition_to_none=false` 是默认值，不在状态结束时自动 reset：此时 `none` 只是实验逻辑上的无输出，不表示硬件已经复位。只有显式设为 `true`，状态结束才会按 previous key 发送 reset-to-none；reset-to-none 成功入队后会清空 `previous_matrix_output_key` 和 active output，失败则保留旧 key/output，方便后续重试并保持日志语义一致。第一版只允许 `hold_ms=0`，trial loop 中不会 sleep。
 
-`haptic_command_log.csv` 中正式输出分别使用 `matrix_contact_valid`、`matrix_pinch_insufficient`、`matrix_blocked_direction`；reset 使用 `matrix_reset_before_output_change` 和 `haptic_phase=reset`。`matrix_output_key`、`previous_matrix_output_key`、`next_matrix_output_key` 与 `haptic_sequence_index` 可以重建 reset/main 的决策和顺序。`previous_matrix_output_key` 只在 main output 成功进入 worker queue 后更新；queue full、not connected、缺少 mapping 或 reset error 都不会更新。
+`haptic_command_log.csv` 中正式输出分别使用 `matrix_contact_valid`、`matrix_pinch_insufficient`、`matrix_blocked_direction`；reset 使用 `matrix_reset_before_output_change` 和 `haptic_phase=reset`。`matrix_output_key`、`previous_matrix_output_key`、`next_matrix_output_key` 与 `haptic_sequence_index` 可以重建 reset/main 的决策和顺序。`previous_matrix_output_key` 和 runtime active output 只在 main output 成功进入 worker queue 后更新；queue full、not connected、缺少 mapping、invalid channel 或 reset error 都不会更新。
 
 `matrix.direction_semantics` 默认是 `blocked_surface`，channel map 表示撞到哪一侧边界，例如 `BLOCKED_X_NEG -> X_NEG`。也可以改成 `correction_direction`，channel map 表示应该往哪个方向退回，例如 `BLOCKED_X_NEG -> X_POS`。haptic log 会同时保存 `primary_blocked_surface`、`correction_direction`、`blocked_surface_set`、`correction_direction_set`、`matrix_filtered_blocked_surface_set`、`matrix_filtered_correction_direction_set`、`matrix_direction_used`、`matrix_direction_semantics` 和 `matrix_ignored_direction_axes`。
 
@@ -1058,6 +1058,14 @@ python run_matrix_haptic_smoke.py --host 192.168.x.x --port 12345 --channels 1,2
 ```
 
 脚本只会连接 Matrix ESP32、等待 `--startup-settle-seconds`，发送一次 channel list，写一个 JSON smoke log，然后退出。默认 log 写到 `data/haptic_smoke/matrix_haptic_smoke_<timestamp>.json`；也可以用 `--out data\haptic_smoke\smoke_01.json` 指定路径。这个入口适合先确认 ESP32 IP/端口、TCP parser、HV507 channel 映射是否工作，再进入正式 live trial。
+
+如果要单独验证 Matrix reset/main 顺序，可以不用 MANUS/Vive，直接跑 sequence smoke：
+
+```powershell
+python run_matrix_haptic_smoke.py --host 192.168.x.x --port 12345 --sequence contact_valid_to_pinch_insufficient --contact-valid-channels 1 --contact-valid-reset-channels 10 --pinch-insufficient-channels 2
+```
+
+这个模式会按顺序发送 `main contact_valid`、`reset contact_valid`、`main pinch_insufficient` 三个 packet，并在 JSON log 的 `steps` 中记录每一步的 role、key、channels、packet_hex 和发送时间。它只验证电脑端 TCP 发包顺序和 ESP32 端响应，不进入 trial/block/cue 状态机。
 
 如果 `matrix.enabled=true` 且 `matrix.required=true`，程序会在 trial 开始前连接 Matrix ESP32，并等待 `startup_settle_seconds`。连接失败会明显停止在 trial 前，`run_stop_reason=matrix_haptic_connect_failed`，不会进入 trial。trial loop 中只提交 haptic command，不执行阻塞式 connect/send；队列有界，发送失败或队列替换写入 `session/haptic_command_log.csv`。
 

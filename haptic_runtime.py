@@ -601,8 +601,11 @@ class HapticRuntime:
                 phase = "state_update"
 
         if phase is not None:
-            self._queue_matrix_main_output(context, output, phase)
-            self._last_matrix_send_monotonic_ms = now_ms
+            queued = self._queue_matrix_main_output(context, output, phase)
+            if queued:
+                self._last_matrix_send_monotonic_ms = now_ms
+                self._active_matrix_output = output
+            return
         self._active_matrix_output = output
 
     def _resolve_matrix_main_output(self, trial_result: Any) -> _MatrixMainOutput | None:
@@ -657,10 +660,12 @@ class HapticRuntime:
     def _end_matrix_state(self, context: _FrameContext, reason: str) -> None:
         if self._active_matrix_output is None:
             return
-        self._record_matrix_end(context, self._active_matrix_output, reason)
+        active_output = self._active_matrix_output
+        self._record_matrix_end(context, active_output, reason)
         reset_config = self.haptic_config.matrix.reset_before_output_change
         if reset_config.enabled and reset_config.apply_on_transition_to_none:
             self._queue_matrix_reset_to_none(context)
+            return
         self._active_matrix_output = None
         self._last_matrix_send_monotonic_ms = None
 
@@ -1089,6 +1094,8 @@ class HapticRuntime:
                 self._finish_not_sent(steps[-1].record, "not_connected", "matrix_not_connected")
             return False
 
+        previous_active_output = self._active_matrix_output
+        previous_last_send_monotonic_ms = self._last_matrix_send_monotonic_ms
         with self._matrix_output_key_lock:
             self._previous_matrix_output_key = next_key
             submit_sequence = getattr(self._matrix_worker, "submit_sequence", None)
@@ -1097,9 +1104,11 @@ class HapticRuntime:
                     steps,
                     on_reset_failure=(
                         (
-                            lambda: self._rollback_matrix_output_key(
+                            lambda: self._rollback_matrix_output_after_reset_failure(
                                 expected_key=next_key,
                                 previous_key=previous_key,
+                                previous_output=previous_active_output,
+                                previous_last_send_monotonic_ms=previous_last_send_monotonic_ms,
                             )
                         )
                         if has_reset
@@ -1120,10 +1129,10 @@ class HapticRuntime:
                 self._previous_matrix_output_key = previous_key
             return bool(accepted)
 
-    def _queue_matrix_reset_to_none(self, context: _FrameContext) -> None:
+    def _queue_matrix_reset_to_none(self, context: _FrameContext) -> bool:
         previous_key = self._get_previous_matrix_output_key()
         if previous_key is None:
-            return
+            return False
         reset_config = self.haptic_config.matrix.reset_before_output_change
         reset_entry = reset_config.reset_map.get(previous_key)
         channels = tuple(reset_entry.channel_list) if reset_entry is not None else ()
@@ -1136,19 +1145,40 @@ class HapticRuntime:
         if not channels:
             status = "skipped" if reset_config.missing_reset_policy == "skip_reset" else "error"
             self._finish_not_sent(record, status, "missing_matrix_reset_mapping")
-            return
+            return False
         try:
             packet = encode_matrix_channel_packet(list(channels))
         except Exception as exc:
             record.error = str(exc)
             self._finish_not_sent(record, "error", "invalid_matrix_reset_channels")
-            return
+            return False
         if self._matrix_worker is None:
             self._finish_not_sent(record, "not_connected", "matrix_not_connected")
-            return
-        self._matrix_worker.submit_sequence(
+            return False
+
+        previous_output = self._active_matrix_output
+        previous_last_send_monotonic_ms = self._last_matrix_send_monotonic_ms
+        with self._matrix_output_key_lock:
+            if self._previous_matrix_output_key == previous_key:
+                self._previous_matrix_output_key = None
+            self._active_matrix_output = None
+            self._last_matrix_send_monotonic_ms = None
+
+        accepted = self._matrix_worker.submit_sequence(
             (MatrixSendStep(record, packet, role="reset"),),
+            on_reset_failure=lambda: self._restore_matrix_output_after_reset_to_none_failure(
+                previous_key=previous_key,
+                previous_output=previous_output,
+                previous_last_send_monotonic_ms=previous_last_send_monotonic_ms,
+            ),
         )
+        if not accepted:
+            self._restore_matrix_output_after_reset_to_none_failure(
+                previous_key=previous_key,
+                previous_output=previous_output,
+                previous_last_send_monotonic_ms=previous_last_send_monotonic_ms,
+            )
+        return bool(accepted)
 
     def _record_matrix_end(
         self,
@@ -1280,15 +1310,39 @@ class HapticRuntime:
         with self._matrix_output_key_lock:
             return self._previous_matrix_output_key
 
-    def _rollback_matrix_output_key(
+    def _rollback_matrix_output_after_reset_failure(
         self,
         *,
         expected_key: str,
         previous_key: str | None,
+        previous_output: _MatrixMainOutput | None,
+        previous_last_send_monotonic_ms: float | None,
     ) -> None:
         with self._matrix_output_key_lock:
             if self._previous_matrix_output_key == expected_key:
                 self._previous_matrix_output_key = previous_key
+            if (
+                self._active_matrix_output is not None
+                and self._active_matrix_output.output_key == expected_key
+            ):
+                self._active_matrix_output = previous_output
+                self._last_matrix_send_monotonic_ms = previous_last_send_monotonic_ms
+
+    def _restore_matrix_output_after_reset_to_none_failure(
+        self,
+        *,
+        previous_key: str,
+        previous_output: _MatrixMainOutput | None,
+        previous_last_send_monotonic_ms: float | None,
+    ) -> None:
+        with self._matrix_output_key_lock:
+            if (
+                self._previous_matrix_output_key is None
+                and self._active_matrix_output is None
+            ):
+                self._previous_matrix_output_key = previous_key
+                self._active_matrix_output = previous_output
+                self._last_matrix_send_monotonic_ms = previous_last_send_monotonic_ms
 
     def _record_vibration_command(
         self,
