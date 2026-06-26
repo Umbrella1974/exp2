@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "matrix": {
-    "enabled": false,
+    "enabled": true,
     "transport": "tcp_magic_v1",
     "required": true,
     "host": "192.168.1.9",
@@ -16,35 +16,46 @@
     "direction_semantics": "blocked_surface",
     "ignore_direction_axes": ["Z"],
     "direction_channel_map": {
-      "X_NEG": [],
-      "X_POS": [],
-      "Y_NEG": [],
-      "Y_POS": [],
+      "X_NEG": [82,81,83],
+      "X_POS": [87,88,89],
+      "Y_NEG": [83,86,89],
+      "Y_POS": [82,84,87],
       "Z_NEG": [],
       "Z_POS": []
     },
     "combination_channel_map": {},
     "missing_combination_policy": "skip",
     "contact_valid_feedback": {
-      "enabled": false,
-      "channel_list": []
+      "enabled": true,
+      "channel_list": [1]
     },
     "pinch_insufficient_feedback": {
-      "enabled": false,
-      "channel_list": []
+      "enabled": true,
+      "channel_list": [2]
     },
     "reset_before_output_change": {
-      "enabled": false,
+      "enabled": true,
       "missing_reset_policy": "skip_reset",
-      "apply_on_transition_to_none": false,
-      "reset_map": {}
+      "apply_on_transition_to_none": true,
+      "reset_map": {
+        "contact_valid": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
+        "pinch_insufficient": {"channel_list": [], "hold_ms": 0},
+        "blocked:X_POS": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
+        "blocked:Y_POS": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
+        "blocked:X_NEG": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
+        "blocked:Y_NEG": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
+        "blocked:X_POS+Y_POS": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
+        "blocked:X_POS+Y_NEG": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
+        "blocked:X_NEG+Y_POS": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
+        "blocked:X_NEG+Y_NEG": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0}
+      }
     }
   },
   "vibration": {
     "enabled": true,
     "transport": "tcp_line_int_v1",
     "required": true,
-    "host": "192.168.x.y",
+    "host": "192.168.1.22",
     "port": 12346,
     "connect_timeout_s": 3.0,
     "send_timeout_s": 0.05,
@@ -67,3 +78,4 @@
     "pinch_insufficient_slip_policy": "allow_loose_touch"
   }
 }
+

@@ -23,36 +23,24 @@
       "Z_NEG": [],
       "Z_POS": []
     },
-    "combination_channel_map": {
-      "X_POS+Y_POS": [84,87,88],
-      "X_POS+Y_NEG": [86,88,89],
-      "X_NEG+Y_POS": [84,81,82],
-      "X_NEG+Y_NEG": [81,83,86]
-    },
+    "combination_channel_map": {},
     "missing_combination_policy": "skip",
     "contact_valid_feedback": {
       "enabled": true,
-      "channel_list": [81,82,83,84,85,86,87,88,89]
+      "channel_list": [1]
     },
     "pinch_insufficient_feedback": {
-      "enabled": false,
-      "channel_list": []
+      "enabled": true,
+      "channel_list": [2]
     },
     "reset_before_output_change": {
-      "enabled": true,
+      "enabled": false,
       "missing_reset_policy": "skip_reset",
       "apply_on_transition_to_none": true,
       "reset_map": {
-        "contact_valid": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "pinch_insufficient": {"channel_list": [], "hold_ms": 0},
-        "blocked:X_POS": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:Y_POS": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:X_NEG": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:Y_NEG": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:X_POS+Y_POS": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:X_POS+Y_NEG": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:X_NEG+Y_POS": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:X_NEG+Y_NEG": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0}
+        "contact_valid": {"channel_list": [10], "hold_ms": 0},
+        "pinch_insufficient": {"channel_list": [11], "hold_ms": 0},
+        "blocked:X_POS": {"channel_list": [12], "hold_ms": 0}
       }
     }
   },
@@ -83,3 +71,4 @@
     "pinch_insufficient_slip_policy": "allow_loose_touch"
   }
 }
+

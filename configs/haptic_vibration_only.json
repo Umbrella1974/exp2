@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "matrix": {
-    "enabled": true,
+    "enabled": false,
     "transport": "tcp_magic_v1",
     "required": true,
     "host": "192.168.1.9",
@@ -16,44 +16,28 @@
     "direction_semantics": "blocked_surface",
     "ignore_direction_axes": ["Z"],
     "direction_channel_map": {
-      "X_NEG": [82,81,83],
-      "X_POS": [87,88,89],
-      "Y_NEG": [83,86,89],
-      "Y_POS": [82,84,87],
+      "X_NEG": [],
+      "X_POS": [],
+      "Y_NEG": [],
+      "Y_POS": [],
       "Z_NEG": [],
       "Z_POS": []
     },
-    "combination_channel_map": {
-      "X_POS+Y_POS": [84,87,88],
-      "X_POS+Y_NEG": [86,88,89],
-      "X_NEG+Y_POS": [84,81,82],
-      "X_NEG+Y_NEG": [81,83,86]
-    },
+    "combination_channel_map": {},
     "missing_combination_policy": "skip",
     "contact_valid_feedback": {
-      "enabled": true,
-      "channel_list": [81,82,83,84,85,86,87,88,89]
+      "enabled": false,
+      "channel_list": []
     },
     "pinch_insufficient_feedback": {
       "enabled": false,
       "channel_list": []
     },
     "reset_before_output_change": {
-      "enabled": true,
+      "enabled": false,
       "missing_reset_policy": "skip_reset",
-      "apply_on_transition_to_none": true,
-      "reset_map": {
-        "contact_valid": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "pinch_insufficient": {"channel_list": [], "hold_ms": 0},
-        "blocked:X_POS": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:Y_POS": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:X_NEG": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:Y_NEG": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:X_POS+Y_POS": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:X_POS+Y_NEG": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:X_NEG+Y_POS": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0},
-        "blocked:X_NEG+Y_NEG": {"channel_list": [66,65,64,68,69,67,70,71,72], "hold_ms": 0}
-      }
+      "apply_on_transition_to_none": false,
+      "reset_map": {}
     }
   },
   "vibration": {

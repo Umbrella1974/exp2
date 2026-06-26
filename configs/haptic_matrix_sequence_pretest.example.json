@@ -4,7 +4,7 @@
     "enabled": true,
     "transport": "tcp_magic_v1",
     "required": true,
-    "host": "192.168.x.x",
+    "host": "192.168.1.9",
     "port": 12345,
     "connect_timeout_s": 3.0,
     "send_timeout_s": 0.05,
@@ -16,10 +16,10 @@
     "direction_semantics": "blocked_surface",
     "ignore_direction_axes": ["Z"],
     "direction_channel_map": {
-      "X_NEG": [],
-      "X_POS": [],
-      "Y_NEG": [],
-      "Y_POS": [],
+      "X_NEG": [82,81,83],
+      "X_POS": [87,88,89],
+      "Y_NEG": [83,86,89],
+      "Y_POS": [82,84,87],
       "Z_NEG": [],
       "Z_POS": []
     },
