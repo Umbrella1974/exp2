@@ -363,6 +363,70 @@ def test_termination_config_json_is_loaded_and_written(tmp_path: Path) -> None:
     assert result.summary["max_detach_count"] == 4
 
 
+def test_live_profile_config_sets_defaults_and_cli_can_override(tmp_path: Path) -> None:
+    map_path = _write_valid_map(tmp_path / "map_profile.json")
+    profile_path = tmp_path / "live_profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "map_config": str(map_path),
+                "out_dir": str(tmp_path / "profile_out"),
+                "gui": True,
+                "cue_sink": "gui_text",
+                "visual_profile": "experiment_visibility_feedback",
+                "ignore_task_z": True,
+                "task_z_half_extent": 5.0,
+                "index_node": 14,
+                "calibrate_pinch_threshold": True,
+                "pinch_threshold_config": "configs/pinch_threshold_20_30.json",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = runner._parse_args(
+        [
+            "--profile-config",
+            str(profile_path),
+            "--out-dir",
+            str(tmp_path / "cli_out"),
+            "--no-gui",
+            "--cue-sink",
+            "logging",
+            "--no-calibrate-pinch-threshold",
+        ]
+    )
+    config = runner._config_from_args(args)
+
+    assert config.profile_config_path == profile_path
+    assert config.map_config == map_path
+    assert config.out_dir == tmp_path / "cli_out"
+    assert config.gui is False
+    assert config.cue_sink == "logging"
+    assert config.visual_profile == "experiment_visibility_feedback"
+    assert config.ignore_task_z is True
+    assert config.index_node == 14
+    assert config.calibrate_pinch_threshold is False
+    assert config.pinch_threshold_config_path == Path("configs/pinch_threshold_20_30.json")
+
+
+def test_live_profile_config_rejects_unknown_keys(tmp_path: Path) -> None:
+    profile_path = tmp_path / "bad_live_profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "map_config": str(_write_valid_map(tmp_path / "map_bad_profile.json")),
+                "gui": True,
+                "not_a_real_argument": 123,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit):
+        runner._parse_args(["--profile-config", str(profile_path)])
+
+
 def test_invalid_cue_config_exits_before_run_without_summary(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

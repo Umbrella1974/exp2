@@ -1,0 +1,27 @@
+# Full visual debug + Matrix/electrotactile + vibration motor feedback.
+# Edit ESP32 IPs inside the referenced haptic config before running.
+map_config: maps/examples/xoy_three_turn1.json
+host: 127.0.0.1
+port: 8888
+out_dir: data/live_integrated_session/debug_all_matrix_vibration_01
+
+gui: true
+cue_sink: gui_text
+visual_profile: debug_all
+status_panel: auto
+show_axes: auto
+show_grid: auto
+
+ignore_task_z: true
+task_z_half_extent: 5.0
+pinch_position_mode: nodes_world
+thumb_node: 4
+index_node: 14
+tracker_index: 0
+skeleton_index: 0
+
+calibrate_pinch_threshold: true
+pinch_threshold_config: configs/pinch_threshold_20_30.json
+haptic_config: configs/haptic_matrix_vibration.example.json
+interaction_config: configs/interaction_boundary_lock.example.json
+

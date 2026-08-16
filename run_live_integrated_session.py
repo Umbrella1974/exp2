@@ -83,6 +83,7 @@ class LiveIntegratedSessionConfig:
     """Configuration for one integrated live session."""
 
     map_config: Path
+    profile_config_path: Path | None = None
     host: str = "127.0.0.1"
     port: int = 8888
     out_dir: Path = Path("data/live_integrated_session")
@@ -1155,6 +1156,7 @@ def _trial_config_payload(
     payload.update(
         {
             "mode": "live_integrated_session",
+            **_profile_settings_payload(config),
             "scene_type": "map_config",
             "map_config_path": str(config.map_config),
             "trial_id": config.trial_id,
@@ -1222,6 +1224,7 @@ def _session_meta(
     payload = {
         "session_id": session_dir.name,
         "mode": "live_integrated_session",
+        **_profile_settings_payload(config),
         "trial_id": config.trial_id,
         "subject_id": config.subject_id,
         "notes": config.notes,
@@ -1308,6 +1311,7 @@ def _build_summary(
     gui_summary = _live_gui_summary(config, gui_snapshot_store, gui_diagnostics_path, gui_requested_stop)
     summary = {
         "mode": "live_integrated_session",
+        **_profile_settings_payload(config),
         "is_live_trial": True,
         "is_formal_experiment": False,
         "run_stop_reason": run_stop_reason,
@@ -1831,6 +1835,201 @@ def _parse_vec3(value: str) -> list[float]:
     return [float(part) for part in parts]
 
 
+_PROFILE_BOOL_KEYS = {
+    "overwrite_session",
+    "strict_map_validation",
+    "confirm_calibration",
+    "allow_calibration_warnings",
+    "recalibrate",
+    "calibrate_pinch_threshold",
+    "calibration_require_tracker_valid",
+    "ignore_task_z",
+    "gui",
+    "boundary_lock_enabled",
+    "anchor_current_pinch_debug",
+}
+
+_PROFILE_INT_KEYS = {
+    "port",
+    "min_samples",
+    "max_frames",
+    "print_every",
+    "thumb_node",
+    "index_node",
+    "tracker_index",
+    "skeleton_index",
+}
+
+_PROFILE_FLOAT_KEYS = {
+    "sample_duration_seconds",
+    "min_line_length",
+    "control_rate_hz",
+    "duration_seconds",
+    "pinch_grab_threshold",
+    "pinch_release_threshold",
+    "slip_motion_threshold",
+    "task_z_half_extent",
+    "gui_fps",
+    "boundary_lock_unlock_delta_m",
+    "boundary_lock_contact_tolerance_m",
+    "anchor_timeout_seconds",
+    "timestamp_scale",
+    "socket_timeout",
+    "stream_wait_timeout_seconds",
+    "valid_tracker_timeout_seconds",
+    "valid_pinch_timeout_seconds",
+    "no_frame_timeout_seconds",
+}
+
+_PROFILE_STRING_KEYS = {
+    "host",
+    "out_dir",
+    "session_dir",
+    "subject_id",
+    "trial_id",
+    "notes",
+    "map_config",
+    "calibration_id",
+    "point_source",
+    "pinch_threshold_config",
+    "pinch_threshold_json",
+    "display_mode",
+    "cue_sink",
+    "cue_config",
+    "haptic_config",
+    "interaction_config",
+    "boundary_lock_surface_mode",
+    "visual_profile",
+    "status_panel",
+    "show_axes",
+    "show_grid",
+    "termination_config",
+    "pinch_position_mode",
+}
+
+
+def _preparse_profile_config(argv: list[str] | None) -> Path | None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--profile-config", default=None)
+    args, _unknown = parser.parse_known_args(argv)
+    return Path(args.profile_config) if args.profile_config is not None else None
+
+
+def _load_live_profile_defaults(
+    path: Path,
+    parser: argparse.ArgumentParser,
+) -> dict[str, Any]:
+    payload = _load_live_profile_payload(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"profile config must be an object: {path}")
+    allowed = {
+        action.dest
+        for action in parser._actions
+        if action.dest not in {"help", "profile_config"}
+    }
+    defaults: dict[str, Any] = {}
+    original_keys: dict[str, str] = {}
+    for raw_key, raw_value in payload.items():
+        if not isinstance(raw_key, str):
+            raise ValueError(f"profile config keys must be strings: {path}")
+        key = raw_key.strip().replace("-", "_")
+        if not key:
+            raise ValueError(f"profile config contains an empty key: {path}")
+        if key == "profile_config":
+            raise ValueError("profile_config cannot be nested inside a profile config.")
+        if key not in allowed:
+            allowed_text = ", ".join(sorted(allowed))
+            raise ValueError(
+                f"unknown profile config key {raw_key!r}; allowed keys: {allowed_text}"
+            )
+        if key in defaults:
+            raise ValueError(
+                f"duplicate profile config key {raw_key!r}; already set by {original_keys[key]!r}"
+            )
+        defaults[key] = _normalize_live_profile_value(key, raw_value)
+        original_keys[key] = raw_key
+    return defaults
+
+
+def _load_live_profile_payload(path: Path) -> Any:
+    if not path.exists():
+        raise FileNotFoundError(f"profile config not found: {path}")
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return json.loads(path.read_text(encoding="utf-8"))
+    if suffix in {".yaml", ".yml"}:
+        try:
+            import yaml
+        except ImportError as exc:  # pragma: no cover - depends on environment
+            raise RuntimeError("PyYAML is required for YAML profile configs.") from exc
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+    raise ValueError("profile config must be .json, .yaml, or .yml")
+
+
+def _normalize_live_profile_value(key: str, value: Any) -> Any:
+    if value is None:
+        return None
+    if key in _PROFILE_BOOL_KEYS:
+        if not isinstance(value, bool):
+            raise ValueError(f"profile config {key} must be true or false.")
+        return value
+    if key in _PROFILE_INT_KEYS:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"profile config {key} must be an integer.")
+        return value
+    if key in _PROFILE_FLOAT_KEYS:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"profile config {key} must be a number.")
+        return float(value)
+    if key in _PROFILE_STRING_KEYS:
+        if not isinstance(value, str):
+            raise ValueError(f"profile config {key} must be a string or null.")
+        return value
+    if key == "up_hint":
+        return _parse_profile_vec3(value)
+    return value
+
+
+def _parse_profile_vec3(value: Any) -> list[float]:
+    if isinstance(value, str):
+        return _parse_vec3(value)
+    if not isinstance(value, list):
+        raise ValueError("profile config up_hint must be a 3-number list or comma string.")
+    if len(value) != 3:
+        raise ValueError("profile config up_hint must contain exactly 3 numbers.")
+    parts: list[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError("profile config up_hint values must be finite numbers.")
+        part = float(item)
+        if not math.isfinite(part):
+            raise ValueError("profile config up_hint values must be finite numbers.")
+        parts.append(part)
+    return parts
+
+
+def _validate_choice(
+    parser: argparse.ArgumentParser,
+    name: str,
+    value: str | None,
+    choices: tuple[str, ...],
+) -> None:
+    if value is None:
+        return
+    if value not in choices:
+        parser.error(f"--{name.replace('_', '-')} must be one of: {', '.join(choices)}")
+
+
+def _profile_settings_payload(config: LiveIntegratedSessionConfig) -> dict[str, Any]:
+    return {
+        "profile_config_path": (
+            str(config.profile_config_path)
+            if config.profile_config_path is not None
+            else None
+        ),
+    }
+
+
 def _print_operator_commands(*, enabled: bool, gui_enabled: bool) -> None:
     if not enabled:
         return
@@ -1859,17 +2058,25 @@ def _user_requested_quit() -> bool:
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    profile_config_path = _preparse_profile_config(argv)
     parser = argparse.ArgumentParser(description="Integrated live calibration + trial session.")
+    parser.add_argument(
+        "--profile-config",
+        default=None,
+        help="JSON/YAML file providing defaults for this runner's CLI arguments.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8888, type=int)
     parser.add_argument("--out-dir", default="data/live_integrated_session")
     parser.add_argument("--session-dir", default=None)
     parser.add_argument("--overwrite-session", action="store_true")
+    parser.add_argument("--no-overwrite-session", dest="overwrite_session", action="store_false")
     parser.add_argument("--subject-id", default=None)
     parser.add_argument("--trial-id", default="live_integrated_trial")
     parser.add_argument("--notes", default=None)
-    parser.add_argument("--map-config", required=True)
+    parser.add_argument("--map-config", default=None)
     parser.add_argument("--strict-map-validation", action="store_true")
+    parser.add_argument("--no-strict-map-validation", dest="strict_map_validation", action="store_false")
     parser.add_argument("--calibration-id", default=None)
     parser.add_argument("--point-source", choices=("tracker_position_world", "pinch_center_world"), default="tracker_position_world")
     parser.add_argument("--sample-duration-seconds", default=5.0, type=float)
@@ -1882,21 +2089,26 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--allow-calibration-warnings", dest="allow_calibration_warnings", action="store_true")
     parser.add_argument("--no-allow-calibration-warnings", dest="allow_calibration_warnings", action="store_false")
     parser.add_argument("--recalibrate", action="store_true")
+    parser.add_argument("--no-recalibrate", dest="recalibrate", action="store_false")
     parser.add_argument("--control-rate-hz", default=60.0, type=float)
     parser.add_argument("--max-frames", default=None, type=int)
     parser.add_argument("--duration-seconds", default=None, type=float)
     parser.add_argument("--pinch-grab-threshold", default=None, type=float)
     parser.add_argument("--pinch-release-threshold", default=None, type=float)
     parser.add_argument("--calibrate-pinch-threshold", action="store_true")
+    parser.add_argument("--no-calibrate-pinch-threshold", dest="calibrate_pinch_threshold", action="store_false")
     parser.add_argument("--pinch-threshold-config", default=None)
     parser.add_argument("--pinch-threshold-json", default=None)
     parser.add_argument("--calibration-require-tracker-valid", action="store_true")
+    parser.add_argument("--no-calibration-require-tracker-valid", dest="calibration_require_tracker_valid", action="store_false")
     parser.add_argument("--slip-motion-threshold", default=None, type=float)
     parser.add_argument("--ignore-task-z", action="store_true")
+    parser.add_argument("--no-ignore-task-z", dest="ignore_task_z", action="store_false")
     parser.add_argument("--task-z-half-extent", default=5.0, type=float)
     parser.add_argument("--display-mode", choices=("text", "none"), default="text")
     parser.add_argument("--print-every", default=30, type=int)
     parser.add_argument("--gui", action="store_true", help="Open the debug display during trial running.")
+    parser.add_argument("--no-gui", dest="gui", action="store_false")
     parser.add_argument("--gui-fps", default=30.0, type=float)
     parser.add_argument("--cue-sink", choices=CUE_SINK_CHOICES, default="logging")
     parser.add_argument("--cue-config", default=None, help="JSON/YAML cue generation config.")
@@ -1914,6 +2126,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--show-grid", choices=DISPLAY_CONTROL_CHOICES, default="auto")
     parser.add_argument("--termination-config", default=None, help="JSON/YAML protective termination config.")
     parser.add_argument("--anchor-current-pinch-debug", action="store_true")
+    parser.add_argument("--no-anchor-current-pinch-debug", dest="anchor_current_pinch_debug", action="store_false")
     parser.add_argument("--anchor-timeout-seconds", default=10.0, type=float)
     parser.add_argument("--thumb-node", default=4, type=int)
     parser.add_argument("--index-node", default=9, type=int)
@@ -1931,7 +2144,50 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--valid-tracker-timeout-seconds", default=60.0, type=float)
     parser.add_argument("--valid-pinch-timeout-seconds", default=60.0, type=float)
     parser.add_argument("--no-frame-timeout-seconds", default=5.0, type=float)
+    parser.set_defaults(
+        overwrite_session=False,
+        strict_map_validation=False,
+        recalibrate=False,
+        calibrate_pinch_threshold=False,
+        calibration_require_tracker_valid=False,
+        ignore_task_z=False,
+        gui=False,
+        anchor_current_pinch_debug=False,
+    )
+    if profile_config_path is not None:
+        try:
+            parser.set_defaults(
+                **_load_live_profile_defaults(profile_config_path, parser)
+            )
+        except Exception as exc:
+            parser.error(str(exc))
     args = parser.parse_args(argv)
+    if args.map_config is None or not str(args.map_config).strip():
+        parser.error("--map-config is required; provide it directly or in --profile-config.")
+    _validate_choice(
+        parser,
+        "point_source",
+        args.point_source,
+        ("tracker_position_world", "pinch_center_world"),
+    )
+    _validate_choice(parser, "display_mode", args.display_mode, ("text", "none"))
+    _validate_choice(parser, "cue_sink", args.cue_sink, CUE_SINK_CHOICES)
+    _validate_choice(
+        parser,
+        "boundary_lock_surface_mode",
+        args.boundary_lock_surface_mode,
+        ("primary",),
+    )
+    _validate_choice(parser, "visual_profile", args.visual_profile, VISUAL_PROFILE_CHOICES)
+    _validate_choice(parser, "status_panel", args.status_panel, DISPLAY_CONTROL_CHOICES)
+    _validate_choice(parser, "show_axes", args.show_axes, DISPLAY_CONTROL_CHOICES)
+    _validate_choice(parser, "show_grid", args.show_grid, DISPLAY_CONTROL_CHOICES)
+    _validate_choice(
+        parser,
+        "pinch_position_mode",
+        args.pinch_position_mode,
+        ("nodes_world", "tracker_plus_local"),
+    )
     if args.sample_duration_seconds <= 0.0:
         parser.error("--sample-duration-seconds must be > 0.")
     if args.min_samples <= 0:
@@ -2018,6 +2274,9 @@ def _config_from_args(args: argparse.Namespace) -> LiveIntegratedSessionConfig:
     )
     return LiveIntegratedSessionConfig(
         map_config=Path(args.map_config),
+        profile_config_path=(
+            Path(args.profile_config) if args.profile_config is not None else None
+        ),
         host=args.host,
         port=args.port,
         out_dir=Path(args.out_dir),

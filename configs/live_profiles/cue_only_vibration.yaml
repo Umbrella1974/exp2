@@ -1,0 +1,27 @@
+# Cue-oriented display + vibration motor feedback.
+# This keeps text feedback visible while hiding axes/grid/status chrome.
+map_config: maps/examples/xoy_turn.json
+host: 127.0.0.1
+port: 8888
+out_dir: data/live_integrated_session/cue_only_vibration_01
+
+gui: true
+cue_sink: gui_text
+visual_profile: experiment_visibility_feedback
+status_panel: hide
+show_axes: hide
+show_grid: hide
+
+ignore_task_z: true
+task_z_half_extent: 5.0
+pinch_position_mode: nodes_world
+thumb_node: 4
+index_node: 14
+tracker_index: 0
+skeleton_index: 0
+
+calibrate_pinch_threshold: true
+pinch_threshold_config: configs/pinch_threshold_20_30.json
+haptic_config: configs/haptic_vibration_only.json
+interaction_config: configs/interaction_boundary_lock.example.json
+

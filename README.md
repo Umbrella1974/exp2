@@ -642,6 +642,33 @@ python run_live_integrated_session.py ^
   --trial-id trial_001
 ```
 
+如果一串参数太长，可以把它们放进 live profile，然后只传一个 profile：
+
+```powershell
+python run_live_integrated_session.py --profile-config configs\live_profiles\debug_all_vibration.yaml
+```
+
+profile 使用和命令行参数一致的 snake_case key，例如 `map_config` 对应 `--map-config`，`pinch_position_mode` 对应 `--pinch-position-mode`。路径解释方式和 CLI 一样，都是相对当前工作目录；建议仍然从项目根目录运行命令。profile 只提供默认值，命令行显式参数可以覆盖：
+
+```powershell
+python run_live_integrated_session.py ^
+  --profile-config configs\live_profiles\debug_all_vibration.yaml ^
+  --out-dir data\live_integrated_session\debug_override_01 ^
+  --no-gui ^
+  --cue-sink logging
+```
+
+已提供的示例：
+
+```text
+configs/live_profiles/debug_all_vibration.yaml
+configs/live_profiles/cue_only_vibration.yaml
+configs/live_profiles/debug_all_matrix_vibration.yaml
+configs/live_profiles/cue_only_matrix_vibration.yaml
+```
+
+profile 会严格检查字段名；写错 key 会直接报错，不会静默忽略。运行后 `profile_config_path` 会写入 `summary.json`、`session/session_meta.json` 和 `session/trial_config.json`，方便之后追溯当时使用的运行模板。
+
 建议流程：
 
 ```text
@@ -662,6 +689,7 @@ python analyze_session.py --session-dir data\live_integrated_session\debug_01\se
 常用参数：
 
 ```text
+--profile-config                可选，JSON/YAML live profile；作为本 runner 的参数默认值
 --map-config                     必填，MapConfig JSON
 --out-dir                        默认 data/live_integrated_session
 --session-dir                    可选；不传默认 out_dir/session
@@ -680,10 +708,12 @@ python analyze_session.py --session-dir data\live_integrated_session\debug_01\se
 --pinch-release-threshold        可选，覆盖 EngineConfig 默认值
 --slip-motion-threshold          可选，覆盖 EngineConfig 默认值
 --ignore-task-z                  debug only，放宽 z 方向地图判定
+--no-ignore-task-z               覆盖 profile 中的 ignore_task_z: true
 --task-z-half-extent             默认 5.0，仅配合 --ignore-task-z
 --display-mode                   text / none，默认 text
 --print-every                    默认 30
 --gui                            debug display，在 trial running 阶段打开 GUI
+--no-gui                         覆盖 profile 中的 gui: true
 --gui-fps                        默认 30，GUI 轮询/刷新频率
 --cue-sink                       none / logging / console / gui_text，默认 logging
 --cue-config                     可选，JSON/YAML cue 生成配置
@@ -693,6 +723,7 @@ python analyze_session.py --session-dir data\live_integrated_session\debug_01\se
 --show-grid                      auto / show / hide，默认 auto
 --termination-config             可选，JSON/YAML 保护性 trial 终止配置
 --anchor-current-pinch-debug     debug only，默认关闭
+--no-anchor-current-pinch-debug  覆盖 profile 中的 anchor_current_pinch_debug: true
 --pinch-position-mode            nodes_world / tracker_plus_local，默认 nodes_world
 --stream-wait-timeout-seconds    默认 60，等不到任何 raw frame 会安全退出
 --valid-tracker-timeout-seconds  默认 60，等不到 tracker_valid=True 会安全退出
