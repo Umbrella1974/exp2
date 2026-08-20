@@ -1,0 +1,26 @@
+# Visibility feedback only, no haptic (matrix / vibration) output.
+# Block disappears while held (INSIDE_BLOCK) and reappears when released (OUTSIDE_BLOCK).
+# The map (track / target / initial block) is never shown.
+map_config: maps/examples/xoy_turn.json
+host: 127.0.0.1
+port: 8888
+out_dir: data/live_integrated_session/visibility_feedback_only_01
+
+gui: true
+cue_sink: gui_text
+visual_profile: experiment_visibility_feedback
+status_panel: hide
+show_axes: hide
+show_grid: hide
+
+ignore_task_z: true
+task_z_half_extent: 5.0
+pinch_position_mode: nodes_world
+thumb_node: 4
+index_node: 14
+tracker_index: 0
+skeleton_index: 0
+
+calibrate_pinch_threshold: true
+pinch_threshold_config: configs/pinch_threshold_20_30.json
+# No haptic_config -> haptic stage stays disabled by default.

@@ -665,6 +665,7 @@ configs/live_profiles/debug_all_vibration.yaml
 configs/live_profiles/cue_only_vibration.yaml
 configs/live_profiles/debug_all_matrix_vibration.yaml
 configs/live_profiles/cue_only_matrix_vibration.yaml
+configs/live_profiles/visibility_feedback_only.yaml
 ```
 
 profile 会严格检查字段名；写错 key 会直接报错，不会静默忽略。运行后 `profile_config_path` 会写入 `summary.json`、`session/session_meta.json` 和 `session/trial_config.json`，方便之后追溯当时使用的运行模板。
