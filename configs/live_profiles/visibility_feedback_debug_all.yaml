@@ -1,0 +1,27 @@
+# Visibility-feedback task settings, but with full debug visualization.
+# Use this when you need to find the hand / pinch point before running the
+# stricter visibility-feedback-only condition.
+map_config: maps/examples/xoy_turn.json
+host: 127.0.0.1
+port: 8888
+out_dir: data/live_integrated_session/visibility_feedback_debug_all_01
+
+gui: true
+cue_sink: gui_text
+visual_profile: debug_all
+status_panel: show
+show_axes: show
+show_grid: show
+
+ignore_task_z: true
+task_z_half_extent: 5.0
+pinch_position_mode: nodes_world
+thumb_node: 4
+index_node: 14
+tracker_index: 0
+skeleton_index: 0
+
+calibrate_pinch_threshold: true
+pinch_threshold_config: configs/pinch_threshold_20_30.json
+# No haptic_config -> haptic stage stays disabled by default.
+
