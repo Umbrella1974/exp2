@@ -23,5 +23,5 @@ skeleton_index: 0
 
 calibrate_pinch_threshold: true
 pinch_threshold_config: configs/pinch_threshold_20_30.json
+interaction_config: configs/interaction_boundary_lock.example.json
 # No haptic_config -> haptic stage stays disabled by default.
-
